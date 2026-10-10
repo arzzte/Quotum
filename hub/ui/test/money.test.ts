@@ -71,7 +71,7 @@ test('explicit card scales outside the bounded preview survive saving, reload an
   assert.equal(keyShown(withKeyShown(saved,source,'sixth',false),source,'sixth',preview),false);
 });
 test('money display preserves micro-spending, negatives and integers beyond Number precision in both locales',()=>{
-  for(const locale of ['en','ru'] as const){setLocale(locale);assert.match(money('1'),/0[.,]000001 USD/);assert.match(money('-1'),/−0[.,]000001/);assert.match(money('0'),/0[.,]00/);assert.ok(money('9007199254740993','USD',true).endsWith('740993 USD'));assert.match(money('999999'),/1[.,]00/);}
+  for(const locale of ['en','ru','en'] as const){setLocale(locale);const separator=locale==='en'?'.':',';assert.equal(money('1'),`0${separator}000001 USD`);assert.match(money('-1'),/−0[.,]000001/);assert.match(money('0'),/0[.,]00/);assert.ok(money('9007199254740993','USD',true).endsWith('740993 USD'));assert.match(money('999999'),/1[.,]00/);}
   assert.equal(capPercent({...meter('cap','1'),kind:'cap',limit:'0'}),null);setLocale('en');
 });
 test('money defaults select only balances, bound overflow and preserve explicit archived details on lineup growth',()=>{
@@ -82,7 +82,7 @@ test('money defaults select only balances, bound overflow and preserve explicit 
   assert.equal(moneySelection(cards,['source:one'],explicit).removed,1);
 });
 test('source access is an independent private slice and disappears with its lineup',()=>{
-  const snapshot:Snapshot={board:{id:'b',name:'',personal:true},view:{layout:{columns:6,places:{}},names:{},hidden:[],shown:[],windows:[],plans:{},unplanned:[],colors:{},columns:{},shownColumns:{}},historyStart:0,sources:[card('one')],sessions:{},cadence:{},refresh:{},forecast:{},mine:['one'],boards:[],resets:{resets:{},trackers:[],past:{}}};
+  const snapshot:Snapshot={board:{id:'b',name:'',personal:true},view:{version: 2 as const, layout: {columns: 6, places: {}}, names:{},hidden:[],shown:[],windows:[],plans:{},unplanned:[],colors:{},columns:{},shownColumns:{}},historyStart:0,sources:[card('one')],sessions:{},cadence:{},refresh:{},forecast:{},mine:['one'],boards:[],resets:{resets:{},trackers:[],past:{}}};
   const before=reduce(INITIAL,{type:'hub',event:{type:'snapshot',data:snapshot}});
   const own={error:null,expiresAt:null,canRefresh:true,credentialIds:['own']};
   const next=reduce(before,{type:'hub',event:{type:'sourceAccess',data:{one:own}}});
@@ -98,4 +98,25 @@ test('reported-only sources default to Spending and mode choices preserve earlie
   assert.deepEqual(moneySelection([card('one'),reported],[],{...spending,view:'balance'}).selection?.ids,[['one','balance']]);
   assert.deepEqual(moneySelection([reported],[],readMoney({unit:'USD',view:'spending'})).selection?.ids,[['report','costs']]);
   assert.deepEqual(moneySelection([reported],[],readMoney({unit:'USD',view:'balance'})).selection?.ids,[]);
+});
+
+test('mixed credits select one native meter through USD context and grant metadata changes selection identity',()=>{
+  const source:Card={...card('codex'),provider:'codex',meters:[{...meter('balance:credits','12345678912'),unit:'credits:codex',scale:7}],budget:{enabled:true,since:10,anchor:20,revision:'first'}};
+  const selection=moneySelection([source],[],readMoney({}),undefined,'funds').selection!;
+  assert.deepEqual(selection.ids,[['codex','balance:credits']]);assert.equal(selection.displayCurrency,'USD');
+  assert.notEqual(JSON.stringify(moneySelection([{...source,budget:{...source.budget!,anchor:30}}],[],readMoney({}),undefined,'funds').selection),JSON.stringify(selection));
+  assert.deepEqual(moneySelection([{...source,budget:{...source.budget!,enabled:false}}],[],readMoney({}),undefined,'funds').selection?.ids,[]);
+  assert.deepEqual(moneySelection([source],['source:codex'],readMoney({}),undefined,'funds').selection?.ids,[]);
+  for(const locale of ['en','ru'] as const){setLocale(locale);const exact=money('12345678912','credits:codex',true,undefined,7);assert.match(exact,/5678912/);assert.ok(!exact.includes('12345678'));}
+  setLocale('en');
+});
+
+
+test('wallet and subscription fund selections stay disjoint even with explicit saved meters',()=>{
+  const wallet=card('wallet'),funds:Card={...card('subscription'),provider:'codex',meters:[{...meter('balance:credits','2500000000'),unit:'credits:codex'}]};
+  const cards=[wallet,funds],settings=readMoney({selected:{USD:[['wallet','balance'],['subscription','balance:credits']]}});
+  assert.deepEqual(moneySelection(cards,[],settings).selection?.ids,[['wallet','balance']]);
+  assert.deepEqual(moneySelection(cards,[],settings,undefined,'funds').selection?.ids,[['subscription','balance:credits']]);
+  assert.deepEqual(moneySelection(cards,[],readMoney({selected:{USD:[]}}),undefined,'funds').selection?.ids,[]);
+  assert.deepEqual(moneySelection(cards,[],readMoney({})).selection?.ids,[['wallet','balance']]);
 });

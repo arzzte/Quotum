@@ -1,10 +1,11 @@
+import {budgetVisible, subscriptionFundsVisible} from '../lib/money';
 import {memo, useEffect, useRef, useState, type CSSProperties, type ReactNode} from 'react';
 import type {Card, Win} from '../lib/types';
 import {MEASURE_INTERVAL, windowKey, type MeasureIntervalMs} from '../lib/types';
 import {countdown, countdownChangesAt, earliest, num, stamp} from '../lib/format';
 import {cadenceChangesAt, cadenceOf, dotChangesAt, dotOf, errorText, problemOf, resetLineChangesAt, windowName} from '../lib/quota';
 import {t, useLocale} from '../i18n';
-import {DEFAULT_PLAN, isValidPlan, planAt, planChangesAt, planNote, planTotal, type WeeklyPlan} from '../lib/plan';
+import {DEFAULT_PLAN, isValidPlan, planMark, planMarkChangesAt, planNote, planNoteChangesAt, planTotal, type WeeklyPlan} from '../lib/plan';
 import {logoOf} from './logos';
 import {MeterBar,PercentLimit,ResetText} from './Meter';
 import {KeyScaleSettings} from './KeyScaleSettings';
@@ -26,9 +27,8 @@ import {quotaPeriods,quotaRemaining} from '../lib/subscription';
 
 /** Where the plan expects the limit to be now: a mark on its meter, in whole percent, moved when that changes. */
 function PlanMark({w, measuredAt, weekly}: {w: Win; measuredAt: number | null; weekly: WeeklyPlan | null}) {
-  const now = useClock(now => planChangesAt(w, measuredAt, now, weekly));
-  const plan = planAt(w, measuredAt, now, weekly);
-  const pace = plan && !plan.done ? Math.round(plan.remaining) : null;
+  const now = useClock(now => planMarkChangesAt(w, measuredAt, now, weekly));
+  const pace = planMark(w, measuredAt, now, weekly);
   return (
     <b
       className="pace"
@@ -42,7 +42,7 @@ function PlanMark({w, measuredAt, weekly}: {w: Win; measuredAt: number | null; w
 
 /** How far ahead of the plan or behind it the limit is, when that is worth a word. */
 function PlanNote({w, measuredAt, weekly}: {w: Win; measuredAt: number | null; weekly: WeeklyPlan | null}) {
-  const now = useClock(now => planChangesAt(w, measuredAt, now, weekly));
+  const now = useClock(now => planNoteChangesAt(w, measuredAt, now, weekly));
   const note = planNote(w, measuredAt, now, weekly);
   if (note?.key === 'ahead') {
     return (
@@ -448,15 +448,15 @@ export function CardMark({source}: {source: Card}) {
   );
 }
 
-/** The card's tray: news of resets for everyone, free resets, the agents running on it. */
-function CardTray({source}: {source: Card}) {
+/** The card's tray: reset news, additional funds, free resets and running agents. */
+function CardTray({source, funds}: {source: Card; funds?: ReactNode}) {
   const sessions = useSessions(source.id);
   const resets = useResetsFor(source.provider);
   const access = useSourceAccess(source.id);
   const quotaIssue=source.quota&&!source.quota.complete;
   const news=providerOf(source.provider)?.funding==='wallet'||source.balanceStatus||access||quotaIssue?<><BalanceMark source={source}/>{access&&<AccessMark id={source.id}/>}
     {quotaIssue&&<QuotaMark source={source}/>}</>:null;
-  return <Tray resets={resets} news={news} current={!!source.resets?.available&&<FreeResets resets={source.resets}/>} sessions={sessions} />;
+  return <Tray resets={resets} news={news} current={funds||source.resets?.available?<>{funds}{!!source.resets?.available&&<FreeResets resets={source.resets} observation={source.resources?.resets}/>}</>:null} sessions={sessions} />;
 }
 
 /**
@@ -474,6 +474,7 @@ export const SourceCard = memo(function SourceCard({id, arrange, boardId, person
   const weekly = planOf(arrange.view, source.id);
   const takeOff = !personal && (arrange.owner || mine);
   const caps=hasSubscriptionCaps(source.provider);
+  const funds=budgetVisible(source)&&providerOf(source.provider)?.funding==='subscription';
 
   return (
     <article className="card" data-card={id} style={{'--card-color': colorOf(arrange.view, source.id, source.provider)} as CSSProperties}>
@@ -489,14 +490,14 @@ export const SourceCard = memo(function SourceCard({id, arrange, boardId, person
       </div>
 
       <div className="limits">
-        {caps?<QuotaCard source={source} ids={shownPeriods.map(w=>w.id)}/>:source.meters&&<MoneyCard source={source} board={boardId} view={arrange.view}/>}
+        {caps?<QuotaCard source={source} ids={shownPeriods.map(w=>w.id)}/>:budgetVisible(source)&&!funds&&<MoneyCard source={source} board={boardId} view={arrange.view}/>}
         {visible.map(w => (
           <Limit key={w.id} w={w} measuredAt={source.successAt} weekly={weekly} />
         ))}
-        {!caps && !source.windows.length && !source.meters && <div className="card-empty">{errorText(source.error ?? 'waiting')}</div>}
+        {!caps && !source.windows.length && !budgetVisible(source) && !source.meters && <div className="card-empty">{errorText(source.error ?? 'waiting')}</div>}
         {!!periods.length && !shownPeriods.length && <AllHidden source={source} arrange={arrange} />}
       </div>
-      <CardTray source={source} />
+      <CardTray source={source} funds={subscriptionFundsVisible(source)&&<MoneyCard source={source} board={boardId} view={arrange.view} tray/>} />
     </article>
   );
 });

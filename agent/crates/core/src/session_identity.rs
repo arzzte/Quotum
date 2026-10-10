@@ -7,8 +7,8 @@ use std::path::Path;
 
 use sha2::{Digest, Sha256};
 
+use crate::clients::ClientId;
 use crate::config::Paths;
-use crate::model::Provider;
 
 fn field(out: &mut Vec<u8>, bytes: &[u8]) {
     out.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
@@ -23,7 +23,7 @@ pub(crate) fn birth(boot: &[u8], pid: u32, start: u64) -> Vec<u8> {
     out
 }
 
-pub(crate) fn identify(salt: &str, provider: Provider, native: &[u8]) -> String {
+pub(crate) fn identify(salt: &str, provider: ClientId, native: &[u8]) -> String {
     let mut encoded = Vec::new();
     for bytes in [
         b"quotum/session/v1".as_slice(),
@@ -180,14 +180,14 @@ mod tests {
         let first = salt(&stand.0).unwrap();
         assert!(reusable(&stand.0) == first);
         let native = birth(b"boot-a", 7, 123);
-        let id = identify(&first, Provider::Codex, &native);
+        let id = identify(&first, ClientId::Codex, &native);
         assert_eq!(id.len(), 32);
-        assert_eq!(identify(&reusable(&stand.0), Provider::Codex, &native), id);
+        assert_eq!(identify(&reusable(&stand.0), ClientId::Codex, &native), id);
         for token in [birth(b"boot-a", 8, 123), birth(b"boot-a", 7, 124), birth(b"boot-b", 7, 123)] {
-            assert_ne!(identify(&first, Provider::Codex, &token), id);
+            assert_ne!(identify(&first, ClientId::Codex, &token), id);
         }
-        assert_ne!(identify(&first, Provider::Claude, &native), id);
-        assert_ne!(identify(&"0".repeat(32), Provider::Codex, &native), id);
+        assert_ne!(identify(&first, ClientId::Claude, &native), id);
+        assert_ne!(identify(&"0".repeat(32), ClientId::Codex, &native), id);
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -210,7 +210,7 @@ mod tests {
         assert!(at.elapsed() < Duration::from_secs(1));
         assert!(!path.exists());
         drop(lock);
-        assert!(salt(&stand.0).is_some());
+        assert_eq!(reusable(&stand.0).len(), 32);
     }
 
     #[test]
@@ -261,7 +261,7 @@ mod tests {
         assert_eq!(unsafe { libc::waitpid(child, std::ptr::null_mut(), 0) }, child);
         assert!(busy.is_none());
         assert!(elapsed < Duration::from_secs(1));
-        assert!(salt(&stand.0).is_some());
+        assert_eq!(reusable(&stand.0).len(), 32);
     }
 
     #[cfg(unix)]

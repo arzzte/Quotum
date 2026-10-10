@@ -68,6 +68,127 @@ is the effective permitted time, respecting the device minimum. Stale data can s
 have a next measurement and reason. A frequency write reaches all boards that show the
 source through the existing events, without polling or changing the agent protocol.
 
+## Adding widgets and saving views
+
+`GET /api/boards/:board/catalogue` requires membership. It returns the board,
+`viewRevision`, `connectionsRevision`, registered connectors, and only sources and
+standard widgets this reader can add or show. Sources are the reader's holdings and
+data already provided to this board; another member's private sources are absent.
+Visible and forbidden entries are omitted. Members may add or show their own cards;
+only the board owner may show another member's hidden card or add a standard widget.
+
+`POST /api/additions` reserves an owner-scoped UUID `requestId`, a frozen `boardId`
+(null for personal connection or replacement), and one item:
+`{kind:"sources", sourceIds:[...]}`, `{kind:"widget", widgetId}`,
+`{kind:"connection", provider, account?: {kind:"new"} | {kind:"existing", id}}`, or `{kind:"replace", credentialId}`.
+Source selections contain one to 100 unique IDs. Standard widgets are `agents`,
+`activity`, `quota-history`, `subscription-funds`, `budget-history`, `quota-table`, `budget-table`. Replacement is personal; the server captures its
+provider, source and access revision. Reusing a request ID with another destination or
+selection returns `409 addition_conflict`. No secret goes into reservation or storage.
+
+`POST /api/additions/:id/run` accepts optional `secret`, `accountName`,
+`allowUnknownExpiry` and `sameAccount` fields. Provider verification
+happens outside SQLite, with a 25-second deadline. Before committing the hub checks
+the original session, membership, holdings, operation generation and replacement
+revision again. Encrypted access, source, holding, initial measurement, sharing,
+visibility and the complete receipt commit in one transaction. An own existing account
+reuses its access; new key bytes never implicitly replace its saved key. Source batches
+are all-or-nothing. Personal connection does not change a shared board or an existing
+hidden card. No-expiry access is admitted without another checkbox or submit.
+
+For a declared new account, its free name is supplied only with the secret in
+`accountName`; it is validated against that secret before persistence and never enters
+the ledger item. Existing declared identities are owner-scoped. Unknown expiry requires
+`allowUnknownExpiry: true`, and replacement or existing-account selection requires
+`sameAccount: true` for declared providers. OpenRouter's confirmed no-expiry access
+needs no additional expiry submission. Receipts include the truthful `expiryKind`.
+
+Concurrent requests may share provider verification, but each waiting request's session
+is checked before returning its private result. A revoked session receives
+`403 addition_permission` (`401 unauthorized` through legacy credentials APIs).
+Another authorized request's committed result remains intact.
+
+`GET /api/additions/:id` is owner-only; another owner's ID and an unknown ID both give
+`404 addition_not_found`. `GET /api/additions?limit=20&before=<cursor>` discovers the
+owner's recent unfinished and terminal receipts, with a maximum page size of 50 and
+30-day retention. An optional UUID `requestId` looks up that owner's reservation.
+Results include immutable safe items, timestamps, state, source IDs, optional own
+credential ID and access revision, and current disposition per source or widget.
+They never include a secret, ciphertext, raw supplier identity or inaccessible board
+labels. States are `ready`, `verifying`, `needs_input`, `complete`, `failed`, `expired`.
+Reservations expire after 24 hours, with at most 20 unfinished actions per owner.
+
+Verification leases last 30 seconds across process restart. An expired lease becomes
+`needs_input` and increments the generation; its late callback cannot commit. A key
+not saved before interruption must be entered again. A completed operation returns its
+receipt without verification or side effects, even after later hide, unshare, replacement
+or removal. Replacement cleanup may report `credential_cleanup_pending` on a complete
+receipt; this does not mean the replacement failed. The legacy replacement endpoint
+accepts optional `requestId` and returns its operation ID for recovery.
+
+Mutations require an explicit same-site Origin before parsing and owner authentication,
+with 32-KiB bodies and ten key-verification attempts per minute per user and address.
+Status and reservation have a separate bounded request limit. Credentials cannot be
+submitted in a query. Closed panels do not poll or read catalogue/history data.
+
+`POST /api/boards/:board/view` is owner-only and accepts a full View with
+`version: 2`, up to 76 KiB (77,824 UTF-8 bytes including JSON syntax). The independent
+writer header `X-Quotum-View-Version: 2` is required, even when a previous page echoes
+a received v2 body. Missing or incompatible writer headers and absent/legacy body
+versions return `428 view_reload_required` without mutation; malformed or future body
+versions return `400 invalid_request`. `If-Match: "<revision>"` remains required:
+missing is `428 view_reload_required`, malformed is `400 invalid_request`, and stale
+is `409 view_conflict` with the authorized current `{view, revision}`.
+Success returns `{view, revision}`. Semantic changes increment revision; no-op saves
+do not. Snapshots and view events carry that revision.
+
+The standard widgets are `agents`, `activity`, `quota-history`, `subscription-funds`, `budget-history`,
+`quota-table` and `budget-table`. `subscription-funds` shows additional balances of
+subscriptions. The budget pair shows wallets only. These widgets share monetary
+history transport but keep independent selections and visibility. Each analytics replacement in `shown` is placed;
+`hidden` takes precedence. Unplaced analytics become placed once their resource
+capabilities appear, independently of filters, latest errors or zero balances. Placed
+widgets remain when resources leave. `enabledWhenEmpty` applies only to explicit
+`agents` and `activity` additions. New empty boards have no analytics placed and keep
+activity hidden; any standard widget can be added explicitly to an empty board.
+
+The schema upgrade converts legacy history/table placements atomically. Mixed boards
+keep the quota pair at the old coordinates and append the budget pair after existing
+analytics anchors. Money-only boards give the old coordinates to the budget pair.
+Explicitly hidden legacy panels hide both replacements. Columns follow their family;
+other source settings and geometry are retained. Reader-local modes never participate.
+Runtime capability reconciliation produces one authoritative view/revision pair and
+preserves the previous editor; a concurrent owner save receives the normal conflict.
+
+Widget reservation and run/resume also require the writer header. Existing addition
+items and request bindings remain immutable; legacy receipts carry frozen canonical
+`widgetIds` and report `current.widgets` with their current placement. Replaying a
+completed receipt never restores a subsequently hidden widget. Only a current client
+may resume an interrupted legacy widget addition. Non-widget connection operations
+retain their existing version-independent authorization.
+
+The page serializes its own saves and flushes pending changes before Add. Ordinary
+bodies retain the debounce; bodies above 64 KiB start an ordinary save immediately.
+No oversized body uses keepalive, and outstanding view keepalives share a 64-KiB
+budget. In a browser only, pending/failed oversized changes register the native close
+warning until acknowledged or explicitly discarded; navigation destroying the saver
+waits for these writes. Board/settings navigation keeps the saver and its queue.
+This is best-effort browser protection, not durability through forced termination.
+Electron and Tauri use the same ordinary save limit and queue without a new browser
+warning or change to native close/quit behavior. Save errors retain the existing
+retry/discard flow; conflicts never silently reapply an old full document.
+
+`POST /api/device-onboarding {requestId, boardId}` reserves a private device intent.
+The existing token-create and code-approval routes accept optional `onboardingId`;
+code redemption binds the exact device atomically. Ordinary CLI confirmation stays a
+personal action. The owner may instead explicitly select an existing device.
+`POST /api/device-onboarding/:id/selection {requestId, deviceId, sourceIds}` freezes
+only a delivered subset of that live own device and links the same addition receipt.
+Publishing that subset and completing the intent commit together. Neither later accounts
+nor other devices become shared. Owner GET/list routes permit recovery for 30 days;
+unfinished intents expire after 24 hours. Codes, tokens and provider secrets are absent
+from these projections. Local desktop does not expose device onboarding.
+
 ## Frames
 
 Each event is `event: <type>`, `data: <JSON>` and an empty line. There is no `id:`: the
@@ -85,9 +206,11 @@ change as it was.
 | `event` | `data` | When |
 |---|---|---|
 | `hello` | `{epoch, now, client, heartbeatMs}` | First. `epoch`: when this start of the hub began, base 36. `now`: the hub's clock. `client`: the path of the page's entry script the hub serves (`/assets/index-<hash>.js`), null without a build. `heartbeatMs`: 25000. |
-| `snapshot` | `{providers, sourceAccess, board, view, historyStart, sources, sessions, cadence, refresh, forecast, mine, boards, resets}` | Second: the board for this reader. |
+| `snapshot` | `{providers, sourceAccess, board, view, viewRevision, connectionsRevision, historyStart, sources, sessions, cadence, refresh, forecast, mine, boards, resets}` | Second: the board for this reader. |
 | `board` | `{board: {id, name, personal}}` | The board was renamed. |
-| `view` | `{view}` | The board's view was saved. |
+| `view` | `{view, revision}` | The board's view was saved. The monotonic revision belongs to this board. |
+| `connections` | `{revision}` | Only this reader's connection structure or access health changed; no private IDs or labels. Successful measurements and unchanged device heartbeats do not increment it. |
+| `devices` | `{}` | Only this reader's current device sessions changed. Invalidate an open Devices disclosure; no session fields, IDs, counts or names are sent. |
 | `lineup` | `{sources: string[]}` | The board's sources, in order, changed. |
 | `card` | a card | A source's state changed. |
 | `sessions` | `{id, sessions}` | The agents running on a source, on the machines of its people on this board, changed. |
@@ -111,12 +234,11 @@ content: a widget never takes fewer rows than the least its content can show (al
 or the table, a chart as tall as it draws by itself, the first agent of the list and how
 many more), so `h` is what the owner asked for, not what shows, and the hub does not check
 it against the content. A place has exactly `x`, `y`, `w` and, optionally, `h`; anything
-else is refused. Stored views from before the grid can still contain `order`
-and `sizes`, with an empty layout: the page translates them, including hidden or absent
-widgets. Saving a view requires `layout`; the hub drops the old fields. A save is
-limited to 64 KiB (65,536 UTF-8 bytes), so it fits the page's keepalive request when
-leaving before the debounced save. There is no separate count limit on places; each
-place is validated.
+else is refused. The hub migrates stored pre-grid views and split analytics IDs before
+serving the view with its revision. Saves require version 2, its writer header and
+`layout`, with a 76 KiB UTF-8 body limit. The page uses keepalive only within its
+aggregate 64 KiB budget; larger drafts use immediate serialized ordinary saves.
+There is no separate count limit on places; each place is validated.
 
 In a `snapshot`, `sources` are the cards of the board's sources in its order; `sessions`,
 `cadence`, `refresh` and `forecast` are by source id, for those sources only. `board` is
@@ -245,7 +367,7 @@ retention period. The hub credits machines that went quiet before reading the ce
   now: number,
   run: string, // this start of the hub, the same as hello.epoch
   historyStart: number,
-  known: {work: number, sources: Record<string, number>},
+  known: {own?: number, work: number, sources: Record<string, number>},
   meta?: string, // opaque metadata token, only when the request opts in
   chunks: Chunk[]
 }
@@ -261,7 +383,10 @@ captured when that request started, requiring both its token and `run` to match;
 it never borrows a later reply's metadata. Requests without `meta` keep the full
 answer shape, and a full answer is accepted without a token.
 
-`known.work` is when the hub began keeping work. `known.sources` gives when each shown
+`known.work` is when the hub began keeping work. A personal board's quota/activity
+history also includes `known.own`, the lower bound for its owner's private work,
+independently of the selected subscriptions. Shared and financial history omit it.
+`known.sources` gives when each shown
 subscription came to the board; hidden cards are absent. The chunks cover the cut
 `[from, to)` whole, including empty cells, in time order, cut at tile edges. A whole tile
 ending no later than now is closed. Closed tiles are cached under their board, grid and
@@ -277,12 +402,12 @@ type Chunk = {
   series: {
     source: string; window: string; hold: number; open: number | null;
     cells: [index: number, low: number, spent: number, covered: number, extra?: {
-      f?: number; l?: number; o?: number | null; g?: 1; h?: number;
+      f?: number; l?: number; o?: number | null; g?: 1; h?: number; u?: number;
       w?: [spent: number, covered: number, duringWork: number];
     }][];
   }[];
   activity: {
-    sessions: [ref: string, source: string, project: string | null, device: string][];
+    sessions: [ref: string, source: string | null, project: string | null, device: string][];
     devices: Record<string, string>;
     cells: [index: number, active: number,
       sessions: (number | [sessionIndex: number, agentMs: number])[],
@@ -320,7 +445,17 @@ Only differences from these decoded defaults are written:
 | `open` (`o`) | series `open` in its first measured cell, then the preceding measured cell's `last` |
 | break (`g`) | 0 |
 | `hold` (`h`) | series `hold` |
+| availability end (`u`) | no explicit bound; an exclusive Unix-millisecond cutoff after an unavailable quota observation, limited by the sample's own freshness end |
 | work (`w`) | `[spent, 0, 0]` at or after the subscription's known threshold, `[0, 0, 0]` before |
+
+A reported availability end limits drawing and readout without changing the original
+measurement's freshness promise. A bounded readout uses the precise pointer timestamp
+against that sample's deadline, not a later sample's freshness promise. Recovery begins
+a new segment: neither spending nor forecast evidence crosses an explicit unavailable
+observation. An aggregate cell recovering after an unavailable start is unavailable for
+drawing and readout (`g=1`, `u=cell start`), even if the gap began in an earlier cell.
+Recovery exactly at a cell boundary starts an ordinary new cell. Spending totals still
+include only proven steps; the aggregate does not invent intra-cell sample positions.
 
 A field is omitted only when its rounded value equals the decoded default. `f` is
 omitted while `open` is not null. The subscription's known threshold is
@@ -515,9 +650,10 @@ Both resource types use the same segmented meter; balances have no percentage me
 
 A hub-measured card may also carry `meters`, `keys` (a preview of at most five),
 `keysCount`, `inventory` and `spending`. A meter is `{id, kind, unit, amount, limit,
-resetAt, minutes, scope, label, at, staleAfterMs, stale}`. Kind is `counter`, `balance`
+resetAt, minutes, scope, label, at, staleAfterMs, stale, scale?}`. Kind is `counter`, `balance`
 or `cap`; a cap's amount is used, its remaining is limit minus amount. A zero limit
-has no percentage. All unit-valued amount fields are canonical decimal strings of whole millionths,
+has no percentage. Unless an explicit scale is present (native Codex credits),
+unit-valued amount fields are canonical decimal strings of whole millionths,
 quantized once from the supplier's original decimal token, with nearest rounding and
 halfway values away from zero. They use signed 64-bit SQLite integers; totals use exact
 integer arithmetic and never combine units. A balance has no 100%.
@@ -573,6 +709,26 @@ Safe provider context and reported period totals are retained in sparse internal
 history with their own observation times and UTC period anchors. This storage does
 not add board events or a new history capability. No raw response, raw key hash,
 creator/workspace id, connection label or credential enters that archive.
+
+`GET /api/history` accepts optional `scope=quota|budget`. Current readers send a
+scope; absent scope retains the previous combined contract. Quota reads contain native
+windows, resets, work and selected catalogue-defined subscription cap meters. Budget
+reads contain only selected financial meters and never execute native-window or agent
+work reads; the native/activity wire fields are empty. Budget scope requires a valid
+`unit`/`meters` pair, including an explicit empty list. Resource-family mismatches return
+`400 invalid_request`; hidden or unauthorized selected sources remain `404 not_found`.
+Quota reads cannot request private monetary conversion. Validated ranges outside readable
+bounds return `400 history_range_invalid` for scoped readers, independently of malformed
+selection errors. Existing cell, tile, meter, response and retention limits remain.
+
+Cache and metadata identities include the read scope. Work-name changes invalidate only
+quota caches; metadata offered by another scope cannot be reused. A `history` event keeps
+its legacy `sources` union and minimum `since`, and adds `changes: [{source, scope, since}]`.
+Each source/scope keeps its own earliest changed time. Native samples, subscription caps
+and credited work affect quota; monetary observations and valuation changes affect budget.
+Work refreshes preserve coalesced budget changes. Clients without `changes` conservatively
+invalidate both relevant scopes. Scope never grants access or adds private rate or owner
+information to a shared event.
 
 `GET /api/history` additionally accepts `unit` and `meters`: a JSON array of at most
 32 logical `[sourceId, meterId]` pairs, sorted and deduplicated. Sources must be visible
@@ -682,8 +838,8 @@ a current USD valuation; this does not alter provider `balanceStatus` or key hea
 
 Native observations commit before currency-service reads. Quotes have no credential or
 account inputs. Failure retains original measurements and leaves USD unknown or stale,
-never zero. Existing events carry these additive fields; no currency settings form or native
-bridge command is added. Original foreign-currency history stays available through the
+never zero. Existing events carry these additive fields; currency settings use authenticated
+hub routes in web and local mode, without a native bridge command. Original foreign-currency history stays available through the
 measurement API, and existing development-layout converted history is retained.
 
 Reader snapshots may include `currencies`, and a private `currencies` event updates it:
@@ -693,6 +849,7 @@ Reader snapshots may include `currencies`, and a private `currencies` event upda
   target: {id, name, symbol, fractionDigits},
   definitions: [{id, name, symbol, fractionDigits}],
   revision?: string,
+  registryRevision?: string,
   sources: {[sourceId]: [{from, at, anchor: string | null, steps: RateLeg[]}]}
 }
 ```
@@ -729,10 +886,61 @@ Authenticated registry operations, also available in local mode:
 - `POST /api/currencies/:id/rates`: `{base, rate, date?}` adds an owner-only fixed-rate
   version, effective at `date` or the current time. Future dates are rejected.
 
-The hub issues personal identities. Names or symbols never identify or merge currencies.
-Private operations use existing authentication and origin guards; errors carry only
-`invalid_currency` or `currency_not_found`. These operations support the future settings
-section without introducing provider-specific widgets or currency controls.
+- `GET /api/currencies/manage`: `{registryRevision, selected, standards, personal, maxActive}`.
+  Standards are the server-issued ISO catalogue. Each personal entry is
+  `{definition, archivedAt: number | null, pairs}`, including archived definitions; maxActive is 64.
+  Each current pair summary is `{base, rate: string | null}`: exact integer millionths,
+  or null for a stopped pair. Superseded rates do not reappear in this summary.
+- `GET /api/currencies/:id/history?before=<cursor>&limit=<1..64>`: retained personal
+  definition, archivedAt, current `pairs`, paginated `changes` and `nextCursor`.
+  A change carries `{sequence, base, effectiveAt, recordedAt, kind: 'rate' | 'stop',
+  quote: RateSnapshot | null, nominal}`. Sequence numbers count only this owner's rate
+  changes and stops. Pages run newest sequence first; the opaque
+  cursor is scoped to this owner and currency. Current pairs are independent of paging.
+- `POST /api/currencies/:id`: `{name, symbol, fractionDigits, ...mutation}` updates
+  metadata without changing identity, the nominal ratio or any recorded amounts.
+- `POST /api/currencies/:id/archive`: `{replacement?, ...mutation}` archives a personal
+  definition. If selected, an explicit different active replacement is required; both
+  changes commit atomically. Archived definitions cannot be selected or edited.
+- `POST /api/currencies/:id/restore`: `{...mutation}` restores availability without
+  selecting the currency or cancelling any rate stops.
+- `POST /api/currencies/:id/rates/:quoteId/archive`: `{base, ...mutation}` stops the
+  current version of this personal pair at server time. A superseded quote conflicts.
+
+`mutation` is `{expectedRevision: string, requestId: UUID}`. New lifecycle routes require
+both fields. The existing create, select and rate routes accept them additively and keep
+their prior success shapes. Every private write increments the owner's registry revision
+once; public rates do not. An owner-scoped receipt is checked before CAS: the same request
+and payload return its original success, while reusing an ID with another payload returns
+`409 mutation_conflict`. Receipts are retained seven days. An expired request with a stale
+revision conflicts instead of creating a duplicate. Legacy writes still validate lifecycle
+and update revisions. Settings reload management after success; a source-free command
+response must not replace the board's complete currency context.
+
+Private routes use existing session and origin guards. Errors include `400 invalid_currency`,
+`400 currency_limit`, `404 currency_not_found`, and `409 currency_conflict`,
+`currency_selected`, `currency_archived` or `mutation_conflict`. Display selection keeps
+its existing `400 invalid_currency` for inaccessible targets. Foreign personal IDs are
+unavailable. Standard definitions and public quotes are read-only. Management details,
+archived definitions, full ISO lists, receipts and version lists never enter shared SSE.
+The private event includes registryRevision and active personal definitions only.
+
+Rates are immutable. The latest effective pair event wins, with sequence breaking equal
+UTC millisecond timestamps. A stop closes that pair without falling back to an older price.
+A later rate resumes it; a correction backdated before the stop does not resume it now.
+Other configured active pairs can still supply a path. The owner-wide private path revision
+refreshes missing history even for a standard target reached through a personal bridge;
+metadata-only edits do not change that revision. Successful historical assignments never
+change. Rate/preference changes cannot create spending, top-ups or native measurements.
+
+Unavailable real observation anchors are retryable, not immutable negative assignments.
+They terminate the previous displayed interval at the actual observation, not at the rate
+stop. A later rate may recover that anchor only if its effective interval covers it.
+Observation cells retain disjoint intervals with `observations[]`, even with only two
+segments. Positive ranges coalesce only across continuous eligibility, without swallowing
+missing anchors. Retention preserves pair decisions at retained native anchors even for
+readers without prior assignments. Retained versions are not an unlimited audit log.
+The hub issues personal identities; names and symbols never identify or merge currencies.
 
 A frame that cannot fit losslessly in the history budget returns `413 history_limit`.
 
@@ -740,7 +948,7 @@ DeepSeek connections use owner-only `POST /api/credentials` with
 `{provider: "deepseek", secret, account: {kind: "new", name} | {kind: "existing", id},
 sameAccount?, allowUnknownExpiry?, requestId?}`. Existing account selection
 requires `sameAccount: true` before provider work. Replacement accepts only
-`{secret, sameAccount: true, allowUnknownExpiry?}`. Its API cannot verify the
+`{secret, sameAccount: true, allowUnknownExpiry?, requestId?}`. Its API cannot verify the
 owner's identity declaration. Account names are normalized private labels, unique
 per owner/provider, independent of immutable UUIDs and keys. A new account creates a
 new source; last-key removal preserves identity and retained history for reconnection.
@@ -756,12 +964,13 @@ creates, replacement and polls, including resets with no credentials.
 
 OpenRouter connections use owner-only `POST /api/credentials` with `{provider, secret,
 allowNoExpiry?, requestId?}` and replacement with `{secret, allowNoExpiry?}`. An access
-without expiry requires explicit `allowNoExpiry: true`; otherwise the hub returns
-`409 credential_expiry_confirmation` with `{expiresAt: null, expiryKind: "none"}`
-without writing. Replacement keeps owner, provider
-and source; a different account is refused. The optional creation requestId is a UUID,
-replayed for the same owner/provider for 24 hours, with a tombstone after deletion.
-Replacement accepts no requestId. Deleting the last own bound credential releases
+with confirmed no expiry is admitted in one informed submit; `allowNoExpiry` remains
+accepted for compatibility but does not gate admission. Replacement keeps owner,
+provider and source; a different supplier account is refused. The optional creation
+requestId is a UUID, replayed for the same owner/provider for 24 hours, with a tombstone
+after deletion. Replacement accepts an optional requestId and returns the durable
+operationId for recovery; its committed cleanup warning does not ask for a new key.
+Deleting the last own bound credential releases
 that person's holding and orphan shares, preserving other holders and history.
 
 z.ai expiry is `unknown`, distinct from confirmed `none` and `dated`. Owner credential
@@ -987,3 +1196,108 @@ proof is `credential_access_invalid` (revoked or expired). Keys and raw organiza
 headers never enter board state, events or history. Hub refresh may finish as
 `updated_partially`; certified data can remain visible while a transient attempt still
 fails and preserves its supplier retry deadline across refresh, rotation and restart.
+## Mixed Codex subscription and credit balance
+
+Codex keeps one source/card with independent quota, reset and financial observations.
+Authorized cards add `creditBalance: {id, unit, status, hasCredits?, at, staleAfterMs}`,
+`resources: {windows?, resets?}` (each `{status, at, staleAfterMs}`; resets also retain `valueAt` and `valueStaleAfterMs` for the last reported count), and a native
+`balance:credits` meter in `credits:codex`. Its `amount` is an exact signed integer
+coefficient with per-value `scale` (0–18); absent scale means 6 for existing money.
+Meter semantics and history retain scale; composed summaries carry `startScale` and
+`endScale`. Conversion originals retain amount, scale and actual observation time.
+Packed observation cells preserve all exclusive gaps and scale changes, including
+within one cell. Retention and a requested crop do not change a sample's origin.
+
+`budget: {enabled, since, anchor, revision}` describes financial authority on a board.
+Personal boards allow it. Shared Codex sources default to disabled; existing wallet
+providers retain complete historical access (`since=anchor=0`). Disabled finance
+removes amounts, credit statuses, flags, histories and currency bindings from every
+board projection and event. Quotas and free resets remain visible. `GET /api/boards/:board/shares`
+includes `budget`; a member who holds the source may use
+`PUT /api/boards/:board/shares/:source/budget` with `{enabled, expectedRevision}`.
+A stale revision returns 409 `share_conflict`; repeating the current desired state
+with the current revision is a no-op. Board ownership alone cannot grant funds.
+Enablement sets `since` and clears `anchor`; the first accepted finite observation
+at or after it stores the anchor and one durable reading even for an unchanged value.
+Current last-known funds may predate consent and keep their actual timestamp, but
+history admits no earlier evidence. Re-enabling starts over. Source addition items
+may include `includeBudget: [sourceId, ...]`, a frozen, explicit subset of the selected
+Codex sources included in the request's idempotency identity. Device selection alone
+never grants financial access.
+
+Native history cache identity includes the financial revision, cutoff and anchor.
+Clients include those fields in their selection generation and discard revoked data
+and late responses. Both scoped and legacy history endpoints enforce the same authority
+before currency conversion, without substituting crop boundaries for admission.
+Before delivering a prepared batch, the hub rechecks its financial authority. A
+mismatch rebuilds the current snapshot, including the reader's currency context.
+Poll leases also retain the authority of their last delivered dataset: an intervening
+grant revision discards undelivered frames and returns a fresh snapshot, including
+after a disable/re-enable cycle. Normal SSE updates keep the delta protocol; current
+card grant metadata changes the client's financial history generation. Financial
+invalidations exclude disabled or unadmitted grants and cannot precede the current
+admission anchor.
+
+`credits:codex` is an immutable builtin currency definition with `kind: provider-credit`.
+It is convertible but cannot be selected as a display currency and uses none of the 64
+personal definition slots. Currency management includes `builtins`. Its public immutable
+`codex-default` quote is based on credits, dated 0 with unlimited validity, and has
+rates `credits:codex=1000000`, `USD=40000`: one credit is estimated at 0.04 USD.
+It is independent of the latest public FX quote and requires no network request.
+The existing rate endpoint accepts `direction: basePerUnit` for an exact USD-per-credit
+personal override; omitted direction retains the legacy `unitPerBase` contract.
+Builtin updates require the ordinary revision and request receipt. A POST to
+`/api/currencies/credits:codex/rates/default` appends a default-restoration event,
+preserving old overrides and successful observation bindings. Overrides are private.
+
+Valuation uses an existing binding first, otherwise exactly one current credit/USD
+rate followed by the shared USD/display path (at most three legs), with one final
+rounding. USD selection follows this contract too. There is no synthetic USD meter
+for Codex: subscription-funds analytics select the native meter and request `currency=USD`
+when appropriate. Provider history and spending do not change with exchange rates.
+Cards and compact rows show Additional funds in the subscription footer beside free
+resets, using the shared money renderer; unlimited, missing, unsupported, invalid, stale
+and confirmed zero remain distinct. Hovering shows the exact native balance; the
+disclosure adds the timestamp and rate provenance. A stale amount stays visible in
+the warning colour as the last known balance. Subscription extra funds trends shows
+credit history separately from wallet budgets. Spending and top-ups are unavailable
+for credits, and quota analytics remain percentage-based.
+
+
+## Private machine clients
+
+Only the owner's personal snapshot has `ownSessions`, an array of running sessions
+without a currently held source. Each session includes `clientId`, machine ID/name,
+origin, project/folder, start, last work, working and credited `workedMs`; it contains no
+producer ID, raw source attribution or provenance. Shared snapshots omit this field.
+The private `ownSessions` event is `{sessions: [...]}` and replaces this slice only.
+Normal source `sessions` also carry `clientId` and retain their visibility rules.
+
+A personal `history` event may include `ownSince`, independently of `sources`, `since`
+and scoped `changes`. The quota/activity reader invalidates from this cutoff even when
+no sources are selected; budget and subscription funds readers ignore it. Private and
+source history coalesce into one frame using their earliest independent cutoffs. No
+synthetic source ID is used. Closed history tiles invalidate on private credit even
+without watchers. Names, ownership and visibility changes invalidate from zero; quiet
+presence expires on the usual five-minute deadline. Shared streams never receive this
+private slice or cutoff, including when the owner is a member.
+
+Personal quota history includes activity without cards. Unknown and unheld work uses a
+null source in activity cells and the reserved `unknown` source group; it produces no
+quota series, spending correlation or forecast. A held source under a hidden card keeps
+its existing exclusion. The Agents and Agent activity widgets can be placed through
+Add widget on empty or budget-only boards; explicit hiding remains authoritative.
+
+`GET /api/devices` adds owner-private `clients` entries (`clientId`, nullable `version`,
+`seenAt`) and current `sessions` with the safe board fields plus a held source ID or null.
+Device revocation removes inventory and current presence. Inventory changes use the
+existing connection revision. The account-private `devices` hint reaches the device
+owner on any board, including a shared board, when current device presence changes or
+expires. Other readers receive no hint. It carries no private board data and changes no
+connection revision. An open Devices disclosure reads the owner API on this hint, on
+reconnect and on opening; closed disclosures do not read on presence hints. Clients and
+measuring settings are separate in desktop
+`app_state`: `clients` has `id`, `enabled`, reserved `route` consent and nullable `path`;
+`app_save_settings` accepts client enabled/route patches without a new bridge command.
+With every collector disabled and tracking enabled, the agent state is `tracking`;
+`idle` means both measurement and client tracking are off.

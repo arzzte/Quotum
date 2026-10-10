@@ -25,7 +25,7 @@ type Method = 'GET' | 'POST' | 'DELETE';
 const halted = new AbortController();
 export const haltRequests = () => halted.abort();
 
-async function call<T>(base: string, method: Method, path: string, options: {body?: unknown; cookie?: string; token?: string} = {}): Promise<{body: T; cookie: string | null}> {
+async function call<T>(base: string, method: Method, path: string, options: {body?: unknown; cookie?: string; token?: string; headers?: Record<string,string>} = {}): Promise<{body: T; cookie: string | null}> {
   const response = await fetch(base + path, {
     method,
     headers: {
@@ -34,6 +34,7 @@ async function call<T>(base: string, method: Method, path: string, options: {bod
       ...(options.cookie ? {cookie: options.cookie} : {}),
       ...(options.cookie&&method!=='GET'?{origin:new URL(process.env.QUOTUM_PUBLIC_URL??base).origin}:{}),
       ...(options.token ? {authorization: `Bearer ${options.token}`} : {}),
+      ...options.headers,
     },
     body: options.body === undefined ? undefined : JSON.stringify(options.body),
     signal: halted.signal,
@@ -96,7 +97,8 @@ export class Person {
   }
 
   async saveView(board: string, view: object) {
-    await this.post(`/api/boards/${encodeURIComponent(board)}/view`, view);
+    const snapshot=await this.get<{viewRevision:number}>(`/api/overview?board=${encodeURIComponent(board)}`);
+    await call(this.base,'POST',`/api/boards/${encodeURIComponent(board)}/view`,{body:view,cookie:this.cookie,headers:{'X-Quotum-View-Version':'2','If-Match':'"'+snapshot.viewRevision+'"'}});
   }
 
   async approve(code: string) {
@@ -123,6 +125,11 @@ export class Agent {
     private readonly token: string,
   ) {}
 
+  private clientSessions: object[] = [];
+  private clients: object[] | undefined;
+  trackClients(sessions: object[], clients: object[]) { this.clientSessions = sessions; this.clients = clients; }
+  get clientSessionCount() { return this.clientSessions.length; }
+
   static readonly VERSION = 'quotum-demo/1';
 
   /** Connects a machine with a one-time code that `person` approves, as `quotum connect` does. */
@@ -148,7 +155,7 @@ export class Agent {
 
   /** Tells the hub the machine's whole list of running agents, as of now. */
   async sessions(sessions: object[], now: number) {
-    const body = {version: 1, agent: Agent.VERSION, machine: this.machine, sentAt: new Date(now).toISOString(), sessions};
+    const body = {version: 1, agent: Agent.VERSION, machine: this.machine, sentAt: new Date(now).toISOString(), sessions, clientSessions: this.clientSessions, ...(this.clients ? {clients: this.clients} : {})};
     return (await call<{accepted: number}>(this.base, 'POST', '/v1/sessions', {body, token: this.token})).body;
   }
 }

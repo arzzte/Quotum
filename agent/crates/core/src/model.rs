@@ -158,6 +158,43 @@ pub struct RunningSession {
     pub working: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientSource {
+    pub provider: Provider,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account_name: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ClientSession {
+    pub client_id: crate::clients::ClientId,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<ClientSource>,
+    pub origin: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub folder: Option<String>,
+    #[serde(with = "ts")]
+    pub started_at: Millis,
+    #[serde(skip_serializing_if = "Option::is_none", with = "ts::option")]
+    pub last_worked_at: Option<Millis>,
+    pub working: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SessionReport {
+    pub sessions: Vec<RunningSession>,
+    pub client_sessions: Vec<ClientSession>,
+    pub clients: Vec<crate::clients::InstalledClient>,
+}
+
 /// A successful measurement of one provider account on one machine.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -184,6 +221,48 @@ pub struct Snapshot {
     /// Free resets of the limits the account holds, when the client reports them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resets: Option<Resets>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_status: Option<ResourceStatuses>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub balances: Option<Vec<CreditBalance>>,
+}
+
+/// Independent observations do not make retained values fresh.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ResourceStatus {
+    Observed,
+    Missing,
+    Unsupported,
+    Invalid,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResourceStatuses {
+    pub windows: ResourceStatus,
+    pub resets: ResourceStatus,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BalanceStatus {
+    Finite,
+    Unlimited,
+    Missing,
+    Unsupported,
+    Invalid,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreditBalance {
+    pub id: String,
+    pub unit: String,
+    pub status: BalanceStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub amount: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub has_credits: Option<bool>,
 }
 
 /// Free resets of the plan's limits (providers grant them now and then): how many can be
@@ -436,6 +515,8 @@ mod tests {
                 window("spark", Some(0), Some(" Spark ")),
             ],
             resets: Some(Resets::new(5_000, (0..60).map(|i| (100, Some(i))))),
+            resource_status: None,
+            balances: None,
         };
         snapshot.tidy();
         assert_eq!((snapshot.account_name, snapshot.client), (None, None));
@@ -463,6 +544,8 @@ mod tests {
             windows: vec![Window::new("weekly", Some(WEEK_MINUTES), None, 10.0, None)],
             // Every one within how many there are, but a group for each.
             resets: Some(Resets::new(60, (0..60).map(|i| (1, Some(i))))),
+            resource_status: None,
+            balances: None,
         };
         snapshot.tidy();
         let expiring = snapshot.resets.unwrap().expiring;
@@ -485,6 +568,8 @@ mod tests {
             stale_after_ms: 300_000,
             windows: vec![Window::new("weekly", Some(WEEK_MINUTES), None, 8.0, Some(ms))],
             resets: Some(Resets::new(3, [(1, Some(ms)), (1, None)])),
+            resource_status: None,
+            balances: None,
         };
         let json = serde_json::to_value(&snapshot).unwrap();
         assert_eq!(json["observedAt"], "2026-09-22T20:20:00.77Z");

@@ -14,6 +14,7 @@ import type {ResetFeed, TrackerHealth} from './resets.js';
 import type {BoardSession} from './sessions.js';
 import type {Why} from './cadence.js';
 import type {MeasureIntervalMs} from './domain/frequency.js';
+import type {BudgetAccess} from './domain/resources.js';
 import type {SourceState} from './domain/quota.js';
 import type {ResetProvider, ResetStatus} from './domain/resets.js';
 import type {View} from './domain/view.js';
@@ -35,16 +36,16 @@ import type {Announcement, BoardSource, Store} from './store/store.js';
 export type Timed<T> = {value: T; changesAt: number | null};
 
 /** A source as a card shows it: its state, whose it is on this board, and whether its numbers are too old. */
-export type Card = SourceState & {owners: string[]; stale: boolean; measureIntervalMs: MeasureIntervalMs;spending?:CalendarSpend|null;keysCount?:number;reportedSpending?:ReportCalendar[];allowance?:Allowance|null;currencyUnavailable?:boolean;identityOrigin?:'supplier'|'declared'};
+export type Card = SourceState & {budget?:BudgetAccess;owners: string[]; stale: boolean; measureIntervalMs: MeasureIntervalMs;reportedSpending?:ReportCalendar[];allowance?:Allowance|null;spending?:CalendarSpend|null;keysCount?:number;currencyUnavailable?:boolean;identityOrigin?:'supplier'|'declared'};
 
 /** When a source is measured next and why, while its holder follows the hub's pace. */
 export type Cadence = {by?:'hub';next: number; why: Why} | null;
 
-export type BoardPart = {board: {id: string; name: string; personal: boolean}; view: View; lineup: string[]};
+export type BoardPart = {board: {id: string; name: string; personal: boolean}; view: View; viewRevision: number; lineup: string[]};
 export type SourcePart = {card: Card; sessions: BoardSession[]; cadence: Cadence; refresh: Refresh};
 /** Where the recent pace of a source's weekly windows leads, by window id (server/forecasts.ts). */
 export type ForecastPart = Record<string, WindowForecast>;
-export type ReaderPart = {mine: string[]; boards: Board[];currencies:CurrencyContext};
+export type ReaderPart = {mine: string[]; boards: Board[]; connectionsRevision: number; currencies:CurrencyContext};
 export type HubPart = {resets: Partial<Record<ResetProvider, ResetStatus>>; trackers: TrackerHealth[]; past: Record<string, Announcement[]>};
 
 /** The whole board for one reader at once (spec: `snapshot`). */
@@ -54,6 +55,7 @@ export type Snapshot = Omit<BoardPart, 'lineup'> & {
   historyStart: number;
   sources: Card[];
   sessions: Record<string, BoardSession[]>;
+  ownSessions?: BoardSession[];
   cadence: Record<string, Cadence>;
   refresh: Record<string, Refresh>;
   forecast: Record<string, ForecastPart>;
@@ -69,9 +71,9 @@ const byHubSource=(provider:string)=>providerOf(provider)?.measuredBy==='hub';
 const DAY = 86_400_000;
 
 /** Credential failures are private even to other members of a source's shared board. */
-export function publicSourceState(state: SourceState): SourceState {
+export function publicSourceState(state: SourceState, financial=true): SourceState {
   const error = state.error?.startsWith('secret_key_') || state.error?.startsWith('credential_') ? 'unmeasured' : state.error;
-  return {id: state.id, provider: state.provider, plan: state.plan, successAt: state.successAt, error, windows: state.windows, staleAfterMs: state.staleAfterMs, resets: state.resets,...(state.quota?{quota:state.quota}:{}),...(state.balanceStatus?{balanceStatus:{isAvailable:state.balanceStatus.isAvailable,at:state.balanceStatus.at,staleAfterMs:state.balanceStatus.staleAfterMs,partial:state.balanceStatus.partial,issues:state.balanceStatus.issues}}:{}),...(state.meters?{meters:state.meters,keys:state.keys,inventory:state.inventory}:{}),...(state.reportQuality?{reportQuality:state.reportQuality,monthlyLimit:state.monthlyLimit?{...state.monthlyLimit,error:state.monthlyLimit.error?'unavailable':null}:undefined}:{})};
+  return {id: state.id, provider: state.provider, plan: state.plan, successAt: state.successAt, error, windows: state.windows, staleAfterMs: state.staleAfterMs, resets: state.resets,...(state.resources?{resources:state.resources}:{}),...(financial&&state.creditBalance?{creditBalance:state.creditBalance}:{}),...(state.quota?{quota:state.quota}:{}),...(financial&&state.balanceStatus?{balanceStatus:{isAvailable:state.balanceStatus.isAvailable,at:state.balanceStatus.at,staleAfterMs:state.balanceStatus.staleAfterMs,partial:state.balanceStatus.partial,issues:state.balanceStatus.issues}}:{}),...(state.meters&&(financial||!monetaryOf(state.provider))?{meters:state.meters,keys:state.keys,inventory:state.inventory}:{}),...(financial&&state.reportQuality?{reportQuality:state.reportQuality,monthlyLimit:state.monthlyLimit?{...state.monthlyLimit,error:state.monthlyLimit.error?'unavailable':null}:undefined}:{})};
 }
 
 export class Projection {
@@ -86,7 +88,8 @@ export class Projection {
   boardPart(board: string, lineup = this.lineup(board)): BoardPart | null {
     const found = this.hub.directory.board(board);
     if (!found) return null;
-    return {board: found, view: this.hub.directory.view(board), lineup: lineup.map(s => s.id)};
+    const {view, revision} = this.hub.directory.viewState(board);
+    return {board: found, view, viewRevision: revision, lineup: lineup.map(s => s.id)};
   }
 
   /**
@@ -106,9 +109,9 @@ export class Projection {
   /** One source of a board: its card, the agents running on it on the machines of its people there, and its pace. */
   sourcePart(source: BoardSource, members: Map<string, string>, now: number): Timed<SourcePart> {
     const {store, ingest} = this.hub;
-    const state = publicSourceState(store.state(source.id));
-    const stale = state.successAt === null || state.staleAfterMs === null || now - state.successAt > state.staleAfterMs;
-    const card: Card = {...state, owners: source.holders.flatMap(id => members.get(id) ?? []).sort(), stale, measureIntervalMs: store.measureInterval(source.id)};
+    const state = publicSourceState(store.state(source.id),source.budget?.enabled!==false);
+    const stale = state.successAt === null || state.staleAfterMs === null || now - state.successAt > state.staleAfterMs || !!state.resources?.windows && state.resources.windows.status!=='observed';
+    const card: Card = {...state,...(source.budget?{budget:source.budget}:{}), owners: source.holders.flatMap(id => members.get(id) ?? []).sort(), stale, measureIntervalMs: store.measureInterval(source.id)};
     if(byHubSource(source.provider))card.identityOrigin=(store.db.prepare('SELECT kind FROM source_identity WHERE source_id=?').get(source.id)?.kind as Card['identityOrigin'])??'supplier';
     if(card.meters) {
       const keys=card.keys??[];if(!card.quota)card.keysCount=keys.length;card.keys=keys.slice(0,5).map(k=>({...k,periods:{day:utcPeriods(k.at).day===utcPeriods(now).day?k.periods.day:null,week:utcPeriods(k.at).week===utcPeriods(now).week?k.periods.week:null,month:utcPeriods(k.at).month===utcPeriods(now).month?k.periods.month:null}}));
@@ -116,12 +119,12 @@ export class Projection {
       card.meters=card.meters.filter(m=>!m.id.startsWith('key:')||preview.has(m.id.split(':')[1])).map(m=>({...m,stale:m.stale||now>m.at+m.staleAfterMs||m.kind==='cap'&&m.resetAt!==null&&m.resetAt<=now}));
       const credits=card.meters.find(m=>m.id==='credits'),usage=card.meters.find(m=>m.id==='usage');
       if(credits&&usage&&credits.unit===usage.unit)card.meters.push({...usage,id:'balance',kind:'balance',amount:(BigInt(credits.amount)-BigInt(usage.amount)).toString(),stale:credits.stale||usage.stale});
-      const originals=card.meters.filter(m=>m.kind==='balance'&&m.unit!==DEFAULT_CURRENCY&&balanceDescriptor(card.provider,m.id));
+      const originals=card.meters.filter(m=>m.kind==='balance'&&m.unit!==DEFAULT_CURRENCY&&m.unit!=='credits:codex'&&balanceDescriptor(card.provider,m.id));
       for(const native of originals){const value=store.currencies.project(source.id,native,DEFAULT_CURRENCY,now);if(value)card.meters.push(value);}
       const nativeUsd=card.meters.some(m=>m.unit===DEFAULT_CURRENCY&&!m.conversion&&balanceDescriptor(card.provider,m.id)?.role==='total');
       if(!nativeUsd&&originals.some(m=>!m.stale&&balanceDescriptor(card.provider,m.id)?.role==='total'&&!card.meters!.some(v=>v.conversion?.original.meterId===m.id&&!v.stale)))card.currencyUnavailable=true;
       const accounting=monetaryOf(card.provider);
-      if(accounting&&!state.reportQuality)card.spending=accounting.spending==='counter'?store.meters.calendar(source.id,now,state.successAt??utcPeriods(now).day):null;
+      if(accounting&&!state.reportQuality&&source.budget?.enabled!==false)card.spending=accounting.spending==='counter'?store.meters.calendar(source.id,now,state.successAt??utcPeriods(now).day):null;
     }
     if(state.reportQuality){card.reportedSpending=store.reports.calendar(source.id,now);card.allowance=reportAllowance(card.reportedSpending,state.monthlyLimit,now);}
     const people = source.holders.filter(id => members.has(id));
@@ -130,7 +133,7 @@ export class Projection {
     const cadence = byHub?this.hub.hubSources?.cadence(source.id)??{value:null,changesAt:null}:ingest.nextMeasurement(source.id, source.account, now);
     return {
       value: {card, sessions: ingest.live.of(source.id, people, now), cadence: cadence.value, refresh: refresh.value},
-      changesAt: earliest(state.balanceStatus&&now<=state.balanceStatus.at+state.balanceStatus.staleAfterMs?state.balanceStatus.at+state.balanceStatus.staleAfterMs+1:null,...state.windows.map(w => w.resetAt !== null && w.resetAt > now ? w.resetAt : null),...(card.meters??[]).map(m=>m.stale?null:m.at+m.staleAfterMs+1),...(card.meters??[]).map(m=>m.resetAt!==null&&m.resetAt>now?m.resetAt:null),card.spending||card.reportedSpending?utcPeriods(now).day+86_400_000:null,this.hub.credentials?.nextExpiry(source.id,now)??null, stale ? null : state.successAt! + state.staleAfterMs! + 1, ingest.live.ofChangesAt(source.id, people, now), cadence.changesAt, refresh.changesAt),
+      changesAt: earliest(state.creditBalance&&now<=state.creditBalance.at+state.creditBalance.staleAfterMs?state.creditBalance.at+state.creditBalance.staleAfterMs+1:null,state.balanceStatus&&now<=state.balanceStatus.at+state.balanceStatus.staleAfterMs?state.balanceStatus.at+state.balanceStatus.staleAfterMs+1:null,...state.windows.map(w => w.resetAt !== null && w.resetAt > now ? w.resetAt : null),...(card.meters??[]).map(m=>m.stale?null:m.at+m.staleAfterMs+1),...(card.meters??[]).map(m=>m.resetAt!==null&&m.resetAt>now?m.resetAt:null),card.spending||card.reportedSpending?utcPeriods(now).day+86_400_000:null,this.hub.credentials?.nextExpiry(source.id,now)??null, stale ? null : state.successAt! + state.staleAfterMs! + 1, ingest.live.ofChangesAt(source.id, people, now), cadence.changesAt, refresh.changesAt),
     };
   }
 
@@ -189,9 +192,8 @@ export class Projection {
   }
   currencyContext(user:string,lineup:BoardSource[],now:number):CurrencyContext {
     const {store}=this.hub;
-    if(store.currencies.preference(user).id===DEFAULT_CURRENCY)return store.currencies.context(user);
     const inputs=Object.fromEntries(lineup.map(source=>{
-      const meters=store.state(source.id).meters??[],points=meters.map(m=>({unit:m.unit,at:m.at,anchor:null as string|null}));
+      const meters=source.budget?.enabled===false?[]:store.state(source.id).meters??[],points=meters.map(m=>({unit:m.unit,at:m.at,anchor:null as string|null}));
       for(const native of meters){const value=store.currencies.project(source.id,native,DEFAULT_CURRENCY,now);if(value?.conversion)points.push({unit:value.conversion.original.unit,at:value.conversion.original.at,anchor:value.conversion.rate.id});}
       return [source.id,points];
     }));
@@ -217,6 +219,11 @@ export class Projection {
     return {value: {...this.hub.resets.snapshot(), past}, changesAt: oldest === null ? null : oldest + kept + 1};
   }
 
+  ownSessions(user: string, board: string, now: number): Timed<BoardSession[]> | null {
+    if (this.hub.store.privateOwner(board) !== user) return null;
+    return {value: this.hub.ingest.live.own(user, board, now), changesAt: this.hub.ingest.live.ownChangesAt(user, board, now)};
+  }
+
   /** The board as the reader sees it now; null once it is gone. */
   snapshot(user: string, board: string, now: number): Snapshot | null {
     const lineup = this.lineup(board);
@@ -230,14 +237,17 @@ export class Projection {
       currencies:this.currencyContext(user,lineup,now),
       board: part.board,
       view: part.view,
+      viewRevision: part.viewRevision,
       historyStart: this.hub.store.historyStart(now),
       sources: sources.map(s => s.card),
+      ...(this.hub.store.privateOwner(board) === user ? {ownSessions: this.ownSessions(user, board, now)!.value} : {}),
       sessions: Object.fromEntries(lineup.map((s, i) => [s.id, sources[i].sessions])),
       cadence: Object.fromEntries(lineup.map((s, i) => [s.id, sources[i].cadence])),
       refresh: Object.fromEntries(lineup.map((s, i) => [s.id, sources[i].refresh])),
       forecast: Object.fromEntries(lineup.map(s => [s.id, this.forecastPart(s.id, now).value])),
       mine: this.mine(user, lineup),
       boards: this.boards(user),
+      connectionsRevision: this.hub.directory.connectionsRevision(user),
       resets: this.hubPart(now).value,
     };
   }

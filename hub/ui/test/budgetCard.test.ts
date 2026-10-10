@@ -15,6 +15,7 @@ function render(source:Card,compact=false) {
     if(name==='react/jsx-runtime')return {jsx:(type:unknown,props:Node['props'])=>({type,props}),jsxs:(type:unknown,props:Node['props'])=>({type,props}),Fragment:'fragment'};
     if(name.endsWith('/money'))return amounts;
     if(name.endsWith('/currency'))return currency;
+    if(name.endsWith('/currencySettings'))return {rateText:()=>''};
     if(name.endsWith('/format'))return formats;
     if(name.endsWith('/clock'))return {useClock:()=>100};
     if(name.endsWith('/i18n'))return {t};

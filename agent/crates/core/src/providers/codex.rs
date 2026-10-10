@@ -7,7 +7,8 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Value, json};
 
-use super::{Adapter, Context, locate, process_failure, version_in};
+use super::{Collector, Context, locate, process_failure, version_in};
+use crate::model::{BalanceStatus, CreditBalance, ResourceStatus, ResourceStatuses};
 use crate::model::{ErrorKind, Failure, Kind, Millis, Outcome, Provider, Resets, Snapshot, Window, now_ms, pseudonym};
 use crate::process::Client;
 
@@ -18,34 +19,9 @@ const PLAN_LIMIT: &str = "codex";
 
 pub struct Codex;
 
-impl Adapter for Codex {
+impl Collector for Codex {
     fn provider(&self) -> Provider {
         P
-    }
-
-    fn program(&self) -> &'static str {
-        "codex"
-    }
-
-    fn install_dirs(&self, home: &Path) -> Vec<PathBuf> {
-        // And where the installer of the command-line client puts it on Windows.
-        let installer = dirs::data_local_dir().filter(|_| cfg!(windows));
-        let installer = installer.map(|local| local.join("Programs").join("OpenAI").join("Codex").join("bin"));
-        std::iter::once(home.join(".codex/bin")).chain(installer).collect()
-    }
-
-    /// The clients the Codex app and the editor extensions carry: whoever uses only those
-    /// has no command-line client to install.
-    fn fallback_dirs(&self, home: &Path) -> Vec<PathBuf> {
-        let mut found = Vec::new();
-        if cfg!(target_os = "linux") {
-            found.push(PathBuf::from("/usr/lib/chatgpt/resources"));
-        }
-        if cfg!(windows) {
-            found.extend(dirs::data_local_dir().map(|local| app_clients(&local)).unwrap_or_default());
-        }
-        found.extend(extension_clients(home));
-        found
     }
 
     fn measure(&mut self, ctx: &Context) -> Outcome {
@@ -78,7 +54,7 @@ impl Adapter for Codex {
 
 /// The directories holding the client of the Codex extension (`openai.chatgpt-<version>-<platform>`)
 /// in VS Code, its server and its forks, the newest version first.
-fn extension_clients(home: &Path) -> Vec<PathBuf> {
+pub(crate) fn extension_clients(home: &Path) -> Vec<PathBuf> {
     let version = |dir: &Path| -> Vec<u32> {
         let name = dir.file_name().and_then(|n| n.to_str()).unwrap_or_default();
         let version = name.trim_start_matches("openai.chatgpt-").split('-').next().unwrap_or_default();
@@ -104,7 +80,7 @@ fn extension_clients(home: &Path) -> Vec<PathBuf> {
 /// (installed from the web, or from the Store): each place, then the directories in it
 /// (`bin\\<hash>`), the newest first. Not the app's own package in WindowsApps: nobody
 /// but the app may start what is there.
-fn app_clients(local: &Path) -> Vec<PathBuf> {
+pub(crate) fn app_clients(local: &Path) -> Vec<PathBuf> {
     let places = [
         local.join("OpenAI").join("Codex").join("bin"),
         local
@@ -161,12 +137,27 @@ pub fn from_responses(init: &Value, limits: &Value, observed_at: Millis) -> Outc
         _ => vec![&result["rateLimits"]],
     };
 
+    let account = result["accountId"].as_str().filter(|id| !id.trim().is_empty()).map(|id| pseudonym(P, id));
+    let authoritative = result["rateLimitsByLimitId"].as_object().and_then(|map| map.get(PLAN_LIMIT)).or_else(|| {
+        match &result["rateLimits"]["limitId"] {
+            Value::Null => Some(&result["rateLimits"]),
+            Value::String(id) if id == PLAN_LIMIT => Some(&result["rateLimits"]),
+            _ => None,
+        }
+    });
+    let mut invalid_windows = false;
     let mut windows: Vec<Window> = Vec::new();
     for entry in entries {
         let limit = entry["limitId"].as_str().unwrap_or(PLAN_LIMIT);
         for w in [&entry["primary"], &entry["secondary"]] {
-            let Some(used) = w["usedPercent"].as_f64() else { continue };
-            let minutes = w["windowDurationMins"].as_u64().map(|m| m as u32);
+            if w.is_null() {
+                continue;
+            }
+            let Some(used) = w["usedPercent"].as_f64().filter(|v| v.is_finite() && (0.0..=100.0).contains(v)) else {
+                invalid_windows = true;
+                continue;
+            };
+            let minutes = w["windowDurationMins"].as_u64().and_then(|m| u32::try_from(m).ok());
             let slug = Kind::of_minutes(minutes).slug(minutes);
             let (id, label) = if limit == PLAN_LIMIT {
                 (slug, None)
@@ -174,27 +165,114 @@ pub fn from_responses(init: &Value, limits: &Value, observed_at: Millis) -> Outc
                 (format!("{limit}:{slug}"), Some(entry["limitName"].as_str().unwrap_or(limit).to_string()))
             };
             if !windows.iter().any(|x| x.id == id) {
-                windows.push(Window::new(id, minutes, label, used, w["resetsAt"].as_i64().map(|s| s * 1000)));
+                windows.push(Window::new(
+                    id,
+                    minutes,
+                    label,
+                    used,
+                    w["resetsAt"].as_i64().and_then(|s| s.checked_mul(1000)),
+                ));
             }
         }
     }
-    if windows.is_empty() {
+    if windows.is_empty() && account.is_none() {
         let kind = if result["rateLimits"].is_null() { ErrorKind::Unsupported } else { ErrorKind::InvalidOutput };
         return Err(Failure::new(P, kind, "no rate limit windows (API-key login?)"));
     }
 
+    let resets = reset_credits(&result["rateLimitResetCredits"]);
+    let resource_status = account.as_ref().map(|_| ResourceStatuses {
+        windows: if !windows.is_empty() {
+            ResourceStatus::Observed
+        } else if invalid_windows {
+            ResourceStatus::Invalid
+        } else {
+            ResourceStatus::Missing
+        },
+        resets: if resets.is_some() {
+            ResourceStatus::Observed
+        } else if result["rateLimitResetCredits"].is_null() {
+            ResourceStatus::Missing
+        } else {
+            ResourceStatus::Invalid
+        },
+    });
+    let balances = account.as_ref().map(|_| vec![credit_balance(authoritative.map(|entry| &entry["credits"]))]);
     Ok(Snapshot {
         provider: P,
         account_name: None,
-        account: result["accountId"].as_str().map(|id| pseudonym(P, id)),
-        plan: result["rateLimits"]["planType"].as_str().map(str::to_string),
+        account,
+        plan: authoritative
+            .and_then(|entry| entry["planType"].as_str())
+            .or_else(|| result["rateLimits"]["planType"].as_str())
+            .map(str::to_string),
         observed_at,
         via: VIA.into(),
         client: init["result"]["userAgent"].as_str().and_then(version_in),
         stale_after_ms: 0,
         windows,
-        resets: reset_credits(&result["rateLimitResetCredits"]),
+        resets,
+        resource_status,
+        balances,
     })
+}
+
+/// Only the account bucket supplies funds; flags are facts, never inferred permission.
+fn credit_balance(value: Option<&Value>) -> CreditBalance {
+    let mut balance = CreditBalance {
+        id: "balance:credits".into(),
+        unit: "credits:codex".into(),
+        status: BalanceStatus::Missing,
+        amount: None,
+        has_credits: None,
+    };
+    let Some(value) = value.filter(|v| !v.is_null()) else { return balance };
+    let (Some(has), Some(unlimited)) = (value["hasCredits"].as_bool(), value["unlimited"].as_bool()) else {
+        balance.status = BalanceStatus::Invalid;
+        return balance;
+    };
+    balance.has_credits = Some(has);
+    if unlimited {
+        balance.status = BalanceStatus::Unlimited;
+    } else if !value["balance"].is_null() {
+        balance.amount = value["balance"].as_str().and_then(exact_credits);
+        balance.status = if balance.amount.is_some() { BalanceStatus::Finite } else { BalanceStatus::Invalid };
+    }
+    balance
+}
+
+/// Normalize bounded plain decimals using integer digits alone, without rounding.
+fn exact_credits(value: &str) -> Option<String> {
+    if value.len() > 128 || !value.is_ascii() {
+        return None;
+    }
+    let negative = value.starts_with('-');
+    let digits = value.strip_prefix('-').unwrap_or(value);
+    let (whole, fraction) = match digits.split_once('.') {
+        Some((whole, fraction)) if !fraction.is_empty() => (whole, fraction),
+        Some(_) => return None,
+        None => (digits, ""),
+    };
+    if whole.is_empty()
+        || whole.len() > 1 && whole.starts_with('0')
+        || !whole.bytes().chain(fraction.bytes()).all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    let fraction = fraction.trim_end_matches('0');
+    if fraction.len() > 18 {
+        return None;
+    }
+    let coefficient: i64 = format!("{whole}{fraction}").parse().ok()?;
+    if coefficient == 0 {
+        return Some("0".into());
+    }
+    Some(format!(
+        "{}{}{}",
+        if negative { "-" } else { "" },
+        whole,
+        if fraction.is_empty() { String::new() } else { format!(".{fraction}") }
+    ))
 }
 
 /// Free rate-limit resets the account holds (`rateLimitResetCredits`): the available ones,
@@ -202,9 +280,15 @@ pub fn from_responses(init: &Value, limits: &Value, observed_at: Millis) -> Outc
 fn reset_credits(value: &Value) -> Option<Resets> {
     let credits = value["credits"].as_array();
     let available: Vec<&Value> = credits.into_iter().flatten().filter(|c| c["status"] == "available").collect();
-    let count =
-        value["availableCount"].as_u64().map(|n| n as u32).or_else(|| credits.map(|_| available.len() as u32))?;
-    Some(Resets::new(count, available.iter().map(|c| (1, c["expiresAt"].as_i64().map(|s| s * 1000)))))
+    let count = if value["availableCount"].is_null() {
+        u32::try_from(credits.map(|_| available.len())?).ok()?
+    } else {
+        u32::try_from(value["availableCount"].as_u64()?).ok()?
+    };
+    if count > 1000 {
+        return None;
+    }
+    Some(Resets::new(count, available.iter().map(|c| (1, c["expiresAt"].as_i64().and_then(|s| s.checked_mul(1000))))))
 }
 
 #[cfg(test)]
@@ -213,6 +297,57 @@ mod tests {
 
     fn init() -> Value {
         json!({"id": 1, "result": {"userAgent": "quotum/0.154.0 (Ubuntu 24.4.0; x86_64) xterm (quotum; 0.1.0)"}})
+    }
+
+    #[test]
+    fn exact_native_credits_survive_serde_and_tidy_without_rounding() {
+        let limits = json!({"result":{"accountId":"synthetic", "rateLimits":{"credits":{"hasCredits":false,"unlimited":false,"balance":"1234.5678912000"}}}});
+        let mut snapshot = from_responses(&init(), &limits, 1).unwrap();
+        snapshot.tidy();
+        assert!(snapshot.windows.is_empty());
+        assert_eq!(snapshot.balances.as_ref().unwrap()[0].amount.as_deref(), Some("1234.5678912"));
+        let wire = serde_json::to_string(&snapshot).unwrap();
+        assert_eq!(serde_json::from_str::<Snapshot>(&wire).unwrap(), snapshot);
+        assert_eq!(exact_credits("-0.000"), Some("0".into()));
+        for value in ["1e2", "01", "+1", "1.", "0.0000000000000000001", "9223372036854775808", "NaN"] {
+            assert_eq!(exact_credits(value), None, "{value}");
+        }
+        assert_eq!(exact_credits("0.000000000000000001"), Some("0.000000000000000001".into()));
+        assert_eq!(exact_credits("-9223372036854775807"), Some("-9223372036854775807".into()));
+    }
+
+    #[test]
+    fn only_the_authoritative_account_bucket_supplies_one_balance() {
+        let credits = json!({"hasCredits":true,"unlimited":false,"balance":"2500"});
+        let mut result = json!({"accountId":"synthetic", "rateLimits":{"credits":credits}, "rateLimitsByLimitId":{"codex":{"credits":null},"model":{"credits":credits}}});
+        let get = |result: &Value| from_responses(&init(), &json!({"result":result}), 1).unwrap().balances.unwrap();
+        assert_eq!(get(&result)[0].status, BalanceStatus::Missing);
+        result["rateLimitsByLimitId"]["codex"]["credits"] = credits.clone();
+        assert_eq!(get(&result).len(), 1);
+        assert_eq!(get(&result)[0].amount.as_deref(), Some("2500"));
+        result["rateLimitsByLimitId"] = json!({"model":{"credits":credits}});
+        result["rateLimits"]["limitId"] = json!("another-model");
+        assert_eq!(get(&result)[0].status, BalanceStatus::Missing);
+    }
+
+    #[test]
+    fn flags_are_not_a_zero_balance_or_purchase_permission() {
+        for (value, status, amount) in [
+            (json!({"hasCredits":false,"unlimited":false,"balance":"0"}), BalanceStatus::Finite, Some("0")),
+            (json!({"hasCredits":false,"unlimited":false,"balance":"-1.25"}), BalanceStatus::Finite, Some("-1.25")),
+            (json!({"hasCredits":true,"unlimited":true,"balance":"2500"}), BalanceStatus::Unlimited, None),
+            (json!({"hasCredits":false,"unlimited":false,"balance":null}), BalanceStatus::Missing, None),
+            (json!({"hasCredits":false,"unlimited":false,"balance":"NaN"}), BalanceStatus::Invalid, None),
+            (json!({"hasCredits":"false","unlimited":false,"balance":"0"}), BalanceStatus::Invalid, None),
+        ] {
+            let balance = credit_balance(Some(&value));
+            assert_eq!(balance.status, status);
+            assert_eq!(balance.amount.as_deref(), amount);
+        }
+        let result = json!({"result":{"rateLimits":{"primary":{"usedPercent":10},"credits":{"hasCredits":true,"unlimited":false,"balance":"2500"}}}});
+        let snapshot = from_responses(&init(), &result, 1).unwrap();
+        assert!(snapshot.balances.is_none());
+        assert!(snapshot.resource_status.is_none());
     }
 
     #[test]

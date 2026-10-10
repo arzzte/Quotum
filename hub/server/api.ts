@@ -1,8 +1,8 @@
+import {providerOf, quotaMeter, budgetMeter} from './domain/providers.js';
 import {Attention} from './attention.js';
-import {providerOf} from './domain/providers.js';
 import {STATUS_CODES} from 'node:http';
 import type {Socket} from 'node:net';
-import Fastify, {type FastifyReply, type FastifyRequest} from 'fastify';
+import Fastify, {type FastifyInstance, type FastifyReply, type FastifyRequest} from 'fastify';
 import staticFiles from '@fastify/static';
 import {config, serviceName, version} from './config.js';
 import type {Ingest} from './ingest.js';
@@ -13,7 +13,7 @@ import type {Pairing} from './pairing.js';
 import type {ResetFeed} from './resets.js';
 import type {Store} from './store/store.js';
 import type {Board, Directory, User} from './store/directory.js';
-import {CSP, currentUser, sameSite} from './session.js';
+import {CSP, currentUser, Limiter, sameSite} from './session.js';
 import type {Setup} from './setup.js';
 import {Events} from './events.js';
 import {Projection} from './projection.js';
@@ -28,18 +28,24 @@ import {displayHistory} from './currencies/history.js';
 import type {Chunk} from './domain/history.js';
 import {currencyRoutes} from './routes/currencies.js';
 import {sourceKeyRoutes} from './routes/sourceKeys.js';
+import {BoardAdditions} from './additions.js';
+import {additionRoutes} from './routes/additions.js';
+import {DeviceOnboarding} from './deviceOnboarding.js';
 
 /**
  * `local`: the desktop app's hub, with the key its window enters with (see local.ts); null
  * on a server. `events`: what open dashboards hear, made here when not given.
  */
-export type Hub = {store: Store; directory: Directory; resets: ResetFeed; ingest: Ingest; pairing: Pairing; setup: Setup; local: {key: string} | null; events?: Events; credentials?: Credentials; hubSources?:HubSources; secretSnapshot?: Pick<SecretInputs, 'storageAtStart' | 'wasFileAtStart'>};
+export type Hub = {store: Store; directory: Directory; resets: ResetFeed; ingest: Ingest; pairing: Pairing; setup: Setup; local: {key: string} | null; events?: Events; credentials?: Credentials; additions?:BoardAdditions; deviceOnboarding?:DeviceOnboarding; hubSources?:HubSources; secretSnapshot?: Pick<SecretInputs, 'storageAtStart' | 'wasFileAtStart'>};
 
 /** Route helpers shared by the route modules. */
 export type Guards = {
   user(request: FastifyRequest, reply: FastifyReply): User | null;
   board(request: FastifyRequest, reply: FastifyReply, boardId: string | undefined): {user: User; board: Board} | null;
 };
+
+/** Explicit composition for synthetic demo routes; ordinary startup supplies none. */
+export type ExtendHub = (app: FastifyInstance, hub: Hub, guards: Guards) => void | Promise<void>;
 
 /** Errors of the framework itself (malformed JSON, a body too large…) in the hub's `{error}` shape. */
 function errorCode(status: number, path: string): string {
@@ -78,10 +84,13 @@ function clientError(error: NodeJS.ErrnoException, socket: Socket & {_httpMessag
  * The desktop app's hub (`local`) has one person who never signs in: the window enters
  * at `/local`, and what is about accounts, sharing and connecting is not there.
  */
-export async function buildApp(hub: Hub) {
+export async function buildApp(hub: Hub, extend?: ExtendHub) {
   hub = {...hub, credentials: hub.credentials ?? new Credentials(hub.store, null, startSecrets(hub.store.db, {current: null, previous: null, reset: null, storageAtStart: null, wasFileAtStart: false}))};
   const {store, directory} = hub;
   const projection = new Projection(hub);
+  const additions = new BoardAdditions(store, directory, hub.credentials!);
+  hub.additions = additions;
+  hub.deviceOnboarding = new DeviceOnboarding(store, directory, additions);
   const {requestTimeoutMs, checkMs} = config.http;
   const app = Fastify({
     logger: false,
@@ -101,7 +110,8 @@ export async function buildApp(hub: Hub) {
   const anyHost = hosts.has('*');
   const history = new HistoryTiles(store);
   const events = hub.events ?? new Events(hub);
-  events.onHistory = (source, since) => history.touch(source, since);
+  events.onClientHistory = (user, since) => history.touchClient(user, since);
+  events.onHistory = (source, since, scopes) => history.touch(source, since, scopes);
   events.attach();
   hub.credentials!.setObserver(events);
   hub.hubSources?.setObserver(events);
@@ -112,7 +122,7 @@ export async function buildApp(hub: Hub) {
     if (request.method === 'GET' || request.method === 'HEAD') return;
     const path = request.url.split('?')[0];
     const api = path.startsWith('/api/');
-    const allowed = (request.method === 'POST' && (api || path.startsWith('/v1/'))) || (request.method === 'DELETE' && api);
+    const allowed = (request.method === 'POST' && (api || path.startsWith('/v1/'))) || ((request.method === 'DELETE' || request.method === 'PUT') && api);
     if (!allowed) return reply.code(405).send({error: 'method_not_allowed'});
     // Cookie-authenticated changes are accepted only from pages of this hub.
     const origin = request.headers.origin;
@@ -168,12 +178,14 @@ export async function buildApp(hub: Hub) {
     return snapshot;
   });
 
-  app.get<{Querystring: {cell?: string; from?: string; to?: string; board?: string; meters?: string; unit?: string; currency?:string; meta?:string}}>('/api/history', (request, reply) => {
+  app.get<{Querystring: {cell?: string; from?: string; to?: string; board?: string; meters?: string; unit?: string; currency?:string; meta?:string; scope?:string}}>('/api/history', (request, reply) => {
     const access = guards.board(request, reply, request.query.board);
     if (!access) return reply;
+    const scope = request.query.scope;
+    if(scope!==undefined&&scope!=='quota'&&scope!=='budget')return reply.code(400).send({error:'invalid_request'});
     const now = Date.now();
     // Credit quiet machines before deciding whether their tiles can be reused.
-    hub.ingest.live.sweep(now);
+    if(scope!=='budget')hub.ingest.live.sweep(now);
     const number = (value: string | undefined) => value && /^\d{1,15}$/.test(value) ? Number(value) : NaN;
     const cell = number(request.query.cell);
     const from = number(request.query.from);
@@ -182,7 +194,7 @@ export async function buildApp(hub: Hub) {
     if (!READ_CELLS.includes(cell) || !Number.isFinite(from) || !Number.isFinite(askedTo) || from % cell || (askedTo <= now && askedTo % cell)) return reply.code(400).send({error: 'invalid_request'});
     const to = Math.min(Math.ceil(askedTo / cell) * cell, cellStart(now + CLOCK_TOLERANCE_MS, cell) + cell);
     const oldest = tileStart(tileOf(now - config.retention.sampleDays * 86_400_000, cell), cell);
-    if (to <= from || to % cell || from < oldest || tileOf(to - 1, cell) - tileOf(from, cell) + 1 > MAX_READ_TILES) return reply.code(400).send({error: 'invalid_request'});
+    if (to % cell || tileOf(to - 1, cell) - tileOf(from, cell) + 1 > MAX_READ_TILES) return reply.code(400).send({error: 'invalid_request'});
     const board = access.board.id;
     const shown = store.shown(board, directory.view(board).hidden);
     let meters: MeterSelection | undefined;
@@ -191,26 +203,35 @@ export async function buildApp(hub: Hub) {
       // A shared hidden source is not a history capability, even when its id is known.
       if (meters.ids.some(([source])=>!shown.has(source))) return reply.code(404).send({error:'not_found'});
       if(meters.ids.some(([source,meter])=>meter==='costs'&&!(providerOf(store.state(source).provider)?.meterKinds as readonly string[]|undefined)?.includes('reported')))return reply.code(400).send({error:'invalid_request'});
+      const financial=new Map(store.sources(board).map(s=>[s.id,s]));
+      if(meters.ids.some(([source,id])=>{const s=financial.get(source);return s?.budget?.enabled===false && budgetMeter(providerOf(s.provider),id);} ))return reply.code(404).send({error:'not_found'});
       if(request.query.currency!==undefined)meters={...meters,nativeCurrencies:true};
     }
+    if(scope==='budget'&&!meters || scope==='quota'&&request.query.currency!==undefined)return reply.code(400).send({error:'invalid_request'});
+    if(scope&&meters) {
+      const sources=new Map(store.sources(board).map(source=>[source.id,providerOf(source.provider)]));
+      if(meters.ids.some(([source,id])=>!(scope==='quota'?quotaMeter:budgetMeter)(sources.get(source),id)))return reply.code(400).send({error:'invalid_request'});
+    }
+    if (to <= from || from < oldest) return reply.code(400).send({error: scope ? 'history_range_invalid' : 'invalid_request'});
     let chunks: string[];
-    try {chunks=history.read(board, cell, from, to, now, shown, meters);}
+    try {chunks=history.read(board, cell, from, to, now, shown, meters, scope);}
     catch(error){if(error instanceof HistoryLimit)return reply.code(413).send({error:'history_limit'});throw error;}
     if(request.query.currency!==undefined){
       if(!meters)return reply.code(400).send({error:'invalid_request'});
       try {store.currencies.definition(access.user.id,request.query.currency);}catch{return reply.code(404).send({error:'currency_not_found'});}
       if(store.currencies.preference(access.user.id).id!==request.query.currency)return reply.code(409).send({error:'currency_changed'});
       const observed=new Map<string,number[]>();
+      const grants=new Map(store.sources(board).map(s=>[s.id,s.provider==='codex'?s.budget?.anchor??Infinity:0]));
       const transformed=displayHistory(chunks.map(json=>JSON.parse(json) as Chunk),store.currencies,access.user.id,request.query.currency,cell,(source,meter,until)=>{
         const id=meter==='balance'?'usage':meter,key=source+'\n'+id;let times=observed.get(key);
-        if(!times){const rows=store.meters.readings(source,id,from,to),spans=store.meters.spans(source,id,from,to);times=[...rows.map(r=>r.at),...spans.map(s=>s.to)].sort((a,b)=>a-b);observed.set(key,times);}
+        if(!times){const rows=store.meters.readings(source,id,from,to),spans=store.meters.spans(source,id,from,to);times=[...rows.map(r=>r.at),...spans.flatMap(s=>id==='balance:credits'?[s.from,s.to]:[s.to])].filter(at=>at>=(grants.get(source)??Infinity)).sort((a,b)=>a-b);observed.set(key,times);}
         let low=0,high=times.length;while(low<high){const middle=(low+high)>>>1;if(times[middle]<=until)low=middle+1;else high=middle;}return low?times[low-1]:null;
       });
       chunks=transformed.map(chunk=>JSON.stringify(chunk));
       if(chunks.reduce((sum,json)=>sum+Buffer.byteLength(json),0)>16*1024*1024)return reply.code(413).send({error:'history_limit'});
     }
-    const basis = {run: events.epoch, historyStart: store.historyStart(now), known: store.historyKnown(shown)};
-    const tag = request.query.meta === undefined ? undefined : history.metadata(board, basis);
+    const basis = {run: events.epoch, historyStart: store.historyStart(now), known: store.historyKnown(shown, scope === 'budget' ? null : store.privateOwner(board))};
+    const tag = request.query.meta === undefined ? undefined : history.metadata(board, basis, scope);
     const meta = JSON.stringify(tag && request.query.meta === tag ? {now, run: events.epoch, meta: tag} : {now, ...basis, ...(tag ? {meta: tag} : {})});
 
     return reply.type('application/json').send(`${meta.slice(0, -1)},"chunks":[${chunks.join(',')}]}`);
@@ -228,7 +249,10 @@ export async function buildApp(hub: Hub) {
   accountRoutes(app, hub, guards);
   sourceKeyRoutes(app,hub,guards);
   currencyRoutes(app,hub,guards);
-  await app.register(async scope => credentialRoutes(scope, hub.credentials!, guards));
+  await extend?.(app, hub, guards);
+  const verificationAttempts=new Limiter(10,60_000);
+  await app.register(async scope => credentialRoutes(scope, hub.credentials!, guards, verificationAttempts, additions, directory));
+  await app.register(async scope => additionRoutes(scope, hub, guards, additions, verificationAttempts));
   agentRoutes(app, hub);
   if (hub.local) localRoutes(app, hub, hub.local.key);
 

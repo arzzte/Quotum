@@ -1,7 +1,7 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
-import {INITIAL, metaOf, reduce, titlesOf, type HubEvent, type PageEvent, type PageState, type Snapshot} from '../lib/board';
-import {createStore, selector, shallowEqual} from '../lib/store';
+import {INITIAL, metaOf, namedCardsOf, reduce, titlesOf, type HubEvent, type PageEvent, type PageState, type Snapshot} from '../lib/board';
+import {createStore, sameJson, selector, shallowEqual} from '../lib/store';
 import type {Card, SeriesForecast} from '../lib/types';
 
 const card = (id: string, used = 50, extra: Partial<Card> = {}): Card => ({
@@ -19,7 +19,7 @@ const card = (id: string, used = 50, extra: Partial<Card> = {}): Card => ({
   ...extra,
 });
 
-const VIEW = {layout: {columns: 6, places: {}}, names: {}, hidden: [], shown: [], windows: [], plans: {}, unplanned: [], colors: {}, columns: {}, shownColumns: {}};
+const VIEW = {version: 2 as const, layout: {columns: 6, places: {}}, names: {}, hidden: [], shown: [], windows: [], plans: {}, unplanned: [], colors: {}, columns: {}, shownColumns: {}};
 const session = {device: {id: 'd', name: 'laptop'}, origin: 'terminal' as const, project: 'quotum', folder: null, startedAt: 1, lastWorkedAt: null, working: true, workedMs: 0};
 const ahead = (F: number): SeriesForecast => ({
   state: 'lasts',
@@ -58,6 +58,25 @@ function snapshot(change: Partial<Snapshot> = {}): Snapshot {
 
 const hub = (event: HubEvent): PageEvent => ({type: 'hub', event});
 const run = (...events: PageEvent[]) => events.reduce(reduce, INITIAL);
+
+test('credit heartbeats preserve quota drawing inputs but quota windows, resets and caps still update',()=>{
+  const money={id:'balance:credits',kind:'balance' as const,unit:'credits:codex',amount:'2500',scale:0,at:1000,staleAfterMs:10000,stale:false,limit:null,resetAt:null,minutes:null,scope:null,label:null};
+  const initial=card('s1',50,{meters:[money]}),wallet=card('wallet',0,{provider:'openrouter',windows:[]});
+  const store=createStore(reduce,run(hub({type:'snapshot',data:snapshot({sources:[initial,wallet]})})));
+  const read=(scope:'quota'|'funds'|'budget')=>selector(store,()=>({select:state=>namedCardsOf(state,scope),equal:scope==='quota'?sameJson:shallowEqual}));
+  const quota=read('quota'),funds=read('funds'),budget=read('budget');
+  const oldQuota=quota(),oldFunds=funds(),oldBudget=budget();
+  const heartbeat=JSON.parse(JSON.stringify({...initial,meters:[{...money,at:2000}]}));
+  store.dispatch(hub({type:'card',data:heartbeat}));
+  assert.equal(quota(),oldQuota);assert.notEqual(funds(),oldFunds);assert.equal(budget(),oldBudget);
+  for(const changed of [card('s1',60,{meters:[money]}),card('s1',60,{resets:{available:2}})]){
+    const before=quota();store.dispatch(hub({type:'card',data:changed}));assert.notEqual(quota(),before);
+  }
+  const cap=card('zai',0,{provider:'zai',windows:[],meters:[{...money,id:'quota:credit:5h',unit:'credits:zai',kind:'cap',limit:'10000'}]});
+  store.dispatch(hub({type:'snapshot',data:snapshot({sources:[cap]})}));const beforeCap=quota();
+  store.dispatch(hub({type:'card',data:{...cap,meters:[{...cap.meters![0],amount:'2400'}]}}));
+  assert.notEqual(quota(),beforeCap);
+});
 /** Every slice of the state, to compare what stayed the same object. */
 const slices = (s: PageState) => ({
   meta: s.board!.meta,
@@ -97,6 +116,24 @@ test('a snapshot is the board; the same snapshot again keeps every slice as it w
   assert.equal(again.resets!.trackers[0].at, 2, 'when they were asked is taken');
   const changed = reduce(first, hub({type: 'snapshot', data: snapshot({sources: [card('s1'), card('s2', 60)]})}));
   same(first, changed, ['s2']);
+});
+
+test('owner device hints and reconnect snapshots invalidate disclosures without changing board slices', () => {
+  const first=run(hub({type:'snapshot',data:snapshot()}));
+  const hinted=reduce(first,hub({type:'devices',data:{}}));
+  assert.equal(hinted.devicesRevision,(first.devicesRevision??0)+1);
+  assert.equal(hinted.board,first.board);same(first,hinted);
+  const reconnected=reduce(hinted,hub({type:'snapshot',data:snapshot()}));
+  assert.equal(reconnected.devicesRevision,(hinted.devicesRevision??0)+1);
+  assert.equal(reconnected.board,hinted.board);same(hinted,reconnected);
+});
+
+test('an older snapshot or view response cannot overwrite a newer board revision', () => {
+  const latest={...snapshot().view,hidden:['history']};
+  const state=run(hub({type:'snapshot',data:snapshot({view:latest,viewRevision:8,connectionsRevision:6})}));
+  const old=reduce(state,hub({type:'snapshot',data:snapshot({viewRevision:3,connectionsRevision:2})}));
+  assert.equal(old.board!.view,latest);assert.equal(old.board!.viewRevision,8);assert.equal(old.board!.connectionsRevision,6);
+  assert.equal(reduce(state,hub({type:'view',data:{view:snapshot().view,revision:7}})),state);
 });
 
 test('each event changes its own slice and leaves the others as they were', () => {
@@ -273,4 +310,17 @@ test('snapshot and session events normalize old or invalid credit before retaini
     assert.equal(bad.board!.sessions.s1[0].workedMs, null);
     assert.equal(bad.board!.cards, updated.board!.cards);
   }
+});
+
+test('private sessions replace only their slice, clear on shared snapshots and survive older personal hubs',()=>{
+  const privateSession={...session,clientId:'opencode'};
+  const first=run(hub({type:'snapshot',data:snapshot({ownSessions:[privateSession]})}));
+  const next=reduce(first,hub({type:'ownSessions',data:{sessions:[{...privateSession,workedMs:60_000}]}}));
+  assert.equal(next.board!.cards,first.board!.cards);assert.equal(next.board!.sessions,first.board!.sessions);
+  assert.notEqual(next.board!.ownSessions,first.board!.ownSessions);
+  assert.equal(reduce(next,hub({type:'ownSessions',data:{sessions:next.board!.ownSessions!}})),next);
+  const shared=reduce(next,hub({type:'snapshot',data:snapshot({board:{id:'team',name:'Team',personal:false},ownSessions:[privateSession]})}));
+  assert.deepEqual(shared.board!.ownSessions,[]);
+  assert.equal(reduce(shared,hub({type:'ownSessions',data:{sessions:[privateSession]}})),shared);
+  assert.deepEqual(run(hub({type:'snapshot',data:snapshot()})).board!.ownSessions,[]);
 });

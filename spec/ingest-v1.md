@@ -98,8 +98,59 @@ The envelope, array limits, object shape and unknown-provider checks remain stri
 | `via` | How the value was obtained (`claude-code/get_usage`, `codex/app-server`, `agy/usage`). |
 | `client` | Version of the agent's client that answered. |
 | `staleAfterMs` | How long this measurement stays representative. The agent promises the next measurement of this provider before then; a later one is a gap. At most 24 h. |
-| `windows` | At least one window. |
+| `windows` | At least one window, except an identified Codex resource observation below. |
 | `resets` | Free resets of the limits the account holds, if the client reports them: `{"available": 3, "expiring": [{"count": 1, "expiresAt": "2026-10-03T09:00:00Z"}, {"count": 2}]}`. `available`: how many, at most 1000. `expiring` (optional): the available resets by when they expire, soonest first, one group per time; a group without `expiresAt` (or with `null`) expires at a time the client does not give, and comes last. Each `count` is at least 1, the counts add up to `available` at most (a client may give only how many), and there are at most 50 groups. Only reported, never used. |
+
+#### Independent Codex resources
+
+An identified Codex snapshot may include `resourceStatus` with both `windows` and
+`resets`, each `observed`, `missing`, `unsupported` or `invalid`. `observed` requires
+its numerical payload; the other statuses exclude it. An empty `windows` array is
+valid only with these explicit statuses and a valid supplier account pseudonym.
+A status-only observation is accepted without creating a successful quota measurement.
+
+`balances` is optional and contains at most one entry:
+
+```json
+{"id":"balance:credits","unit":"credits:codex","status":"finite","amount":"1234.5678912","hasCredits":true}
+```
+
+Its status is `finite`, `unlimited`, `missing`, `unsupported` or `invalid`. Only
+`finite` has an amount. `hasCredits` is an optional supplier boolean independent of
+the amount and of permission to spend. Zero and negative amounts are valid.
+Amounts are plain decimal strings, at most 128 characters, without exponent notation,
+leading plus or redundant integer zeros. Trailing fractional zeros are normalized;
+the remaining scale is at most 18 and the signed coefficient's magnitude at most
+9223372036854775807. No floating-point conversion or preliminary rounding is allowed.
+These extensions require provider `codex` and the current reply's stable account ID.
+
+The account's `rateLimitsByLimitId.codex` is authoritative when present, including
+null credits. Otherwise the single `rateLimits` is eligible only if its limit ID is
+`codex`, absent or null. Mirrors and per-model buckets never add funds. An unlimited
+flag overrides the amount; absent credits or a null balance mean missing. Malformed
+credit data affects that resource; an RPC failure remains a measurement failure.
+
+Quota windows, free resets and purchased credits have independent strictly newer
+watermarks; equal timestamps keep the first observation. An omitted legacy resource
+is unobserved, retaining its value and original freshness. Explicit missing resets
+retain their last count without inferring a grant on recovery. Missing, invalid and
+unsupported quota observations end availability exclusively at their timestamp while
+preserving the last reported values and their original freshness. History, forecasts
+and quota alerts cannot infer consumption across that gap; recovery establishes a new
+baseline without a threshold-crossing alert. Missing, invalid, unsupported and
+unlimited credit observations end finite availability exclusively at their timestamp;
+returning to the same finite amount begins a new span. Credits never generate spending,
+top-ups, quota forecasts or quota alerts.
+
+Delivery has a separate monotonic timestamp and promise. A late resource update can
+be accepted without moving cadence or duty backwards. A current authorized device may
+acknowledge its outstanding command without replacing that delivery baseline or lease.
+Accepted quota evidence updates change detection independently of transport progress.
+After restart, fixed schedules restore the persisted baseline; late or equal resource
+observations do not postpone Auto's immediate first measurement.
+A fresh balance alone does not refresh quota windows. Older hubs may reject windowless
+rich snapshots; the agent splits and drops rejected observations with a compatibility
+diagnostic, without manufacturing a window or a zero balance.
 
 #### Stable account ids
 
@@ -144,8 +195,9 @@ given), never per machine. The same keys decide duty in check-ins.
 ## Response
 
 `200` with `{"accepted": n, "duplicates": n, "failures": n, "device": {"id": …}}`.
-A snapshot the hub already has (same account, not newer than the last one) counts as a
-duplicate, so resending a batch after a lost answer is safe.
+A snapshot with no newer resource observation counts as a duplicate. A late snapshot
+with a newer independent resource counts once as accepted, so resending after a lost
+answer is safe.
 
 | Status | Meaning | Agent behaviour |
 |---|---|---|
@@ -347,13 +399,13 @@ of running agents for five minutes after its last request, then forgets it.
 | Field | Meaning |
 |---|---|
 | `provider` | As in a snapshot. |
-| `account`, `accountName` | The subscription, as in a check-in, as far as the agent knows it. Without them the hub takes the subscription this machine last delivered for that provider; the reference agent leaves out a session of a client that names its account while it does not know which one that is (signed in anew since it measured). Either way, only a subscription the device's person holds (their devices measured it). |
+| `account`, `accountName` | The subscription, as in a check-in, as far as the agent knows it. Without them the hub takes the subscription this machine last delivered for that provider; the reference agent leaves out a session of a client that names its account while it does not know which one that is (signed in anew since it measured). Unknown or unheld attribution is retained privately. |
 | `origin` | Where it runs: `terminal`, `editor` (a client an editor runs, one per window) or `app` (a provider's desktop app, one client for all its chats). |
-| `project` | The project it works in, never a path: the name of the git repository its folder is in (for a worktree, of the repository it belongs to), else the name of the folder. Absent when the folder that names it (the repository's main folder, else the folder itself) is the home folder, above it or temporary. A repository is looked for in the folder and the folders above it, stopping before the home folder (neither it nor anything above it is looked at), and on macOS not in or through the folders the system guards (Desktop, Documents, Downloads, iCloud Drive, other volumes): there the project is the folder. Paths are checked as git writes them; a chain of links made by hand may still lead there. The hub counts time under this name, and boards show it. A longer name than 120 characters is cut, not refused. |
+| `project` | The project it works in, never a path. The reference agent leaves project and folder absent for a proven shared runtime or one without a proven client/window owner; an inherited working directory is not project authority. For an owned session: the name of the git repository its folder is in (for a worktree, of the repository it belongs to), else the name of the folder. Absent when the folder that names it (the repository's main folder, else the folder itself) is the home folder, above it or temporary. A repository is looked for in the folder and the folders above it, stopping before the home folder (neither it nor anything above it is looked at), and on macOS not in or through the folders the system guards (Desktop, Documents, Downloads, iCloud Drive, other volumes): there the project is the folder. Paths are checked as git writes them; a chain of links made by hand may still lead there. The hub counts time under this name, and boards show it. A longer name than 120 characters is cut, not refused. |
 | `folder` | The name of the folder it works in, when that is not `project` (a subfolder or a worktree), and the folder is not the home folder, above it or temporary. Boards show it under the project in the lists of running agents, so agents of one project stay apart; where the agent tells none and its person renamed the project, the name reported for the project is shown there instead. Cut like `project`. |
 | `startedAt` | When it started; a time ahead of the hub's is taken as now. |
 | `sessionId` | Optional opaque process identity: exactly 32 lower-case hex characters, unique across the report. Absent or null means legacy identity. Invalid types, malformed or duplicate IDs reject the whole report with `400 {"error":"invalid_request","detail":"sessionId"}`. It is scoped to the authenticated device, unchanged by clock correction. Older hubs ignore it. |
-| `working` | Whether it is working now (the agent's judgement: its processes spend CPU time), or idle. |
+| `working` | Whether it is working now (the agent's judgement: its owned processes spend CPU time), or idle. The reference agent excludes proven service/shared branches from ancestor CPU and ignores ambiguous finished-child CPU for each affected ancestor process birth; self CPU and live owned tools remain counted. A change of accounting basis resets the incompatible delta and hold. |
 | `lastWorkedAt` | Optional: when an idle session was last seen spending CPU like a working one. Absent while working or when unknown, including after the agent restarts or the clocks jump. The reference agent remembers the observation's wall time without recalculating it, and sends it only between `startedAt` and now. The hub corrects it for clock skew as it does `startedAt`, limits it to now and brings a time before `startedAt` up to `startedAt`; an invalid time is refused. |
 
 The reference agent finds a repository by the `.git` in the folder and the folders above
@@ -364,8 +416,7 @@ in a worktree, the `.git` file leads to the main repository's git folder through
 At most 200 sessions (the reference agent keeps the working ones first, then those that
 worked most recently, then the newest), in at most 512 KiB. Without `lastWorkedAt`,
 working ones come first, then the newest. Clocks are as in a batch. `200` with `{"accepted": n}`:
-sessions of a subscription the hub does not know, or the person does not hold, are left
-out. Errors are as for check-ins; a hub without this request answers `404` with
+all accepted sessions are retained; unknown or unheld attribution is private as described below. Errors are as for check-ins; a hub without this request answers `404` with
 `{"error": "not_found"}`, and the agent asks it again an hour later (it may have been
 upgraded). A `404` without that body comes from something in front of the hub and is
 tried again like any failure.
@@ -379,7 +430,9 @@ where that subscription is shown, whoever brought it.
 The hub keeps when each session worked, with its machine, subscription, where it runs,
 since when and its project and folder names: each list counts until the next one, for at
 most 200 seconds. How long agents worked, and how long any of them did, are worked out
-from that. The person whose machines they are can rename projects and merge them, which
+from that. A corrected full list ends future credit under the previous list at its
+arrival; it can still close the preceding interval up to that cutoff and never repairs
+older work. The person whose machines they are can rename projects and merge them, which
 applies to all time kept.
 
 The reference agent derives `sessionId` from the first 16 bytes of SHA-256 over
@@ -409,6 +462,64 @@ a snapshot of the other namespace's retained device-wide end, taken before any w
 This conservatively may undercount parallel processes until that end, rather than
 crediting the same period twice. Existing work is never rewritten or reconstructed.
 
+### Coding clients independent of collectors
+
+The client catalogue is `claude`, `codex`, `antigravity`, `opencode`. Only the first
+three have subscription collectors; OpenCode never appears in snapshots, failures or
+check-ins. Tracking is controlled independently by `[clients.<id>] enabled`; turning
+measurement off does not turn tracking off. `sessions = false` disables all reporting
+of sessions and inventory. `[clients.<id>] path` takes precedence over the legacy
+provider path. `route` reserves consent for future route observations; this agent does
+not classify routes. Unknown configuration IDs are warned about and ignored.
+
+`POST /v1/sessions` accepts these additive fields:
+
+- Legacy `sessions` may include `clientId` and `route`. The hub derives the canonical
+  client from `provider`, ignoring mismatches. Required legacy fields retain strict
+  validation. Legacy session IDs retain their existing validation and identity.
+- `clientSessions` has the same origin, names, dates, working and optional session ID,
+  but requires `clientId` instead of `provider`, and has an optional `source` object
+  `{provider, account?, accountName?}`. Absent, invalid or null source means unknown;
+  this array never uses the machine's previous source binding. Hub-measured providers
+  cannot supply an agent's source attribution.
+- `clients` replaces the device's installed inventory, with at most 64 accepted entries
+  `{clientId, version?: string|null}`. An omitted or malformed whole field preserves
+  inventory, and `[]` clears it. Duplicate IDs keep the first accepted entry. Version
+  is a bounded token, never raw stdout, stderr or an executable path.
+
+Client IDs are lower-case ASCII identifiers of one to 64 characters, beginning with a
+letter, followed by letters, digits, `_` or `-`. Unknown valid IDs are safely preserved.
+Malformed supplemental entries are skipped independently. Malformed optional names,
+last-work times, IDs or provenance become unknown; duplicate IDs across the two arrays
+are skipped in the supplemental array. Malformed new fields do not reject valid legacy
+sessions. The combined limit is 200 accepted sessions, with legacy entries first.
+
+The reference agent preserves the released legacy subset, order, fields and cap policy.
+OpenCode, clients whose collector is disabled, and clients signed in anew since their
+last measurement use only the remaining supplemental capacity. Legacy overflow is not
+moved into the supplemental array. Older hubs ignore new fields and retain the legacy
+subset. Every packet replaces both live lists, including when either list is absent.
+
+Optional route provenance is `{class: "subscription"|"api"|"unknown",
+by: "session"|"machine", host?: string, provider?: string}`. Only session evidence may
+carry a lower-case DNS host without port, scheme, credentials, path, query or fragment.
+Invalid provenance is ignored. These fields do not resolve or change source attribution.
+Stored account evidence (`login`, `inferred`, `legacy`) and route evidence are metadata,
+not process identity. Stronger evidence replaces weaker; equal-strength route conflicts
+become unknown with identifying details removed. Updates never split a work context.
+
+Accepted work with no known source is stored with a null source. A known source the
+owner does not hold remains stored internally but is projected as unknown. Only the
+owner's personal board and authenticated device view include these sessions and work;
+shared boards exclude them even for the owner. They cannot affect a source's working
+state, measuring cadence, forecasts or attention. Held work under a hidden card retains
+its existing filter. No placeholder source, holding or duty is created.
+
+Ledger contexts include the client and a nullable source while keeping released row IDs,
+producer IDs, legacy ordinals and intervals. Stable high water is scoped to device,
+client and producer; released cross-namespace floors remain in effect. Changing source
+creates a context for the same producer without rewriting previous credit.
+
 ## Connecting with a one-time code
 
 The OAuth 2.0 device authorization flow (RFC 8628) with JSON bodies:
@@ -426,6 +537,13 @@ The OAuth 2.0 device authorization flow (RFC 8628) with JSON bodies:
 
 ## Privacy
 
+Codex credit observations add only a native amount, its status and the optional
+`hasCredits` flag under the existing account pseudonym. No purchase history, provider
+account ID, credentials or model request is involved. Personal boards show funds;
+existing and new shared Codex placements require separate explicit financial consent.
+Quota sharing alone does not expose amounts, financial states, history or conversion
+bindings. Revocation removes that access, and re-enabling begins a new history period.
+
 Dropped hub-provider elements are not stored and grant no visibility. OpenAI Platform
 organization identity is a hub-only pseudonym: the first 24 hex characters of SHA-256
 over `quotum/account/v1\nopenai_platform\n` and the exact validated organization
@@ -436,13 +554,41 @@ can measure a source of such a provider, including DeepSeek balances; the agent 
 What never leaves the machine: provider tokens, cookies, account ids and emails,
 prompts, file contents, file paths.
 
-To distinguish running sessions from known Codex maintenance and transport processes,
-the reference agent on Linux reads only a bounded invocation prefix of its user's
-Codex processes from process metadata: at most 2048 bytes to skip the executable name,
-then exact comparisons of the leading role, stopping at the first mismatch or a
-recognised role. It reads no following argument values or process environments and
-retains, logs and sends no command line. Unknown or unreadable roles remain eligible
-to be sessions; macOS and Windows currently do not read invocation roles.
+To distinguish Codex maintenance, transport and runtime roles and establish accounting
+boundaries, the reference agent on Linux reads only a bounded invocation prefix of
+its user's Codex processes: at most 2048 bytes to skip the executable name, then exact
+leading role comparisons, stopping at a mismatch, a recognised service role or the
+first runtime option-prefix byte. It also reads OS process-session IDs and executable
+file identity, checking process birth around metadata and CPU reads. It reads no
+following argument values or process environments and retains, logs and sends no
+command line. Unknown or initially unreadable roles prove no boundary; previously
+proven boundaries can survive unreadable metadata for the same process birth. These
+metadata and caches stay on the machine. macOS and Windows currently have no invocation
+role or shared process-session detector; their existing process observations remain
+eligible. Exhausting the bounded invocation read and unavailable executable metadata
+are unavailable evidence, not proof of a new authority. Previously observed process
+ownership changes invalidate incompatible CPU deltas and working holds; snapshot-proven
+measurement ancestry remains excluded through a later metadata gap. No new wire fields
+or provider content are needed for this accounting. Temporarily unavailable ownership
+metadata leaves placement unproven rather than establishing a permanent shared branch;
+birth-scoped boundary and accounting facts survive an unconfirmed snapshot absence.
+This also applies to a first snapshot's proof before successful additional validation.
+Initially missing non-init ancestry leaves ownership unproven without requiring an
+earlier cache entry. Observed parent links pin both births; pending ancestor evidence
+survives the source's absence and never transfers just by matching a reused PID.
+Conditional cached-parent targets require birth confirmation before further ancestry
+propagation. A formerly excluded process that becomes eligible still discards its
+ambiguous delayed child CPU for that same birth, including a first raw Shared proof
+superseded by newer validation before cache publication. Historical ancestry cannot
+be reconstructed if the ancestor's birth was never available before the source
+disappeared; a PPID alone does not authorize transferring unsafe state to a first-seen
+birth, whose fallback can still show activity from delayed child CPU.
+Raw-proven ownership changes invalidate incompatible working holds before additional
+validation, while newer validated evidence supersedes the initial snapshot.
+At affected roots, retiring an observed owned subtree cannot cancel sampled self or
+live CPU increases; clean subtrees retain their live-plus-reaped accounting. These
+local counters and pending ancestor evidence are not transmitted. Samples shorter
+than the judgement interval retain observed CPU without advancing its references.
 
 What is sent: the pseudonym of each account, the plan name, percentages and reset times
 of the windows, free resets and when each expires, the client's version, the machine's random id, its name
@@ -488,3 +634,22 @@ ID is kept only in the hub's work ledger; no producer ID, raw native token, PID,
 metadata or salt appears in board state, history, errors or logs.
 
 The measuring-frequency preference is kept on the hub. It adds no information to agent traffic.
+
+### Client discovery privacy
+
+Inventory uses configured paths and the catalogue's local install locations. Version
+probes run only when executable identity changes, with neutral working directory, closed
+stdin, discarded stderr and no inherited `QUOTUM_*` variables. Raw stdout is bounded
+before allocation to 16 KiB; the five-second budget covers successful exit as well as EOF.
+Failure stops and reaps the process group. No client credentials or provider APIs are read.
+
+OpenCode discovery recognizes native `opencode` / `opencode.exe`, not a generic node or
+bun host. On Linux a fixed allowlist consumes a bounded invocation prefix to identify the
+default local TUI, proven maintenance commands, or shared `serve`, `web` and `acp` runtimes.
+It stops before option values or free text. Unknown commands, value-bearing options,
+attach/run/remote invocations and unavailable metadata prove no local project authority.
+Shared and unproven roots have no project or folder. Proven maintenance is excluded from
+sessions and from ancestor CPU; unsafe reaping uses the existing birth-scoped rules.
+On macOS and Windows this invocation proof is unavailable: native OpenCode presence is
+reported without project attribution. Node/bun installs are outside detection capability.
+No prompts, transcripts, tool output, configuration endpoints or model requests are used.

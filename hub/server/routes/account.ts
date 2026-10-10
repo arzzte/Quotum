@@ -12,12 +12,13 @@ import {
 } from '../domain/auth.js';
 import type {Guards, Hub} from '../api.js';
 import type {Board, User} from '../store/directory.js';
-import {parseView} from '../domain/view.js';
+import {parseView, VIEW_BODY_LIMIT} from '../domain/view.js';
 import {longerThan} from '../domain/ingest.js';
 import {PROJECT_NAME_CHARS} from '../domain/projects.js';
 import {validFrequency} from '../domain/frequency.js';
 import {providerOf} from '../domain/providers.js';
 import {currentUser, Limiter, publicOrigin, sessionSecret, setSession} from '../session.js';
+import {AdditionError} from '../additions.js';
 
 type Body = Record<string, unknown>;
 const str = (value: unknown) => (typeof value === 'string' ? value : '');
@@ -54,7 +55,7 @@ export function accountRoutes(app: FastifyInstance, hub: Hub, guards: Guards) {
     const available = ['created', 'ok', 'rotated'].includes(outcome);
     return {
       user, boards: user ? directory.boards(user.id) : [], signup: {first, open: !local && (first || config.auth.signup === 'open')}, local: !!local,
-      ...(user ? {trustedKeys: {available, reason: available ? null : outcome === 'mismatch' ? 'secret_key_mismatch' : 'secret_key_missing'}} : {}),
+      ...(user ? {trustedKeys: {available, reason: available ? null : hub.credentials!.report.reason ?? (outcome === 'mismatch' ? 'secret_key_mismatch' : 'secret_key_missing')}} : {}),
       ...(user && local ? {secretKey: {outcome, storageAtStart: hub.secretSnapshot?.storageAtStart ?? null, wasFileAtStart: hub.secretSnapshot?.wasFileAtStart ?? false}} : {}),
     };
   };
@@ -283,15 +284,24 @@ export function accountRoutes(app: FastifyInstance, hub: Hub, guards: Guards) {
   // ---------- views ----------
 
   // The owner arranges a board for everyone on it, as a dashboard is in Grafana.
-  // A full view must also fit the page's keepalive save when it leaves before the debounce.
-  app.post<{Params: {board: string}}>('/api/boards/:board/view', {bodyLimit: 64 * 1024}, (request, reply) => {
+  // Larger migrated views use ordinary autosave; keepalive retains its browser limit.
+  app.post<{Params: {board: string}}>('/api/boards/:board/view', {bodyLimit: VIEW_BODY_LIMIT}, (request, reply) => {
     const access = guards.board(request, reply, request.params.board);
     if (!access) return reply;
     if (!isOwner(access.board)) return forbidden(reply);
+    if (request.headers['x-quotum-view-version'] !== '2') return reply.code(428).send({error: 'view_reload_required'});
+    const version = (request.body as {version?: unknown} | null)?.version;
+    if (version === undefined || version === 1) return reply.code(428).send({error: 'view_reload_required'});
     const view = parseView(request.body);
     if (!view) return reply.code(400).send({error: 'invalid_request'});
-    directory.saveView(access.board.id, view, access.user.id, Date.now());
-    return view;
+    const match = request.headers['if-match'];
+    if (match === undefined) return reply.code(428).send({error: 'view_reload_required'});
+    if (typeof match !== 'string' || !/^"(?:0|[1-9][0-9]*)"$/.test(match) || !Number.isSafeInteger(Number(match.slice(1, -1)))) return reply.code(400).send({error: 'invalid_request'});
+    return directory.transaction(() => {
+      const {revision, view: currentView} = directory.viewState(access.board.id);
+      if (revision !== Number(match.slice(1, -1))) return reply.code(409).send({error: 'view_conflict', view: currentView, revision});
+      return {view, revision: directory.saveView(access.board.id, view, access.user.id, Date.now())};
+    });
   });
 
   // ---------- sharing ----------
@@ -314,6 +324,7 @@ export function accountRoutes(app: FastifyInstance, hub: Hub, guards: Guards) {
           provider: s.provider,
           sharedBy: s.sharedBy ? (names.get(s.sharedBy) ?? '') : '',
           mine: s.holders.includes(access.user.id),
+          budget: s.budget,
         })),
         // Only the holder sees the private account label used to distinguish their sources.
         mine: store.held(access.user.id).map(s => ({
@@ -339,8 +350,18 @@ export function accountRoutes(app: FastifyInstance, hub: Hub, guards: Guards) {
       if (access.board.personal) return forbidden(reply);
       const source = str(request.body?.source);
       if (!store.holds(access.user.id, source)) return notFound(reply);
-      store.share(access.board.id, source, access.user.id, Date.now());
+      if(request.body?.includeBudget!==undefined&&typeof request.body.includeBudget!=='boolean')return reply.code(400).send({error:'invalid_request'});
+      store.share(access.board.id, source, access.user.id, Date.now(), request.body?.includeBudget===true);
       return {ok: true};
+    });
+
+    app.put<{Params:{board:string;source:string};Body:Body}>('/api/boards/:board/shares/:source/budget',(request,reply)=>{
+      const access=guards.board(request,reply,request.params.board);if(!access)return reply;
+      if(access.board.personal)return forbidden(reply);
+      const {enabled,expectedRevision}=request.body??{};
+      if(typeof enabled!=='boolean'||typeof expectedRevision!=='string'||!/^[0-9a-f]{32}$/.test(expectedRevision))return reply.code(400).send({error:'invalid_request'});
+      try{return {budget:store.setBudget(access.board.id,request.params.source,access.user.id,enabled,expectedRevision,Date.now())};}
+      catch(error){const code=error instanceof Error?error.message:'';return reply.code(code==='share_conflict'?409:code==='not_found'?404:400).send({error:code==='share_conflict'||code==='not_found'?code:'invalid_request'});}
     });
 
     // Taken off a board by those who measure it, or by the board's owner.
@@ -370,6 +391,8 @@ export function accountRoutes(app: FastifyInstance, hub: Hub, guards: Guards) {
       agent: device.agent,
       via: device.byCode ? 'code' : 'token',
       lastSeenAt: device.lastSeenAt,
+      clients: directory.deviceClients(device.id),
+      sessions: hub.ingest.live.deviceSessions(user.id, device.id, Date.now()),
       sources: delivered.filter(d => d.device === device.id).map(({provider, source, seenAt}) => ({provider, source, seenAt})),
       failures: failures.filter(f => f.device === device.id).map(({provider, error, detail, at}) => ({provider, error, detail, at})),
     }));
@@ -442,10 +465,21 @@ export function accountRoutes(app: FastifyInstance, hub: Hub, guards: Guards) {
       // A token without a name is shown under a default one in the reader's language.
       const name = str(request.body?.name).trim();
       if (name && !validName(name)) return reply.code(400).send({error: 'invalid_name'});
-      const secret = newSecret('qt_m');
-      const {userId, ...token} = directory.createToken(secret, secretHint(secret), user.id, name, Date.now());
-      // The secret is shown once; only its hash is kept.
-      return {...token, secret};
+      try {
+        return directory.transaction(() => {
+          const secret = newSecret('qt_m');
+          const {userId, ...token} = directory.createToken(secret, secretHint(secret), user.id, name, Date.now());
+          if (request.body?.onboardingId !== undefined) {
+            if (typeof request.body.onboardingId !== 'string') throw new AdditionError('addition_invalid');
+            hub.deviceOnboarding!.bindToken(user.id, request.body.onboardingId, token.id);
+          }
+          // The secret is shown once; only its hash is kept.
+          return {...token, secret};
+        });
+      } catch (error) {
+        if (error instanceof AdditionError) return reply.code(400).send({error: error.code});
+        throw error;
+      }
     });
 
     app.delete<{Params: {token: string}}>('/api/tokens/:token', (request, reply) => {
@@ -474,8 +508,21 @@ export function accountRoutes(app: FastifyInstance, hub: Hub, guards: Guards) {
       const decision = (request.params as {decision: string}).decision;
       if (decision !== 'approve' && decision !== 'deny') return notFound(reply);
       if (!lookups.allow(`user:${user.id}`)) return reply.code(429).send({error: 'too_many_attempts'});
-      const ok = pairing.decide(request.body?.code, decision === 'approve', user.id);
-      return ok ? {ok: true} : reply.code(400).send({error: 'invalid_code'});
+      try {
+        const ok = directory.transaction(() => {
+          const pending = pairing.pending(request.body?.code);
+          if (!pending) return false;
+          if (request.body?.onboardingId !== undefined) {
+            if (decision !== 'approve' || typeof request.body.onboardingId !== 'string') throw new AdditionError('addition_invalid');
+            hub.deviceOnboarding!.bindCode(user.id, request.body.onboardingId, pending.id);
+          }
+          return pairing.decide(request.body?.code, decision === 'approve', user.id);
+        });
+        return ok ? {ok: true} : reply.code(400).send({error: 'invalid_code'});
+      } catch (error) {
+        if (error instanceof AdditionError) return reply.code(400).send({error: error.code});
+        throw error;
+      }
     });
   }
 }

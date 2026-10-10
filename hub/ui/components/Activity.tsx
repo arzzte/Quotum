@@ -1,3 +1,4 @@
+import {AnalyticsPanel} from './AnalyticsPanel';
 import {memo, useEffect, useId, useLayoutEffect, useMemo, useRef, useState} from 'react';
 import {createPortal} from 'react-dom';
 import type {Activity as ActivityData, ActivityDimension, ActivityGroup} from '../lib/types';
@@ -5,12 +6,12 @@ import {clock, num, shortDay, stamp, workHours} from '../lib/format';
 import {sourceLabel} from '../lib/quota';
 import {activityEmpty, activityScale, atOnce, groupColors, mutedKey} from '../lib/activity';
 import {ACTIVITY_BY, setMuted, setPrefs, usePrefs} from '../lib/prefs';
-import {answeredRangeLabel, setTimeRange, timeRangeKey, useTimeRange, type TimeRange} from '../lib/timeRange';
+import {setTimeRange, timeRangeKey, useTimeRange, type TimeRange} from '../lib/timeRange';
 import {cellLabel, frameChangesAt, frameOf, measuredTo, niceTicks} from '../lib/periods';
 import {ACTIVITY, cardId, isHidden, withHidden, type Arrange} from '../lib/view';
-import {useBoardId, useLineup, useTitles, type Title} from '../lib/board';
+import {usePersonalBoard, useBoardId, useLineup, useTitles, type Title} from '../lib/board';
 import {useClock} from '../lib/clock';
-import {useHistory, useHistoryBegins, useHistoryPlot} from '../lib/history';
+import {quotaHistory, useHistory, useHistoryBegins, useHistoryPlot} from '../lib/history';
 import {plotBar, plotGroupsPrepared, type PlotBuffer, type PlotGroup} from '../lib/historyPlot';
 import {usePrepared, usePreparationBasis} from './prepared';
 import {axisNavigation, navigationKey, type AxisNavigation} from '../lib/axisNavigation';
@@ -23,7 +24,7 @@ import {t, useLocale, type Key} from '../i18n';
 import {Segmented} from './Kit';
 import {HideRow, Popover, SlidersIcon} from './Popover';
 import {Tooltip, useBubble, useTip} from './Tooltip';
-import {ProjectsDialog} from './Projects';
+import {navigate, settingsHref} from '../lib/router';
 import {useTimeAxis} from './timeAxis';
 import {usePlot} from './sizing';
 import {clipPlot, PlotLayer, PlotOverlay} from './PlotLayer';
@@ -35,6 +36,7 @@ const LABELS: Record<ActivityDimension, Key> = {source: 'activity.bySource', pro
 
 /** A group as the legend and the tooltip name it. */
 function groupName(group: Pick<ActivityGroup, 'key' | 'name'>, by: ActivityDimension, titles: Record<string, Title>) {
+  if (by === 'source' && group.key === 'unknown') return t('agents.unknownSource');
   if (by === 'source') return titles[group.key] ? sourceLabel(titles[group.key]) : group.key;
   return group.name ?? (by === 'project' ? t('activity.noProject') : group.key);
 }
@@ -42,7 +44,7 @@ function groupName(group: Pick<ActivityGroup, 'key' | 'name'>, by: ActivityDimen
 /** The widget's own settings, as the chart has its own: what its stacks are split by, and (for the board's owner) hiding it. */
 function ActivitySettings({arrange}: {arrange: Arrange}) {
   const {activityBy} = usePrefs();
-  const [projects,setProjects]=useState(false),[open,setOpen]=useState(false);
+  const [open,setOpen]=useState(false);
   return (
     <>
     <Popover label={t('activity.settings')} icon={<SlidersIcon />} open={open} onOpenChange={setOpen}>
@@ -53,10 +55,9 @@ function ActivitySettings({arrange}: {arrange: Arrange}) {
           <Segmented value={activityBy} onChange={next => setPrefs({activityBy: next})} options={ACTIVITY_BY.map(key => [key, t(LABELS[key])])} label={t('activity.by')} />
         </div>
       </div>
-      <div className="popover-section"><button className="popover-row" onClick={()=>{setOpen(false);setProjects(true);}}><span>{t('projects.manage')}</span></button></div>
+      <div className="popover-section"><button className="popover-row" onClick={()=>{setOpen(false);navigate(settingsHref('/settings/projects'));}}><span>{t('projects.manage')}</span></button></div>
       {arrange.owner && <HideRow onHide={() => arrange.update(view => withHidden(view, ACTIVITY, true))}>{t('widget.hide')}</HideRow>}
     </Popover>
-    {projects&&<ProjectsDialog onClose={()=>setProjects(false)}/>}
     </>
   );
 }
@@ -206,13 +207,14 @@ const Totals = memo(function Totals({activity, shownMs, since}: {activity: Activ
  * render it. The unknown part of the period is hatched rather than drawn as idle.
  */
 export const Activity = memo(function Activity({arrange}: {arrange: Arrange}) {
-  const {history, loading} = useHistory();
+  const {history, loading,error} = useHistory();
   const strip = useHistoryPlot();
   const registry = useRef<{token: number; by: ActivityDimension; seed: GroupIdentity[]; groups: GroupIdentity[]} | null>(null);
   const panel = useRef<HTMLElement>(null);
   // Made taller by its owner, the widget gives the room to the stacks, as the chart does.
   const {plot, onBase} = usePlot(panel);
   const lineup = useLineup();
+  const personal = usePersonalBoard();
   const titles = useTitles(arrange.view.names);
   const prefs = usePrefs();
   const by = prefs.activityBy;
@@ -250,7 +252,7 @@ export const Activity = memo(function Activity({arrange}: {arrange: Arrange}) {
     const seed = groups.map((group, i) => ({key: group.key, name: group.name, color: colors[i]}));
     if (!strip) return {identities: seed, shown, strip, registry: null};
     const previous = registry.current?.token === strip.token && registry.current.by === by ? registry.current : {token: strip.token, by, seed, groups: seed};
-    const identities = groupRegistry(previous.seed, previous.groups, [...found.values()], by === 'source' ? key => colorOf(arrange.view, key, titles[key]?.provider ?? '') : undefined);
+    const identities = groupRegistry(previous.seed, previous.groups, [...found.values()], by === 'source' ? key => key === 'unknown' ? 'var(--other)' : colorOf(arrange.view, key, titles[key]?.provider ?? '') : undefined);
     const plotted: {group: PlotGroup; color: string; name: string}[] = [];
     for (const identity of identities) {if (!prefs.muted[mutedKey(by, identity.key)]) plotted.push({group: data.get(identity.key) ?? {key: identity.key, name: identity.name, cells: EMPTY_CELLS}, color: identity.color, name: groupName(identity, by, titles)}); yield;}
     return {identities, shown: plotted, strip, registry: {token: strip.token, by, seed: previous.seed, groups: identities}};
@@ -262,8 +264,8 @@ export const Activity = memo(function Activity({arrange}: {arrange: Arrange}) {
   // Known from later than the period the hub answered begins (not the page's frame, whose clock may be a minute behind).
   const since = history && activity?.known && activity.known.from > history.since ? activity.known.from : null;
 
-  const said = activityEmpty(history, shownSources.length);
-  const empty = !said
+  const said = activityEmpty(history, shownSources.length, personal);
+  const empty = error || !said
     ? null
     : said.key === 'loading'
       ? t('history.loading')
@@ -274,11 +276,9 @@ export const Activity = memo(function Activity({arrange}: {arrange: Arrange}) {
   const emptyFrame = answered && panning === null && !strip ? empty : null;
 
   return (
-    <section ref={panel} className={`panel activity ${loading ? 'is-loading' : ''}`} data-time="chart" aria-label={t('activity.title')} aria-busy={loading} data-history-range={history?.range}>
-      <div className="panel-head">
-        <div><h2>{t('activity.title')}</h2>{history && <span className="answered-range">{t('history.answeredRange', {range: answeredRangeLabel(history)})}</span>}</div>
-        <ActivitySettings arrange={arrange} />
-      </div>
+    <AnalyticsPanel ref={panel} className="activity" title={t('activity.title')} chart history={history} loading={loading} error={error} retry={quotaHistory.retry}
+      settings={<ActivitySettings arrange={arrange}/>}
+    >
       <Totals activity={activity} shownMs={shownMs} since={since} />
       <>
           <Stacks
@@ -292,7 +292,7 @@ export const Activity = memo(function Activity({arrange}: {arrange: Arrange}) {
             plot={plot}
             onBase={onBase}
             strip={presentation.strip}
-            prepared={prepared.ready && (panning !== null || answered)}
+            prepared={prepared.ready && (panning !== null || answered || !!error)}
             navigation={navigation}
             by={by}
             allMuted={!emptyFrame && presentation.identities.length > 0 && presentation.shown.length === 0}
@@ -304,7 +304,7 @@ export const Activity = memo(function Activity({arrange}: {arrange: Arrange}) {
             ))}
           </div>
       </>
-    </section>
+    </AnalyticsPanel>
   );
 });
 

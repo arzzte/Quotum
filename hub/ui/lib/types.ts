@@ -2,6 +2,7 @@ export type {Refresh, RefreshRequest} from '../../server/domain/refresh';
 export {MEASURE_INTERVAL, type MeasureIntervalMs} from '../../server/domain/frequency';
 import type {MeasureIntervalMs} from '../../server/domain/frequency';
 import type {ReportQuality,MonthlyLimit,ReportCalendar,Allowance} from '../../server/domain/reports';
+import type {BudgetAccess,CreditBalanceState,ResourceObservation} from '../../server/domain/resources';
 import type {BalanceStatus,Meter,KeyPart,CalendarSpend,QuotaStatus} from '../../server/domain/meters';
 /** A window's length as the agent classifies it. */
 export type Kind = 'session' | 'weekly' | 'other';
@@ -42,6 +43,9 @@ export type Card = {
   staleAfterMs: number | null;
   measureIntervalMs: MeasureIntervalMs;
   balanceStatus?:BalanceStatus;
+  budget?:BudgetAccess;
+  creditBalance?:CreditBalanceState;
+  resources?:{windows?:ResourceObservation;resets?:ResourceObservation};
   currencyUnavailable?:boolean;
   meters?:Meter[];
   quota?:QuotaStatus;
@@ -64,6 +68,7 @@ export type CadenceWhy = 'low' | 'inUse' | 'changed' | 'idle' | 'reset' | 'fixed
 
 /** A coding agent running on a machine, spending the subscription of its card. */
 export type LiveSession = {
+  clientId?: string;
   device: {id: string; name: string};
   /** A terminal; an editor or the provider's app, which run one client per window. */
   origin: 'terminal' | 'editor' | 'app';
@@ -83,29 +88,7 @@ export type LiveSession = {
  * are `source:<id>` cards, the `agents` list, and the analytics: `activity`, the `history`
  * chart and the `forecast` table.
  */
-export type View = {
-  layout: import('./grid').Layout;
-  /** Boards arranged before the grid: the page translates these; POST never saves them. */
-  order?: string[];
-  sizes?: Record<string, number>;
-  /** Names the board's owner gave cards, by source id. */
-  names: Record<string, string>;
-  hidden: string[];
-  /** Widgets off by default and explicitly enabled key scales beyond the card preview. */
-  shown: string[];
-  /** `windowKey`s of windows hidden from cards and the chart. */
-  windows: string[];
-  /** Weekly spending plans by source id; absent means the default. */
-  plans: Record<string, number[]>;
-  /** Source ids whose plan is switched off on this board. */
-  unplanned: string[];
-  /** Colours given to cards, by source id, instead of the provider's. */
-  colors: Record<string, string>;
-  /** Columns hidden in a widget's table, by widget id. */
-  columns: Record<string, string[]>;
-  /** Columns off by default that the owner turned on, by widget id. */
-  shownColumns: Record<string, string[]>;
-};
+export type {View} from '../../server/domain/view';
 
 export type {HistorySeries, History, SourceEvent} from '../../server/domain/history';
 

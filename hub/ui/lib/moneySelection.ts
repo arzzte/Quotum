@@ -4,11 +4,11 @@ import {isUnit} from '../../server/domain/amount';
 import {MAX_METERS,selectionOf,type MeterSelection} from '../../server/domain/meterHistory';
 import type {Card} from './types';
 import type {MeterHistory} from './moneyView';
-import {referenceBalance} from './money';
-import {providerOf} from '../../server/domain/providers';
+import {referenceBalance,budgetVisible} from './money';
+import {providerOf, budgetMeter, moneyFamily, type MoneyFamily} from '../../server/domain/providers';
 
 export type MoneyPrefs={unit:string|null;view:'balance'|'spending';selected:Record<string,[string,string][]>;modes?:Partial<Record<'balance'|'spending',Record<string,[string,string][]>>>;removed?:number};
-export const DEFAULT_MONEY:MoneyPrefs={unit:null,view:'balance',selected:{}};
+export const DEFAULT_MONEY:MoneyPrefs={unit:DEFAULT_CURRENCY,view:'balance',selected:{}};
 export function readMoney(value:unknown):MoneyPrefs {
   if(!value||typeof value!=='object')return DEFAULT_MONEY;
   const raw=value as Partial<MoneyPrefs>,selected:MoneyPrefs['selected']={};
@@ -19,20 +19,20 @@ export function readMoney(value:unknown):MoneyPrefs {
   for(const view of ['balance','spending'] as const)if(raw.modes?.[view]&&typeof raw.modes[view]==='object'){
     modes[view]={};for(const [unit,ids] of Object.entries(raw.modes[view]!))try{if(!unit.startsWith('credits:'))modes[view]![unit]=selectionOf(ids,unit).ids;}catch{/* Reject malformed saved choices. */}
   }
-  return {unit:isUnit(raw.unit)&&!raw.unit.startsWith('credits:')?raw.unit==='CNY'?DEFAULT_CURRENCY:raw.unit:null,view:raw.view==='spending'?'spending':'balance',selected,modes,...(Number.isSafeInteger(raw.removed)&&raw.removed!>0&&raw.removed!<=32?{removed:raw.removed}:{})};
+  return {unit:isUnit(raw.unit)&&!raw.unit.startsWith('credits:')?raw.unit==='CNY'?DEFAULT_CURRENCY:raw.unit:DEFAULT_CURRENCY,view:raw.view==='spending'?'spending':'balance',selected,modes,...(Number.isSafeInteger(raw.removed)&&raw.removed!>0&&raw.removed!<=32?{removed:raw.removed}:{})};
 }
-export function moneySelection(cards:readonly Card[],hidden:readonly string[],settings:MoneyPrefs,context:CurrencyContext=defaultCurrencyContext):{selection:MeterSelection|undefined;omitted:number;removed:number} {
-  if(!settings.unit)return {selection:undefined,omitted:0,removed:0};
-  const shown=cards.filter(c=>providerOf(c.provider)?.funding==='wallet'&&!hidden.includes('source:'+c.id)),visible=new Set(shown.map(c=>c.id));
-  const explicit=moneyChoices(settings)[settings.unit];
+export function moneySelection(cards:readonly Card[],hidden:readonly string[],settings:MoneyPrefs,context:CurrencyContext=defaultCurrencyContext,family:MoneyFamily='budget'):{selection:MeterSelection|undefined;omitted:number;removed:number} {
+  const unit=settings.unit??DEFAULT_CURRENCY;
+  const shown=cards.filter(c=>moneyFamily(providerOf(c.provider))===family&&budgetVisible(c)&&!hidden.includes('source:'+c.id)),visible=new Set(shown.map(c=>c.id));
+  const explicit=moneyChoices(settings)[unit];
   const ids=explicit??shown.flatMap(card=>{
-    const balance=settings.unit===DEFAULT_CURRENCY?(referenceBalance(card,context.target.id!==DEFAULT_CURRENCY)?.total):card.meters?.find(m=>m.kind==='balance'&&m.unit===settings.unit&&balanceDescriptor(card.provider,m.id)?.role==='total');
+    const balance=unit===DEFAULT_CURRENCY?(referenceBalance(card,context.target.id!==DEFAULT_CURRENCY||card.provider==='codex')?.total):card.meters?.find(m=>m.kind==='balance'&&m.unit===unit&&balanceDescriptor(card.provider,m.id)?.role==='total');
     if(balance)return [[card.id,balance.id] as [string,string]];
-    if(settings.view==='spending'&&card.reportQuality&&(settings.unit===DEFAULT_CURRENCY||card.reportQuality.some(q=>q.unit===settings.unit)))return [[card.id,'costs'] as [string,string]];
+    if(settings.view==='spending'&&card.reportQuality&&(unit===DEFAULT_CURRENCY||card.reportQuality.some(q=>q.unit===unit)))return [[card.id,'costs'] as [string,string]];
     return [];
   });
-  const admitted=ids.filter(([source])=>visible.has(source));
-  return {selection:{...selectionOf(admitted.slice(0,MAX_METERS),settings.unit),...(settings.unit===DEFAULT_CURRENCY&&context.target.id!==DEFAULT_CURRENCY?{displayCurrency:context.target.id,...(context.revision?{displayRevision:context.revision}:{})}:{})},omitted:Math.max(0,admitted.length-MAX_METERS),removed:ids.length-admitted.length};
+  const admitted=ids.filter(([source,meter])=>visible.has(source)&&budgetMeter(providerOf(shown.find(card=>card.id===source)?.provider??''),meter));
+  return {selection:{...selectionOf(admitted.slice(0,MAX_METERS),unit),...(shown.some(c=>c.provider==='codex')?{resourceRevision:JSON.stringify(shown.filter(c=>c.provider==='codex').map(c=>[c.id,c.budget]))}:{}),...(unit===DEFAULT_CURRENCY&&(context.target.id!==DEFAULT_CURRENCY||shown.some(c=>c.provider==='codex'))?{displayCurrency:context.target.id,...(context.revision?{displayRevision:context.revision}:{})}:{})},omitted:Math.max(0,admitted.length-MAX_METERS),removed:ids.length-admitted.length};
 }
 
 /** Membership is checked against the inventory, not against the visible page. */

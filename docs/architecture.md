@@ -53,14 +53,14 @@ is one implementation of them.
 
 ## Measuring
 
-The agent's adapters ask each coding agent's own client, never provider endpoints.
+The agent's collectors ask each coding agent's own client, never provider endpoints.
 The hub's read-only connectors measure z.ai subscriptions and OpenRouter budgets
 directly. These are the client interfaces used by the agent:
 
 | Provider | Interface | Notes |
 |---|---|---|
 | Claude Code | `claude -p --input-format stream-json …`, control request `get_usage` (the Agent SDK protocol) | No MCP servers, hooks, plugins, skills or saved session. Claude Code caches the answer for 60 s. |
-| Codex | `codex app-server`, JSON-RPC `account/rateLimits/read` (the protocol of the IDE extensions) | Plan, per-model limits, account id. |
+| Codex | `codex app-server`, JSON-RPC `account/rateLimits/read` (the protocol of the IDE extensions) | Plan, per-model limits, free resets, purchased credits, account id. |
 | Antigravity | `agy -p /usage --output-format json` (agy 1.1.11+) | The agent sends agy's log to its own file; otherwise agy writes a new log file on every run. |
 
 What follows from this:
@@ -100,25 +100,83 @@ Documents, Downloads, iCloud Drive, other volumes), neither directly nor through
 is the folder. Paths are checked as git writes them; a chain of links made by hand may
 still lead there. Boards list agents by project, with the folder under it where that is
 another, so agents in different worktrees stay apart. An editor or the app runs one client per
-window for all its chats, so there a session is a window. A session works while it and
-what it started (tools, builds, tests) spend more of a CPU core than the client does
-when idle (6% for Claude Code, which redraws its screen even then; 3–4% for the others),
-and for a minute after, so a pause of the model is not idleness. Only this user's
-processes count (on Windows, those of this logon session), and the clients the agent
-starts to measure do not. On Linux, a bounded invocation prefix of this user's Codex
-processes also distinguishes `app-server daemon pid-update-loop` (maintenance) and
-`app-server proxy` (transport forwarding), which are not sessions. The reader skips at
-most 2048 bytes of the executable name, then compares only the leading role, byte by
-byte, stopping at the first mismatch or the end of a recognised role. It never reads
-ahead into argument values, retains no command line, and checks the process's identity
-again after the read. Unknown or unreadable roles remain eligible; processes that exited
-or whose identity changed during the read are left for the next look. A service ancestor
-does not hide a real client it started. Persistent app servers remain eligible, including
-detached servers that may serve remote work; idle alone does not make a service. macOS
-and Windows currently have no invocation-role reader. No client settings or session files
-are read or changed, and no program is started for it. A look is one pass over the process
-list for names and parents, then the times of the clients' own processes: about 20 µs per process
-on Linux. Not seen: a client that runs as `node` (an npm install on macOS and Windows),
+window for all its chats, so there a session is a window. A session works while its owned
+process tree (the client, tools, builds and tests) spends more of a CPU core than the
+client does when idle (6% for Claude Code, 3% for Codex, 4% for Antigravity and 10%
+for OpenCode), and for a minute after, so a pause of the model is not idleness.
+OpenCode's threshold tolerates native idle redraw bursts. This is a CPU estimate,
+not a provider's report of model work; a quiet model wait can eventually appear idle.
+Only this user's processes count (on Windows, those of this logon session), and the
+clients the agent starts to measure do not, even behind an accounting boundary.
+
+On Linux, bounded Codex invocation metadata recognises `app-server daemon
+pid-update-loop` (maintenance), `app-server proxy` (transport), and app-server
+runtimes. Service branches stop both same-provider session folding and ancestor CPU
+accounting. A known runtime in a different OS process session from its provider owner
+is also separated; merely detaching an ordinary shell or build is no boundary. A
+runtime behind such a boundary, or without a proven client or editor/app owner, remains
+visible, with its own CPU estimate but no project or folder. Its inherited cwd does
+not establish which projects it serves. Private same-provider runtimes and ordinary
+editor/app windows retain their existing ownership and placement. CPU is never moved
+to another client based on a connection or a tool's folder.
+
+Linux skips at most 2048 executable-name bytes, compares exact leading role words,
+and stops at the first mismatch, a recognised service role, or the first option-prefix
+byte of a runtime. No option values, process environments or conversation files are
+read; no command line is retained or sent. Process birth and executable file identity
+are checked around these reads and every CPU contributor. Unknown or initially
+unreadable roles prove no boundary. A previously proven boundary survives temporarily
+unreadable metadata and reparenting for that process birth; exhausting the invocation
+read bound or losing executable metadata does not prove a replacement. A confirmed
+invocation or executable change invalidates placement authority. Current shared roots
+are boundaries for every descendant on the same look, and an initially proven ancestor
+can still deny ownership or measurement eligibility if its later validation fails.
+Temporary missing owner metadata leaves placement unproven for that observation,
+including the first look without a cache. An absent non-init parent is incomplete
+ancestry, not proof of an orphan. It does not make a private runtime permanently shared.
+Confirmed role, image and accounting
+scope remain tied to the observed birth across snapshot gaps, until exit or replacement
+is proved. An initially known unsafe branch also retains pending birth-specific ancestor
+evidence until that same ancestor can be validated. This includes a first snapshot's
+proof when its additional validation fails, and a retained unsafe birth whose current
+validation is unavailable. Observed parent links pin both process births, so pending
+ancestor evidence survives the later absence of the source too. A cached parent PID
+supplies only a conditional target until its birth is confirmed; it cannot prove that
+old birth's other ancestors. Raw-proven authority changes invalidate old ownership
+and working holds even before successful additional validation; newer validated
+evidence supersedes them. A reused PID inherits no state.
+These guarantees require observed or conditional birth links. If an ancestor's birth
+was never available before the excluded source disappeared, its later child CPU
+cannot be safely linked by PPID alone; the existing fallback can still show work for
+that first-seen client. Completely unavailable metadata is a detector capability limit.
+
+The OS also gives CPU of finished children, without telling which branch earned it.
+For every ancestor of a proven excluded branch, across wrappers and other-provider
+session roots, this reaped CPU is ignored for that ancestor's remaining process birth.
+The restriction survives branch exit, reparenting and same-birth exec. A previously
+excluded process that becomes eligible also keeps its delayed child CPU excluded,
+including when the first raw Shared proof is superseded before its cache is committed.
+Its own CPU and live owned tools still count; clean trees retain their finished-tool
+accounting. The conservative cost is that a short owned tool entirely between looks
+can be missed at an affected ancestor. Changing the accounting basis discards incompatible deltas and
+working holds rather than turning a lifetime-counter jump into work. Accounting owner
+and authority transitions of observed births also reset affected sessions, even when
+an ancestor was already marked unsafe. New owned tools retain their first observed CPU.
+Unsafe births count their own CPU separately from clean owned subtrees. Each clean
+subtree keeps its live-plus-reaped counter; sampled increases accumulate without
+subtracting retired subtrees, so an observed tool's exit cannot hide new self or live
+CPU. Short looks retain their sampled CPU while keeping references at the last full
+judgement, so a brief metadata gap cannot replay an unchanged counter. Regrouping
+observed contributors discards incompatible deltas and holds. Unsafe
+births continue to mark physical ancestors after the original service has gone,
+including an ancestor whose metadata becomes readable later.
+
+macOS and Windows currently have no invocation-role or process-session detector for
+these shared branches; their existing process observation remains the fallback, not
+proof of shared ownership. Persistent/remote-only servers are not hidden simply for
+being detached or idle. Collection reads process metadata only, starts no program,
+and looks once through the process list, then validates the relevant ancestry and CPU
+trees. Not seen: a client that runs as `node` (an npm install on macOS and Windows),
 and on Windows the folder, which the system does not tell of another process. macOS names
 a process after the file a link leads to, so there a client is also told by its path.
 
@@ -135,6 +193,34 @@ CLI executable. The app execution aliases Windows puts in
 answers. A program started from the desktop does not see the PATH a shell sets up, so
 the desktop app finds a client only in these places; one elsewhere is given by `path` in
 the settings.
+
+### Coding clients and private work
+
+The Rust client catalogue owns executable discovery and process tracking independently
+of quota collectors. Claude Code, Codex and Antigravity map explicitly to their existing
+collectors; OpenCode has no collector. Client enabled/path settings apply to discovery
+and activity; collector enabled settings apply only to measuring. A runner with no
+collectors keeps reporting clients while session reporting is enabled.
+
+Legacy sessions retain their released subset and cap priority. Supplemental sessions
+carry work that cannot enter that subset. Schema 21 adds a client namespace, nullable
+source and evidence metadata to session contexts, preserving ledger row/producer IDs
+and every work interval; device inventory is stored separately. Evidence is neither a
+resolver nor identity. Source-less and unheld work is private to the machine owner's
+personal board. Current holdings normalize private source references at read time;
+shared projections and source activity signals require a current holding.
+
+Private ownSessions and ownSince events update the corresponding page slices and
+quota/activity history without card or financial updates. Closed tiles invalidate even
+without readers. Empty boards use the same explicit Add widget flow and saved visibility.
+An account-private devices hint invalidates an open owner-device disclosure on any
+board without sending session data; opening or reconnecting also reads the owner API.
+The same presence deadline clears the disclosure even when its only sessions use held,
+hidden sources. Unchanged inventory and presence do not change connection revisions.
+OpenCode native local TUI attribution is proven only by bounded Linux invocation metadata;
+shared or unproven invocations and other operating systems have no project authority.
+Version transport bounds bytes before line parsing and waits for both EOF and successful
+exit within five seconds. It never retains raw output or reads client secrets.
 
 ## Scheduling
 
@@ -244,16 +330,40 @@ real next measurement even then.
 
 **Refresh on demand.** Any reader of a subscription on a board can request fresh data
 through its existing card menu, above the action to hide the widget, in the web
-dashboard and the desktop app. The header also refreshes all non-hidden cards on the
-current board through those same requests, up to four at a time. A refused request does
-not stop the rest; a tooltip at the header button lists every requested card in one
-compact row, with its name, status icon and short outcome. Error details expand by
-clicking the row. Each outcome stays in this attempt's receipt after the hub retires its
-status, also while the tooltip is closed. An old outcome cannot stand in for a new
-request, and a reconnect with a missing outcome says it is unknown. Nothing moves the
-widgets. While its refresh is pending, and once it has finished, clicking the button
-only opens or closes that information; a row at the top of the tooltip starts another
-attempt. An individual card cannot be requested again until its refresh finishes, nor
+dashboard and the desktop app. The header groups the board selector and two icon
+buttons on the right, before the account menu: Add widget and Board controls.
+These controls remain available on settings pages for the selected board. Changing
+boards preserves their space in the header while source status loads inside the menu.
+The board's event connection stays open across settings navigation; history reads and
+chart preparation pause until the dashboard returns, with live invalidations retained.
+The brand link returns to the selected board and its range through the shared router.
+A completed connection opened from settings navigates to its destination before focusing
+the card; visibility in the live store alone does not mean that its widget is on screen.
+Add names the destination board and lists eligible absent or hidden widgets with their
+type. One Add action provides or restores the selected widget; a source being shared
+discloses access to its measurements and history in its row before submission.
+The row retains an Added mark until the menu closes, without a confirmation page,
+success page or automatic scroll. Pending requests and recoverable errors stay in
+the row too. Search appears only above ten unfiltered entries in either list, preserves
+pending rows and their receipts, and stays visible while filtering; reopening reads the
+eligible catalogue again. Its Connect entry opens a separate provider/device choice
+while retaining the target board and the connection's verification and recovery flow.
+Board controls shows only the measured sources with visible cards under Data updates,
+their last successful measurements and errors, an explicit Refresh all action, the
+original free/locked layout control and board settings. Analytic widgets keep their
+settings and hiding actions in their own menus. Opening Board controls
+makes no refresh requests. The list keeps compact single-line rows: name and a short
+measurement age or outcome, with the complete timestamp in its tooltip and error
+details revealed only by clicking the row. Its wide layout puts status beside actions; at narrow
+widths actions precede the status list in one column, scrolling inside the Popover.
+The dropdowns share their heading, close action and inset row styles and start below
+the header's bottom edge. Navigation icons use library SVGs.
+Refresh all requests non-hidden cards through the same source endpoint, up to four
+at a time. A refusal does not stop the rest. Outcomes stay with each source's row
+after the hub retires its status, also while the dropdown is closed. Error details
+expand in that row. An old outcome cannot stand in for a new request, and a reconnect
+with a missing outcome says it is unknown. Nothing moves the widgets. A new attempt
+needs an explicit click, including the first one. An individual card cannot be requested again until its refresh finishes, nor
 while the page is still sending its request, from its menu or the header. Already
 pending subscriptions need no additional POST from the board action. The charts and
 tables receive new measurements through the usual events. Leaving the board stops
@@ -552,7 +662,8 @@ spending is positive usage movement and a top-up is positive credits movement.
 The account pair keeps the time its response arrived. Each key page has its own
 observation time for counters, period totals and cap resets, even when a traversal
 crosses a UTC boundary. One atomic store write preserves those independent times.
-Readings use signed integer millionths, with sparse value/semantic changes and
+Money readings use signed integer millionths; native Codex credits carry their own
+exact coefficient and scale. Both have sparse value/semantic changes and
 continuous observation spans. Unchanged heartbeats extend freshness without another
 reading. Retention keeps one predecessor to distinguish a late increase from a reset.
 Safe provider context has its own sparse history alongside that ledger: DeepSeek funds
@@ -574,6 +685,61 @@ A valid null limit explicitly ends the current cap, including in a partial round
 Invalid money leaves stay distinct from null. The ledger retains the last confirmed
 span endpoint as evidence through archival and retention; reappearance uses that
 heartbeat time as its spending anchor.
+
+Codex reports purchased credits on its existing subscription source. Dashboard and
+compact show additional funds as a footer mark, with exact amounts and conversion
+details in its disclosure; the subscription body keeps its percentage limits.
+Clients that have never reported credits get no empty footer mark. A confirmed zero
+is numeric; a missing, invalid or stale reading keeps the last known amount visible
+in the same warning colour as stale free resets. It remains one balance informer,
+with no separate warning icon. Its disclosure uses the tray's shared heading and
+detail table for native credits, measurement time and rate. Hovering shows the exact
+native balance. The separate Subscription extra funds trends widget plots credit
+history in the display currency alongside the subscription limit chart. Wallet budget
+charts and tables exclude subscription funds.
+Windows, free resets and credit status have independent strictly newer observation
+watermarks; a separate monotonic delivery baseline drives cadence and survives restart.
+Accepted late resources acknowledge eligible commands without advancing that baseline.
+New quota evidence can update Auto's change detection independently of transport progress.
+Fixed schedules restore their persisted baseline; Auto still measures immediately after
+restart until a genuinely newer delivery arrives. Deferred runtime acknowledgements run
+only after the mixed database transaction commits.
+An explicit unavailable quota observation persists an availability barrier separately
+from the original samples and their freshness promises. Native quota history, forecast
+evidence and alert baselines break there; recovery starts a new segment without an
+inferred spend or a threshold-crossing alert. Packed quota cells carry an exclusive
+availability end for both drawing and readout, limited by that sample's own freshness.
+Bounded native readouts use the precise pointer time and retain that deadline even if
+later samples have a different freshness promise.
+A coarse cell recovering after an unavailable start remains unavailable as a whole for
+drawing and readout, including when the gap began in an earlier cell. Recovery exactly
+on a cell boundary starts an ordinary new cell. Totals retain only proven consumption steps.
+Native credit amounts use exact coefficient/scale values, with scale stored per reading
+and retained in packed history and conversion provenance. Finite availability ends
+exclusively on missing, invalid, unsupported or unlimited observations; equal-value recovery starts
+a new span. No credit change implies spending, top-ups or quota forecasts.
+
+The shared currency layer defines `credits:codex` and an offline public default of
+0.04 USD per credit. Personal rate events can override or restore that default using
+the existing revision/receipt contract, without changing successful historical bindings.
+One chosen credit/USD leg precedes the ordinary display-currency path, rounded once.
+The builtin is managed in Currencies, immutable and unavailable as a display target.
+No provider-specific conversion or synthetic USD meter is needed in the adapter.
+
+Financial authority is per shared placement. Old and new Codex shares default off;
+wallet shares retain unrestricted retained history. Member-holders explicitly grant
+finance with a revision-checked command; owner status alone is insufficient. Enablement
+records an admission cutoff, and its first finite heartbeat forces one durable numeric
+anchor. History filters evidence before conversion, independently of retention/crop
+geometry. Current last-known values preserve their original time. Projection, events,
+history and currency context use the same grant; revision changes invalidate both
+native tiles and client generations. See the dashboard and ingest specs for the wire
+fields, exact decimal bounds and privacy contract.
+Event delivery rechecks the prepared batch's financial authority before sending. A
+mismatch rebuilds its snapshot and private currency context. A changed revision also
+discards undelivered poll frames, including across a disable/re-enable cycle. Normal
+SSE changes keep the delta protocol; grant metadata invalidates client history.
+History invalidations expose only admitted resource scopes and anchors.
 
 DeepSeek reports totals, granted credits and topped-up balances separately for CNY
 and USD. Stable catalogue descriptors identify total and component roles. Its
@@ -603,8 +769,15 @@ initial USD reference and display policy once. A persisted preference selects ea
 reader's display currency independently of the shared board. Standard currency identities
 are ISO codes; personal definitions use opaque `personal:<24 hex digits>` identities,
 with owner-only names, symbols and display precision. Percentage quotas and non-monetary
-counters keep their units. The settings section has no currency forms yet; authenticated
-currency operations already use the common registry and preference.
+counters keep their units. Personal Settings → Currencies manages this same registry
+and preference on the web and in the local desktop hub. Standard definitions and public
+reference rates are read-only. Display, Personal and Archive tabs separate the overview.
+Clicking a currency row opens a dialog with Settings and Rate history tabs; the row menu
+holds selection and archive actions. Editing shows one form at a time with native
+selectors, without nested menus.
+Personal metadata can be edited without changing identity.
+Archiving the selected currency requires an explicit active replacement in one transaction;
+restoring a currency does not select it or resume stopped rate pairs.
 Standard display precision comes from the runtime's currency metadata; personal
 definitions carry their owner's explicit precision.
 
@@ -613,7 +786,11 @@ validity. Source adapters own transport and supplier validation. The current pub
 adapter is the fixed credential-free ECB XML read, with bounded bytes, timeout and no
 redirects. Public snapshots are shared; fixed personal rates belong to their owner.
 An initial personal ratio defines a timeless nominal unit, rather than a historical
-provider observation. Later dated versions preserve prior assignments. Exact BigInt
+provider observation. Later dated versions preserve prior assignments. An append-only pair timeline selects
+the latest effective rate or stop, with a stable sequence for equal dates. A stop prevents
+older prices of that pair from becoming eligible again; another explicitly configured
+active pair may still provide a path. Initial ratios and immutable quote payloads survive
+archival. Backdated corrections apply only to points without a successful assignment. Exact BigInt
 arithmetic composes supported paths and rounds once, including conversion from the
 original CNY amount rather than a rounded USD intermediary. Neither provider keys nor
 account identifiers reach reference-data readers.
@@ -637,10 +814,22 @@ Unused private rate versions follow the same retention policy as public referenc
 The initial nominal definition, a predecessor for each rate pair, and every quote
 needed by retained assignments remain. Bindings serving a retained native predecessor
 survive even when the binding itself ends before retention.
+Timeline retention also keeps the rate or stop decision at every retained native
+observation anchor, including points with no reader assignment yet. Retryable unavailable
+observations preserve actual heartbeat boundaries across packing: a missing observation
+ends the previous displayed interval, while a later permitted rate can recover that exact
+anchor. Equal successful paths coalesce only across continuous eligible intervals.
 The definition pins its initial quote explicitly; later zero-date versions are ordinary
 retained rate updates, rather than additional permanent definitions.
 
-Reader snapshots and the private `currencies` event carry one target definition and
+Management writes use an owner registry revision and optional replay receipts; settings
+always send both. One transaction validates CAS, writes changes and records the result.
+Receipts last seven days; a stale expired request cannot pass CAS. Notifications and
+cache invalidation occur after commit. Private path revisions are owner-wide, so a
+standard selected target using a personal bridge also refreshes missing history. Metadata
+edits change the registry revision without forcing monetary history reloads.
+
+Reader snapshots and the private `currencies` event carry the registry revision, one target definition and
 source-specific bindings. Personal definitions and rates never enter shared card or
 history caches. The page preserves each source's binding slice so another source's
 measurement does not render its card. Dashboard, compact, key allowances and money
@@ -786,7 +975,8 @@ tests inject their own adapter. Each credential belongs to its person and can be
 created, replaced, listed or removed only by that person's session. Create and replacement
 identify the account outside SQLite, then commit encrypted access and its verified
 source holding atomically. A replacement cannot change the account. No-expiry access
-requires explicit consent. DeepSeek has declared identity: each owner creates an
+is admitted in one informed submit.
+DeepSeek has declared identity: each owner creates an
 immutable account UUID and private name, independent of keys. An owner/provider-scoped
 pseudonym determines the source. Same-account replacement requires an attestation;
 a different account needs a new connection. Both declared connectors use the same
@@ -805,6 +995,19 @@ an explicit same-site Origin before parsing, accept only a connector's strict pr
 ASCII key format, and are limited to ten attempts a minute per person and address.
 Replies contain only the safe record details, including a last-four hint; neither the
 key nor encrypted bytes go to the dashboard's events or shared boards.
+
+Without explicit inputs a new server creates a durable key in separate storage:
+`/keys/current.key` on a distinct persistent container mount, a private POSIX sibling
+of the canonical data directory, or a private nonvolatile HKCU branch on Windows.
+POSIX publication uses an exclusive temporary file, file fsync, a no-replace hard
+link, and directory/parent-entry barriers, repeated when admitting an existing key.
+Linux container storage identifies the opened directories by their kernel `mnt_id`
+and compares the actual backing mount roots, including stacked and hidden mounts.
+Windows reserves a durable nonsecret UUID, then a packaged bounded helper owns a
+global native mutex through private registry query/write, flush and read-back. The
+resolver runs under the same SQLite transaction as the key check; an established
+missing or mismatched store is never regenerated, including an empty credential set.
+The desktop's native controller remains the authority in local mode.
 
 z.ai does not supply account identity or key expiry. Its connector declares authenticated
 access without an account pseudonym; the credential service creates a random,
@@ -857,10 +1060,11 @@ and its limits.
   signs up without an invitation but with its setup code: a new hub prints one to its
   log, so only whoever started it can claim it. After that, signing up needs an invite
   link unless the hub is open (`QUOTUM_SIGNUP=open`).
-- **Devices** are running agents, and each belongs to a person. The *My connections* dialog
+- **Devices** are running agents, and each belongs to a person. The *Settings → Devices* page
   shows a person's devices, what each delivers and the last failure of each client
-  there (not logged in, too old…); the person names them there. The same list contains
-  their provider accounts, and its Connect menu opens a device or provider form directly.
+  there (not logged in, too old…); the person names them there. The page has two open
+  sections: devices with the one-time connection command, and device tokens with their
+  creation and revocation actions. Provider accounts have their own *My connections* page.
   *Agent activity → Settings → Manage projects* lists the projects their agents worked
   on, with the machines and when they last did:
   the person renames them and merges several into one, which applies everywhere they are
@@ -988,7 +1192,12 @@ history's grid at a time; a label past the chart's right edge counts down on its
 a forecast's line goes at the moment the table says it runs out, or at the reset; in the
 table, the plan, where the pace leads and the active hours left each read otherwise at
 their own moment. History is read when the hub tells of measurements or credited agent
-work. The page makes cells from `since` stale and reads only those its frame needs,
+work. Quota/activity, wallet budgets and additional subscription funds use separate readers,
+caches and selections. The two monetary readers share the budget history protocol;
+selected source IDs isolate their invalidations.
+Budget reads never query native quota or agent-work history, and money never enters
+quota forecasts. Legacy unscoped history replies retain their combined contract.
+The page makes cells from `since` stale and reads only those its frame needs,
 without a rate limit or a timer. Reconnect, a new lineup, or a change of whose work the
 board shows or its names (`Store.workKey`) makes all tiles stale. The last frame stays
 undimmed while its tail loads. A frame of another period stays dimmed until its cells
@@ -1013,20 +1222,35 @@ when it was measured and, while the hub sets the pace, when the next measurement
 and why, each a line of its own.
 A board has two areas: the cards (and the list of running agents, when turned on),
 which are about now and show every window, and under
-them the analytics, agent activity, the chart and the table, which show one period
-chosen in the analytics' own head, the chart and the table one window type of it. Each
-area is arranged on its own grid. A row is 48 px (a 32 px track and a 16 px gap).
+them the analytics: agent activity, quota history and table, additional subscription
+funds history, and wallet budget history and table. All use the period in the analytics head; the weekly/session switch applies
+only to the quota pair. Each analytics widget has independent placement,
+visibility and table columns. Budget series are chosen in the budget chart settings
+and shared with its table, even while the chart is hidden. Subscription funds have
+their own balance-only chart and subscription selection. They never appear in wallet
+budget charts or tables; both monetary charts reuse the same renderer. Each
+analytics panel uses the same heading and reader-error component. The selected
+period appears once in the shared analytics controls. While a different range is loading
+or has failed, retained results name the interval they actually cover; this status
+disappears when the selected answer arrives. The
+limit and budget tables share their column controls, cells and responsive renderer;
+when their selected columns no longer fit, both become labelled rows. Their own
+data models provide the values and column widths, including clock-driven cells.
+Each area is arranged on its own grid. A row is 48 px (a 32 px track and a 16 px gap).
 Each widget fills the fewest whole rows that contain its content, with any spare room
 above a card's tray or at the bottom of a panel, unless the owner chose a height for it
 (`h`, in rows). A chosen height is a request, not what shows: a card or the table never
 gets shorter than its content, and grows past the chosen rows while its content needs
-more, back to them when it needs less, without the view changing. Both charts give a
+more, back to them when it needs less, without the view changing. All four charts give a
 chosen height to their plot, never drawing it lower than they do by themselves, their
-heads, totals and legends whole. The list of agents gathers them by project (one name
+heads, totals and legends whole. The Agent sessions widget gathers them by project (one name
 across people, as agent activity counts it), machine or subscription, each viewer for
 themselves, or lists each agent: a group tells how many of its agents work, how long they
 have worked (each running agent's credited work, which the hub sends with it) and their
-last activity as a date and time, or now while any works; an unknown time is a dash.
+last activity as now while any works or within the first minute, minutes or hours ago
+on the current day, yesterday for the previous local day, then a date and time. The exact
+time stays in the tooltip; an unknown time is a dash. Only the time label wakes when its
+wording changes.
 In a narrow grouped list, the default first line pairs the name with the agent count;
 the second pairs credited work on the left with last activity on the right, aligned
 with the line above.
@@ -1074,26 +1298,47 @@ or a bottom corner, or Enter or Space on the bottom edge, gives a widget back th
 of its content. At 1000 px and below the page uses two columns, at 680 and below one, in
 reading order, with the heights chosen where the least their content can show fits them;
 arranging is available only on the wide grid.
-The page translates views saved before the grid, retaining hidden and absent widgets;
-the next save writes only the new layout. The hub requires that layout when saving,
-so an old page cannot overwrite it. Its view route allows 64 KiB per request, so a full
-view also fits the browser's keepalive save when leaving before the debounce, with no
-separate limit on the number of places: new visible neighbours can get their places
-without removing the ids kept by old views.
+The hub migrates pre-grid views and legacy analytics anchors atomically, retaining
+hidden intent, heights, unrelated geometry and each table's columns. A board view and
+revision are read as one reconciled pair. Saves require version 2 and its writer header;
+a stale runtime cannot save a version it merely echoed from a snapshot. The ordinary
+body limit is 76 KiB UTF-8. Up to the aggregate browser keepalive limit of 64 KiB, saves
+retain their debounce. Larger drafts start ordinary serialized saves immediately; a
+browser close warning stays until acknowledgment or explicit discard, and navigation
+that destroys the saver waits, including native browser Back/Forward. A failed save
+retains the exact history entry; a successful queue resumes the original traversal.
+The router publishes only the accepted address to path, board and time-range readers.
+Restoration and replay acknowledge their expected history entry, so repeated native
+traversals and unrelated React renders cannot expose a transient destination to the saver.
+Native shells keep immediate autosave with no additional close flow. Places have no
+separate count limit.
 The board's view comes with its events; the owner's changes show at once and are saved
 about half a second later, one request per burst (a drag, typing a plan), and stay on
-screen until the hub tells the view it saved. What
+screen until the hub tells the view it saved. Saves carry `If-Match` with the persistent
+view revision and are serialized per board by the authenticated shell. A stale save
+returns the current view and a visible conflict; it never silently reapplies an old
+full document over an Add or another window's edit. Add flushes this shell's pending
+save first, then patches only its requested visibility inside its transaction.
+Failed saves keep their unsent intent and a notice throughout settings navigation,
+with an explicit retry carrying the captured revision. Ending the authenticated shell
+drops unsent successors; a submitted Add continues when only its form closes, while an
+owner-scope change prevents further phases. No timer polls for those results.
+New empty boards keep analytics widgets pending. Resource capabilities place
+the quota or wallet pair and the subscription-funds chart independently on first use. An explicit Add also places an empty widget; placement
+is sticky after its last source or series disappears. Explicit hidden intent wins.
+`enabledWhenEmpty` applies to agents and activity; analytics placement lives in `shown`.
+What
 is only about how one person looks (the analytics' period and window type, the chart's
 horizon, lines and groups switched off in either chart's legend, whether it draws the plan and the forecast, what agent activity is stacked by, reset announcements, the lock on the widgets,
 the agents table's sort order, the chosen board and language) stays in their browser.
-Both charts, the remaining shares and agent activity, read and move along time alike
+Quota history, budget history, subscription-funds history and agent activity read and move along time alike
 (`ui/components/timeAxis.ts`), each with its legend under it. A time range selected on
-either becomes the analytics' period; it lives in the page's
+any of them becomes the analytics' period; it lives in the page's
 address (`?from=&to=`), so a reload keeps it, Back undoes it and a link to it can be shared on the board.
 ‹ and › beside the period move the analytics by half their length: back, to a range in
 the past held in the address like a dragged one; forward, up to now, where the chosen
 period comes back. A horizontal touchpad swipe, Shift with the wheel, or Shift with a
-mouse or pen drag moves both charts continuously. A page-local transaction captures
+mouse or pen drag moves all four charts continuously. A page-local transaction captures
 each chart's scale in CSS pixels and applies the same time delta on animation frames;
 plain dragging still selects a range and touch retains its hold-to-select gesture.
 Prepared SVG artwork moves in composited HTML surfaces behind a stationary clip;
@@ -1140,24 +1385,29 @@ Unvisited optional cells remain charged to that gesture after an
 abort or reversal; entering them restores the allowance. A disjoint jump inside a
 held tile also reads the minimum unknown or stale bridge to its retained interval,
 without rereading its fresh component. Empty tiles have no head to fill. At most
-one foreground and one purely speculative flight share the two slots; the final
+one foreground per resource family and one purely speculative flight overall share
+the two aggregate slots; foreground requests take priority; the final
 range uses the same batching without a buffer. Writes to the same tile are
 serialized, obsolete requests are aborted and speculative errors cannot drop the
 selection. The existing 15 MiB tile estimate protects the visible frame. On release,
 speculation stops and exact totals switch only after the final frame is complete.
 The history transport reuses unchanged `historyStart` and `known` through an opaque
-metadata token scoped to the board and hub instance. Each flight keeps the metadata
+metadata token scoped to the board, resource family and hub instance. Each flight keeps the metadata
 it offered, so out-of-order replies cannot borrow a newer or another board's values.
 The server still checks access and computes the current scope on every read; older
-readers continue to receive complete metadata.
+readers continue to receive complete metadata. Time navigation uses the newest accepted
+boundary from either reader, falling back to the current board snapshot before an answer
+arrives. Board changes, new snapshots and hub restarts discard previous boundary evidence.
 Numeric preparation runs outside React rendering through one cancellable MessageChannel
 scheduler. Its shared generators yield between small cell, session, group, event and point
 operations. UI slices target one millisecond and check the deadline after at most sixteen
 generator advances; server and synchronous readers drain those same generators. Each owner
 keeps only its latest job. Tile responses use private COW staging and publish their
 tiles, read bounds and metadata together. At most two responses are admitted for
-processing, including raw answers waiting for a tile reservation; ordinary HTTP
-scheduling remains separate. Flights and reservations remain owned until commit or
+HTTP and processing together, including raw answers waiting for a tile reservation.
+Quota, budget and subscription-funds readers share that pool and a 15 MiB retained-tile and staged-growth
+budget. Global eviction considers only nonvisible, unreserved tiles; an incoming frame
+that cannot fit fails losslessly without evicting the other reader's visible frame. Flights and reservations remain owned until commit or
 discard. Completed projections pin the current tile entry and its write sequence.
 
 Each chart replaces one typed drawing model whole after preparation, then publishes
@@ -1172,7 +1422,7 @@ also requires the complete history answer for the requested range, so a partial
 strip cannot start the fold before that answer replaces it.
 User navigation owns the requested projection separately from drawing readiness.
 Back, a preset or a horizon change retires an older held pose and its pending RAF or
-fold; both charts immediately place their retained data in the requested projection.
+fold; all four charts immediately place their retained data in the requested projection.
 Ready data keeps that projection when it replaces the borrowed model. Borrowed data
 keeps its own coverage and time domain, so future points are clipped rather than
 clamped into an edge and a requested past frame shows no old future labels.
@@ -1192,8 +1442,7 @@ ahead until movement or history news changes what is needed.
 For ordinary discrete navigation the chart moves to the new period at once, drawing
 the answer it has until the next frame is assembled. A run of quick steps reads its
 first and last missing parts. Tiles are kept across frames on the same grid, so a return
-or switching 12h and 24h asks nothing once both have been seen. A new lineup or work
-selection makes them stale; a late measurement or credited work makes only cells from
+or switching 12h and 24h asks nothing once both have been seen. A new lineup makes them stale; changed work attribution invalidates only quota/activity; a late measurement or credited work makes only cells from
 its actual time stale, and the page reads them when a frame needs them.
 
 Both agent lists put working sessions first, then the ones that worked most recently,
@@ -1522,7 +1771,7 @@ only while that same process still holds the machine; one that does not name its
 process is left alone, and the question says taking over failed. `quotum` tells who
 measures, and `quotum stop` ends a waiting `quotum` but never the app.
 
-**Its settings** are in the board's settings panel, only in the app's window: which
+**Its settings** are in Account settings, under Application, only in the app's window: which
 providers are measured and how often, a name for the Antigravity account, whether
 running agents are shown, start at login, the version and *Quit*. They are `quotum`'s
 settings: a change is written to `config.toml` at once, keeping comments, symbolic links

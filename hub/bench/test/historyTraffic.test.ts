@@ -34,8 +34,33 @@ test('the owned proxy measures a real fixed-codec HTTP body without changing JSO
   } finally {await proxy.close(); await new Promise<void>(resolve => upstream.close(() => resolve()));}
 });
 
-import {HistoryBodies, historyScroll} from '../historyTrafficBrowser';
+import {HistoryBodies, historyReadSelection, historyScroll, stableHistoryReads} from '../historyTrafficBrowser';
 import {readUnion} from '../historyTrafficBudget';
+
+test('traffic references preserve each resource selection instead of merging equal time cells', () => {
+  const uri = new URL('http://localhost/api/history?board=b&scope=budget&unit=USD&meters=%5B%5B%22wallet%22%2C%22balance%22%5D%5D&cell=1&from=0&to=60&meta=old');
+  const selection = historyReadSelection(uri);
+  uri.searchParams.set('from', '60'); uri.searchParams.set('to', '120'); uri.searchParams.set('meta', 'new');
+  assert.equal(historyReadSelection(uri), selection, 'new cells borrow the same selection reference');
+  const reference = new URL('http://localhost/api/history?' + selection);
+  assert.equal(reference.searchParams.get('scope'), 'budget');
+  assert.equal(reference.searchParams.get('meters'), '[["wallet","balance"]]');
+  for (const [key, value] of [['scope', 'quota'], ['unit', 'CNY'], ['meters', '[]'], ['currency', 'EUR'], ['board', 'another']]) {
+    const other = new URL(uri); other.searchParams.set(key, value);
+    assert.notEqual(historyReadSelection(other), selection, `${key} is part of the reference identity`);
+  }
+});
+
+test('cancelled resource cohorts keep private quota bounds separate from financial metadata', () => {
+  const quota = {run: 'r', now: 0, known: {work: 0, own: 100, sources: {s: 0}}};
+  const money = {run: 'r', now: 0, known: {work: 0, sources: {s: 0}}};
+  const seeds = new Map([['quota', {answer: quota}], ['budget', {answer: money}], ['funds', {answer: money}]]);
+  const reads = [{selection: 'quota', answer: quota}, {selection: 'budget', answer: money}, {selection: 'funds', answer: money}, {selection: 'quota'}];
+  stableHistoryReads(reads, seeds, 60_000);
+  assert.throws(() => stableHistoryReads([{selection: 'quota', answer: money}], seeds, 60_000));
+  assert.throws(() => stableHistoryReads([{selection: 'budget', answer: {...money, known: {...money.known, work: 1}}}], seeds, 60_000));
+  assert.throws(() => stableHistoryReads([{selection: 'other', answer: money}], seeds, 60_000));
+});
 
 test('the browser observer expands late metadata while counting only each actual response body', async () => {
   const listeners = new Map<string, (event: never) => void>();

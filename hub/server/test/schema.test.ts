@@ -7,7 +7,7 @@ import path from 'node:path';
 import {DatabaseSync} from 'node:sqlite';
 import {STEPS,SCHEMA_VERSION,migrate} from '../store/schema.js';
 import {Store} from '../store/store.js';
-import {Directory} from '../store/directory.js';
+import {CurrencyStore} from '../store/currencies.js';
 
 /**
  * Every step a release shipped, by its hash. A database records which steps it has
@@ -24,6 +24,17 @@ const RELEASED = [
   '559b6e3b19e7c77db182ef425a747de69a2ebe2ddc7c69169616d2746d98bcc6', // 0.6
   '90c23490c93cd2088d4f97f52a579161ea62c476b91469a39e18af1952cdb7bb', // 0.6
   '383d526454a7ae7d0c38b7847e43255c4af60ff8bcceeb478baed4e11b6eac04', // 0.6
+  '977e810f34cba9fb6c5774f89edd11e918f15376c8979795be2ac4e72db52f07', // 0.7
+  'e7cb09c9c37e5d1095e71d713c2e7b378d2f67fa5ebb8b0c3aedc7a78cb5e9b9', // 0.7
+  '3b86ba00d52469c2cc0526df8fef2be35b788fbfd75254e526654da319c4f2c1', // 0.7
+  '3462b3e197deb9f67bc1ff67f1c7b926b13f7dc966c8a8ca2a4b66fe34ba8305', // 0.7
+  '35088adae77f67915193590cc15fa7a4b2d2554d0ec71b7a067dcc8015066aa6', // 0.7
+  'f871e8078d0e3ee57f783201cf47c518643eb9f4b21293a4393957c859e2f8e3', // 0.7
+  '8926d768166db825d4610fdbee22bf5681a6a44f56250c905c52789cedb66873', // 0.7
+  'e6f545f3c89467d2a9001e201d0c7617c120951b2d44bc2bb1ec692a14264459', // 0.7
+  'b0c1b4b2223ca37cfe45a6bbc59036b0a4f64ac05908d344f903a4b0fe663fc6', // 0.7
+  'c290ec9435336ada28e76004d7b3a071ffbcc541c5ba385f6f0290b1516c7118', // 0.7
+  'b4ae9c2c749fcff165b0da116a55a018573aef239a49782a430646ec185d8a3b', // 0.7
 ];
 
 test('released layout steps never change; new ones come after them', () => {
@@ -68,8 +79,8 @@ test('identity migration preserves exact legacy session IDs, keys and intervals'
   assert.deepEqual(store.db.prepare('SELECT id, device_id, source_id, origin, started_at, project, folder, ordinal FROM agent_sessions ORDER BY id').all(), sessions);
   assert.deepEqual(store.db.prepare('SELECT * FROM agent_work ORDER BY session_id, from_at').all(), work);
   assert.deepEqual(store.db.prepare('SELECT producer_id FROM agent_sessions').all().map(row => row.producer_id), [null, null]);
-  assert.match(String(store.db.prepare("EXPLAIN QUERY PLAN SELECT id FROM agent_sessions WHERE device_id='device' AND source_id='codex:1' AND started_at=123 AND origin='terminal' AND project='P' AND folder='wt' AND ordinal=3 AND producer_id IS NULL").get()!.detail), /agent_sessions_legacy_key/);
-  assert.match(String(store.db.prepare("EXPLAIN QUERY PLAN SELECT id FROM agent_sessions WHERE device_id='device' AND producer_id='abc' AND source_id='codex:1' AND origin='terminal' AND project='P' AND folder='wt'").get()!.detail), /agent_sessions_stable_key/);
+  assert.match(String(store.db.prepare("EXPLAIN QUERY PLAN SELECT id FROM agent_sessions WHERE device_id='device' AND client='codex' AND COALESCE(source_id,'')='codex:1' AND source_id='codex:1' AND started_at=123 AND origin='terminal' AND project='P' AND folder='wt' AND ordinal=3 AND producer_id IS NULL").get()!.detail), /agent_sessions_legacy_key/);
+  assert.match(String(store.db.prepare("EXPLAIN QUERY PLAN SELECT id FROM agent_sessions WHERE device_id='device' AND client='codex' AND producer_id='abc' AND COALESCE(source_id,'')='codex:1' AND source_id='codex:1' AND origin='terminal' AND project='P' AND folder='wt'").get()!.detail), /agent_sessions_stable_key/);
   store.close();
 });
 
@@ -82,7 +93,7 @@ test('money storage upgrades the stable-session layout without changing its iden
     db.exec('INSERT INTO agent_work VALUES (42, 1000, 2000)');
     const sessions=db.prepare('SELECT * FROM agent_sessions').all(),work=db.prepare('SELECT * FROM agent_work').all();
     migrate(db,3000);
-    assert.deepEqual(db.prepare('SELECT * FROM agent_sessions').all(),sessions);
+    assert.deepEqual(db.prepare('SELECT id,device_id,source_id,origin,started_at,project,folder,ordinal,producer_id FROM agent_sessions').all(),sessions);
     assert.deepEqual(db.prepare('SELECT * FROM agent_work').all(),work);
     assert.equal(db.prepare('PRAGMA user_version').get()?.user_version,SCHEMA_VERSION);
     for(const name of ['readings','meter_spans','meter_contexts'])assert.ok(db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?").get(name));
@@ -109,7 +120,7 @@ test('the shared currency upgrade preserves native state and legacy history and 
     const valued=store.currencies.project('s',native,'USD',at)!;assert.equal(valued.amount,'15714286');assert.equal(valued.scope,'wallet');assert.equal(valued.label,'Original');assert.equal(valued.conversion?.original.amount,'110000000');assert.equal(valued.conversion?.rate.fetchedAt,at);
     assert.equal(store.currencies.spans('s','fx:USD:balance:CNY',at+10000)[0].interruptedAt,at+10000);
     assert.equal(store.meters.readings('s','converted:balance:USD',0,at+1)[0].amount,'15714286');
-    assert.equal(store.db.prepare('SELECT count(*) n FROM exchange_rates').get()?.n,1);
+    assert.equal(store.db.prepare("SELECT count(*) n FROM exchange_rates WHERE source<>'codex-default'").get()?.n,1);
   }finally{store.close();}
 });
 
@@ -120,7 +131,7 @@ test('unreleased declared-account layouts adopt canonical provenance without los
       db.exec("ALTER TABLE credentials ADD COLUMN expiry_kind TEXT NOT NULL DEFAULT 'none' CHECK(expiry_kind IN ('at','none','unknown')); ");
       db.exec(STEPS[10]);for(const step of STEPS.slice(11,version+1))db.exec(step);
       db.exec('PRAGMA user_version='+version);
-      const directory=new Directory(db),owner=directory.createUser('migration@example.com','Owner','fixture',1);
+      const owner={id:'owner'};db.prepare('INSERT INTO users(id,email,name,password,created_at) VALUES (?,?,?,?,?)').run(owner.id,'migration@example.com','Owner','fixture',1);
       db.prepare("INSERT INTO sources(id,provider,account,created_at) VALUES ('s','deepseek','native',1)").run();
       db.prepare('INSERT INTO declared_accounts VALUES (?,?,?,?,?,?,?,?)').run('account',owner.id,'deepseek','s','Private','private',1,0);
       const cipher=Buffer.from('encrypted fixture'),nonce=Buffer.alloc(12,7);
@@ -135,4 +146,80 @@ test('unreleased declared-account layouts adopt canonical provenance without los
       assert.equal(db.prepare('PRAGMA user_version').get()?.user_version,SCHEMA_VERSION);migrate(db,3);
     }finally{db.close();}
   }
+});
+
+test('board additions append to the integrated currency layout while analytics migration preserves view settings, shares and encrypted access',()=>{
+  const db=new DatabaseSync(':memory:');try {
+    for(const step of STEPS.slice(0,15))db.exec(step);db.exec('PRAGMA user_version = 15');
+    db.exec("INSERT INTO users VALUES ('owner','upgrade@example.test','Owner','fixture',1); INSERT INTO boards VALUES ('board','Board',0,'owner',1); INSERT INTO members VALUES ('board','owner','owner',1)");
+    const payload=JSON.stringify({hidden:['source:deepseek:123456789abc'],order:['legacy'],names:{legacy:'Kept'},unknown:{kept:true}});
+    db.prepare('INSERT INTO views VALUES (?,?,?,?)').run('board',payload,'owner',1);
+    db.exec("INSERT INTO sources(id,provider,account,created_at) VALUES ('deepseek:123456789abc','deepseek','native',1); INSERT INTO holders VALUES ('deepseek:123456789abc','owner',1); INSERT INTO shares VALUES ('board','deepseek:123456789abc','owner',1); INSERT INTO source_identity VALUES ('deepseek:123456789abc','declared','owner')");
+    const cipher=Buffer.from('encrypted fixture'),nonce=Buffer.alloc(12,9);
+    db.prepare("INSERT INTO credentials(id,user_id,provider,source_id,cipher,nonce,key_version,abilities,created_at,expiry_kind) VALUES ('key','owner','deepseek','deepseek:123456789abc',?,?,1,'[\"balance\"]',1,'unknown')").run(cipher,nonce);
+    const before=Object.fromEntries(['sources','holders','shares','credentials'].map(table=>[table,db.prepare('SELECT * FROM '+table).all()]));
+    migrate(db,2);
+    for(const table of ['sources','holders'])assert.deepEqual(db.prepare('SELECT * FROM '+table).all(),before[table]);
+    assert.deepEqual(db.prepare('SELECT board_id,source_id,shared_by,shared_at FROM shares').all(),before.shares);
+    const grant=db.prepare('SELECT budget_since,budget_anchor_at,budget_revision FROM shares').get()!;assert.equal(grant.budget_since,0);assert.equal(grant.budget_anchor_at,0);assert.match(String(grant.budget_revision),/^[0-9a-f]{32}$/);
+    const credential=db.prepare('SELECT * FROM credentials').get()!;assert.equal(credential.access_revision,0);delete credential.access_revision;assert.deepEqual([credential],before.credentials);
+    const saved=db.prepare('SELECT payload,revision,updated_by,updated_at FROM views').get()!;
+    assert.deepEqual({...saved,payload:undefined},{payload:undefined,revision:1,updated_by:'owner',updated_at:1});
+    const view=JSON.parse(String(saved.payload)); assert.equal(view.version,2);
+    assert.deepEqual(view.names,{legacy:'Kept'}); assert.deepEqual(view.unknown,{kept:true});
+    assert.deepEqual(view.hidden,['source:deepseek:123456789abc']);
+    assert.equal(db.prepare('PRAGMA user_version').get()!.user_version,SCHEMA_VERSION);assert.equal(SCHEMA_VERSION,22);
+  }finally{db.close();}
+});
+
+test('currency lifecycle upgrade backfills stable pair ordering without changing quotes or pins',()=>{
+  const db=new DatabaseSync(':memory:');try {
+    for(const step of STEPS.slice(0,16))db.exec(step);db.exec('PRAGMA user_version=16');
+    db.exec("INSERT INTO users VALUES ('owner','currency-upgrade@example.com','Owner','fixture',1)");
+    const id='personal:'+'a'.repeat(24);
+    db.prepare('INSERT INTO currency_definitions VALUES (?,?,?,?,?,?,?)').run(id,'owner','Points','PT',2,null,'initial');
+    const insert=db.prepare('INSERT INTO exchange_rates VALUES (?,?,?,?,?,?)');
+    for(const [quote,date,fetched,rate] of [['initial',0,1,'2000000'],['revised',0,2,'3000000'],['dated',20,30,'4000000']] as const)insert.run(quote,'manual',date,fetched,JSON.stringify({source:'manual',base:'USD',date,fetchedAt:fetched,validUntil:null,rates:{USD:'1000000',[id]:rate}}),'owner');
+    db.prepare('INSERT INTO currency_bindings VALUES (?,?,?,?,?,?,?,?)').run('owner','source','USD',id,10,15,'','[{"id":"initial","from":"1000000","to":"2000000"}]');
+    const quotes=db.prepare('SELECT * FROM exchange_rates ORDER BY id').all(),pins=db.prepare('SELECT * FROM currency_bindings').all();
+    migrate(db,100);migrate(db,101);
+    assert.deepEqual(db.prepare('SELECT * FROM exchange_rates ORDER BY id').all(),quotes);assert.deepEqual(db.prepare('SELECT * FROM currency_bindings').all(),pins);
+    assert.deepEqual(db.prepare('SELECT quote_id FROM currency_rate_changes ORDER BY sequence').all().map(row=>row.quote_id),['initial','revised','dated']);
+    assert.equal(db.prepare("SELECT count(*) n FROM currency_rate_changes WHERE kind='stop'").get()?.n,0);
+  }finally{db.close();}
+});
+
+test('public rate sequences migrate per owner and never reuse pruned numbers after reopening',()=>{
+  const db=new DatabaseSync(':memory:');try {
+    for(const step of STEPS.slice(0,17))db.exec(step);db.exec('PRAGMA user_version=17');
+    for(const owner of ['a','b'])db.prepare('INSERT INTO users VALUES (?,?,?,?,?)').run(owner,owner+'@example.com',owner,'fixture',1);
+    for(const [index,owner] of ['a','b','b','a'].entries())db.prepare("INSERT INTO currency_rate_changes(owner_id,currency_id,base,effective_at,recorded_at,kind) VALUES (?,'old','USD',?,?,'stop')").run(owner,index,index);
+    migrate(db,100);migrate(db,101);
+    assert.deepEqual(db.prepare('SELECT owner_sequence FROM currency_rate_changes ORDER BY sequence').all().map(row=>row.owner_sequence),[1,1,2,2]);
+    db.prepare('DELETE FROM currency_rate_changes WHERE owner_id=?').run('a');
+    const c=new CurrencyStore(db),id=c.create('a',{name:'Points',symbol:'PT',fractionDigits:2},'USD','2000000',110).id;
+    assert.equal(c.rateHistory('a',id,undefined).changes[0].sequence,3);
+    const reopened=new CurrencyStore(db);reopened.setRate('a',id,'USD','3000000',120,120);
+    assert.deepEqual(reopened.rateHistory('a',id,undefined).changes.map(change=>change.sequence),[4,3]);
+  }finally{db.close();}
+});
+
+test('client migration preserves the schema-20 ledger and null-source contexts remain unique per client',()=>{
+  const db=new DatabaseSync(':memory:');
+  try {
+    for(const step of STEPS.slice(0,20))db.exec(step);db.exec('PRAGMA user_version=20');
+    db.exec("INSERT INTO agent_sessions VALUES (42,'device','codex:1','terminal',123,'P','wt',0,'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'),(53,'device','not safe:1','app',124,'','',1,NULL)");
+    db.exec('INSERT INTO agent_work VALUES (42,1000,2000),(42,3000,4000),(53,1500,3500)');
+    const work=db.prepare('SELECT * FROM agent_work ORDER BY session_id,from_at').all();
+    migrate(db,5000);
+    assert.deepEqual(db.prepare('SELECT id,client,producer_id,account_by FROM agent_sessions ORDER BY id').all().map(r=>({...r})),[
+      {id:42,client:'codex',producer_id:'a'.repeat(32),account_by:'legacy'}, {id:53,client:'unknown',producer_id:null,account_by:'legacy'}]);
+    assert.deepEqual(db.prepare('SELECT * FROM agent_work ORDER BY session_id,from_at').all(),work);
+    const add=db.prepare("INSERT INTO agent_sessions(device_id,client,source_id,origin,started_at,project,folder,ordinal,producer_id) VALUES('device',?,NULL,'terminal',123,'P','wt',0,?)");
+    for(const producer of [null,'b'.repeat(32)]) {
+      add.run('opencode',producer); assert.throws(()=>add.run('opencode',producer),/UNIQUE/);
+      add.run('future-client',producer);
+    }
+    const rows=db.prepare('SELECT count(*) AS n FROM agent_sessions').get();migrate(db,6000);assert.deepEqual(db.prepare('SELECT count(*) AS n FROM agent_sessions').get(),rows);
+  }finally{db.close();}
 });

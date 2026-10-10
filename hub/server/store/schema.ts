@@ -1,3 +1,4 @@
+import {migrateAnalyticsViews} from './analyticsView.js';
 import type {DatabaseSync} from 'node:sqlite';
 import {adoptDeclaredLayout} from './legacyDeclared.js';
 
@@ -241,7 +242,114 @@ export const STEPS = [
       AND json_type(q.payload,'$.rates."'||currency_definitions.id||'"') IS NOT NULL
     ORDER BY q.fetched_at,q.rowid LIMIT 1);
   `,
-  // 16 — replaceable daily reports and component confirmations.
+  // 16 — recoverable additions, concurrent board views and private connection discovery.
+  `
+  ALTER TABLE views ADD COLUMN revision INTEGER NOT NULL DEFAULT 0;
+  ALTER TABLE credentials ADD COLUMN access_revision INTEGER NOT NULL DEFAULT 0;
+  CREATE TABLE board_additions (
+    id TEXT PRIMARY KEY, owner_id TEXT NOT NULL, request_id TEXT NOT NULL, board_id TEXT,
+    item TEXT NOT NULL, state TEXT NOT NULL, result TEXT, error TEXT,
+    created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, expires_at INTEGER NOT NULL,
+    attempt_generation INTEGER NOT NULL DEFAULT 0, run_id TEXT, verify_until INTEGER,
+    onboarding_id TEXT UNIQUE, UNIQUE(owner_id, request_id));
+  CREATE INDEX additions_by_owner ON board_additions (owner_id, created_at DESC, id DESC);
+  CREATE TABLE device_onboarding (
+    id TEXT PRIMARY KEY, request_id TEXT NOT NULL, user_id TEXT NOT NULL, board_id TEXT NOT NULL,
+    code_id TEXT, token_id TEXT, device_id TEXT, source_ids TEXT, addition_id TEXT UNIQUE,
+    created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, status TEXT NOT NULL,
+    UNIQUE(user_id, request_id));
+  CREATE TABLE account_revisions (
+    user_id TEXT PRIMARY KEY, revision INTEGER NOT NULL DEFAULT 0
+    CHECK (revision BETWEEN 0 AND 9007199254740991));
+  ${[
+    ['holder_added', 'AFTER INSERT ON holders', 'NEW.user_id'],
+    ['holder_removed', 'AFTER DELETE ON holders', 'OLD.user_id'],
+    ['device_added', 'AFTER INSERT ON devices', 'NEW.user_id'],
+    ['token_added', 'AFTER INSERT ON tokens', 'NEW.user_id'],
+    ['token_changed', 'AFTER UPDATE OF hash, revoked_at ON tokens WHEN OLD.hash IS NOT NEW.hash OR OLD.revoked_at IS NOT NEW.revoked_at', 'NEW.user_id'],
+    ['device_changed', 'AFTER UPDATE OF token_id, token_hash, revoked_at, label ON devices WHEN OLD.token_id IS NOT NEW.token_id OR OLD.token_hash IS NOT NEW.token_hash OR OLD.revoked_at IS NOT NEW.revoked_at OR OLD.label IS NOT NEW.label', 'NEW.user_id'],
+    ['device_source_added', 'AFTER INSERT ON device_sources', '(SELECT user_id FROM devices WHERE id=NEW.device_id)'],
+    ['device_source_changed', 'AFTER UPDATE OF source_id ON device_sources WHEN OLD.source_id IS NOT NEW.source_id', '(SELECT user_id FROM devices WHERE id=NEW.device_id)'],
+    ['credential_added', 'AFTER INSERT ON credentials', 'NEW.user_id'],
+    ['credential_removed', 'AFTER DELETE ON credentials', 'OLD.user_id'],
+    ['credential_changed', 'AFTER UPDATE OF access_revision, expires_at, expiry_kind, last_error, unreadable ON credentials WHEN OLD.access_revision IS NOT NEW.access_revision OR OLD.expires_at IS NOT NEW.expires_at OR OLD.expiry_kind IS NOT NEW.expiry_kind OR OLD.last_error IS NOT NEW.last_error OR OLD.unreadable IS NOT NEW.unreadable', 'NEW.user_id'],
+  ].map(([name, event, owner]) => `CREATE TRIGGER connections_${name} ${event} BEGIN
+    INSERT INTO account_revisions (user_id,revision) VALUES (${owner},1) ON CONFLICT(user_id) DO UPDATE SET revision=revision+1;
+  END;`).join('\n')}
+  `,
+  // 17 — reversible personal currencies, immutable pair lifecycle and recoverable settings saves.
+  `
+  CREATE TABLE currency_rate_changes (
+    sequence INTEGER PRIMARY KEY AUTOINCREMENT, owner_id TEXT NOT NULL, currency_id TEXT NOT NULL,
+    base TEXT NOT NULL, effective_at INTEGER NOT NULL, recorded_at INTEGER NOT NULL,
+    kind TEXT NOT NULL CHECK(kind IN ('rate','stop')), quote_id TEXT,
+    CHECK((kind='rate' AND quote_id IS NOT NULL) OR (kind='stop' AND quote_id IS NULL)));
+  CREATE INDEX currency_rate_timeline ON currency_rate_changes(owner_id,currency_id,base,effective_at,sequence);
+  INSERT INTO currency_rate_changes(owner_id,currency_id,base,effective_at,recorded_at,kind,quote_id)
+    SELECT q.owner_id,d.id,json_extract(q.payload,'$.base'),q.reference_date,q.fetched_at,'rate',q.id
+    FROM exchange_rates q JOIN currency_definitions d ON d.owner_id=q.owner_id
+    WHERE q.source='manual' AND json_type(q.payload,'$.rates."'||d.id||'"') IS NOT NULL
+    ORDER BY q.reference_date,q.fetched_at,q.id;
+  CREATE TABLE currency_unavailable_observations (
+    owner_id TEXT NOT NULL, source_id TEXT NOT NULL, from_currency TEXT NOT NULL, target_currency TEXT NOT NULL,
+    observation_at INTEGER NOT NULL, anchor TEXT NOT NULL,
+    PRIMARY KEY(owner_id,source_id,from_currency,target_currency,observation_at,anchor)) WITHOUT ROWID;
+  CREATE TABLE currency_mutations (
+    owner_id TEXT NOT NULL, request_id TEXT NOT NULL, request_hash TEXT NOT NULL,
+    response TEXT NOT NULL, status INTEGER NOT NULL, created_at INTEGER NOT NULL,
+    PRIMARY KEY(owner_id,request_id)) WITHOUT ROWID;
+  `,
+  // 18 — public rate ordering reveals only the owner's own activity.
+  `
+  ALTER TABLE currency_rate_changes ADD COLUMN owner_sequence INTEGER NOT NULL DEFAULT 0;
+  WITH numbered AS (SELECT sequence,row_number() OVER (PARTITION BY owner_id ORDER BY sequence) n FROM currency_rate_changes)
+    UPDATE currency_rate_changes SET owner_sequence=(SELECT n FROM numbered WHERE numbered.sequence=currency_rate_changes.sequence);
+  CREATE UNIQUE INDEX currency_rate_owner_sequence ON currency_rate_changes(owner_id,owner_sequence);
+  INSERT INTO meta(key,value) SELECT 'currencyRateSequence:'||owner_id,CAST(max(owner_sequence) AS TEXT)
+    FROM currency_rate_changes GROUP BY owner_id;
+  `,
+  // 19 — independently placed quota and budget analytics, with frozen addition targets.
+  `ALTER TABLE board_additions ADD COLUMN widget_targets TEXT;`,
+  // 20 — exact native credit coefficients and explicit financial consent on mixed sources.
+  `
+  ALTER TABLE readings ADD COLUMN amount_scale INTEGER NOT NULL DEFAULT 6 CHECK(amount_scale BETWEEN 0 AND 18);
+  ALTER TABLE shares ADD COLUMN budget_since INTEGER;
+  ALTER TABLE shares ADD COLUMN budget_anchor_at INTEGER;
+  ALTER TABLE shares ADD COLUMN budget_revision TEXT NOT NULL DEFAULT '';
+  UPDATE shares SET budget_revision=lower(hex(randomblob(16)));
+  UPDATE shares SET budget_since=0,budget_anchor_at=0 WHERE source_id IN (SELECT id FROM sources WHERE provider IN ('openrouter','deepseek'));
+  CREATE INDEX shares_budget_pending ON shares(source_id,budget_since) WHERE budget_anchor_at IS NULL AND budget_since IS NOT NULL;
+  `,
+  // 21 — coding clients have optional funding, independent process identities and inventory.
+  `
+  ALTER TABLE agent_sessions RENAME TO agent_sessions_before_clients;
+  CREATE TABLE agent_sessions (
+    id INTEGER PRIMARY KEY, device_id TEXT NOT NULL, client TEXT NOT NULL CHECK(length(client)>0),
+    source_id TEXT, origin TEXT NOT NULL, started_at INTEGER NOT NULL,
+    project TEXT NOT NULL, folder TEXT NOT NULL, ordinal INTEGER NOT NULL, producer_id TEXT,
+    account_by TEXT CHECK(account_by IN ('login','inferred','legacy')),
+    route_class TEXT CHECK(route_class IN ('subscription','api','unknown')),
+    route_by TEXT CHECK(route_by IN ('session','machine')), route_host TEXT, route_provider TEXT);
+  INSERT INTO agent_sessions (id,device_id,client,source_id,origin,started_at,project,folder,ordinal,producer_id,account_by)
+    SELECT s.id,s.device_id,
+      COALESCE((SELECT provider FROM sources WHERE id=s.source_id),
+        CASE WHEN instr(s.source_id,':') BETWEEN 2 AND 65 AND substr(s.source_id,1,1) GLOB '[a-z]' AND substr(s.source_id,1,instr(s.source_id,':')-1) NOT GLOB '*[^a-z0-9_-]*' THEN substr(s.source_id,1,instr(s.source_id,':')-1) ELSE 'unknown' END),
+      s.source_id,s.origin,s.started_at,s.project,s.folder,s.ordinal,s.producer_id,'legacy'
+    FROM agent_sessions_before_clients s;
+  DROP TABLE agent_sessions_before_clients;
+  CREATE UNIQUE INDEX agent_sessions_legacy_key ON agent_sessions
+    (device_id,client,COALESCE(source_id,''),started_at,origin,project,folder,ordinal) WHERE producer_id IS NULL;
+  CREATE UNIQUE INDEX agent_sessions_stable_key ON agent_sessions
+    (device_id,client,producer_id,COALESCE(source_id,''),origin,project,folder) WHERE producer_id IS NOT NULL;
+  CREATE INDEX agent_sessions_by_project ON agent_sessions(device_id,project,source_id,client);
+  CREATE TABLE device_clients (device_id TEXT NOT NULL,client TEXT NOT NULL,version TEXT,seen_at INTEGER NOT NULL,
+    PRIMARY KEY(device_id,client)) WITHOUT ROWID;
+  CREATE TRIGGER device_clients_revoked AFTER UPDATE OF revoked_at ON devices WHEN NEW.revoked_at IS NOT NULL BEGIN
+    DELETE FROM device_clients WHERE device_id=NEW.id;
+  END;
+  `,
+
+  // 22 — replaceable daily reports and component confirmations.
   `
   CREATE TABLE reported_intervals (
     source_id TEXT NOT NULL, meter_id TEXT NOT NULL, unit TEXT NOT NULL,
@@ -270,6 +378,7 @@ export function migrate(db: DatabaseSync, now: number) {
   db.exec('BEGIN IMMEDIATE');
   try {
     for (const step of STEPS.slice(adoptDeclaredLayout(db,current))) db.exec(step);
+    if (current < 19) migrateAnalyticsViews(db, now);
     db.exec(`PRAGMA user_version = ${SCHEMA_VERSION}`);
     db.prepare('INSERT OR IGNORE INTO meta VALUES (?, ?)').run('historyStart', String(now));
     // Before this, how agents worked is not known (the sums of layout 2 are gone), rather than none worked.

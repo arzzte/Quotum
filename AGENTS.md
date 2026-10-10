@@ -47,14 +47,17 @@ one system, say so.
 against its budget (`hub/bench/budget.ts`). An idle board has neither measurements nor
 working agents: it asks the hub nothing and renders only what shows time. Every
 measurement reaches its card and chart, 95 of 100 within a second, reading only new
-history cells and rendering no other card nor the header. A machine report crediting
+history cells and rendering no other card nor the header. A mixed Codex subscription's
+credit changes and unchanged-value heartbeats update its card and funds history while
+quota and wallet analytics remain unchanged. A machine report crediting
 work makes at most one small history read and renders only its card, agents and
 analytics. Run it when you change the dashboard and have Chrome (`QUOTUM_CHROME`, one
 on `PATH`, or `--cdp` to one already running); CI fails over budget. After the readings,
 it also checks consecutive measuring-frequency saves with native arrow keys and fails
 if saving loses focus.
-Native horizontal wheel and Shift-drag scenarios then move both charts at 24h and 30d
-with at least twelve real series and CPU throttled fourfold, including an unread edge,
+Native horizontal wheel and Shift-drag scenarios start separately from the limit, budget
+and subscription-funds charts, moving all four charts at 24h and 30d
+with at least twelve real series per resource family and CPU throttled fourfold, including an unread edge,
 strip rebuilding, reversal and return to live. Moving-frame p95/p99 must stay within
 34/50 ms and input-to-updated-frame p95 within 34 ms; callbacks without actual chart
 movement cannot pass. Existing idle, measurement and work budgets remain unchanged.
@@ -105,6 +108,11 @@ and platform smoke checks still apply.
   work; named account selection adds no second identity or consent mechanism. Reuse
   persisted source bindings without recomputing their identity. Private account labels
   and owner IDs never enter shared projections.
+- **Clients and collectors are independent.** The client catalogue owns discovery and
+  activity; only explicitly mapped collectors measure subscriptions. Preserve legacy
+  session order and cap priority. Unknown or unheld work belongs only to the owner's
+  personal board and devices, never shared projections or source activity signals.
+  Evidence metadata never changes producer identity or retrospectively attributes work.
 - **The provider catalogue defines authority.** Known hub-measured providers are
   dropped from agent snapshots, failures and sessions before their other fields are
   parsed. Check-in replies preserve those elements' positions and tell the agent to
@@ -188,7 +196,16 @@ and platform smoke checks still apply.
 - **Budget widgets share one semantic presentation.** Dashboard and compact use the
   same budget view and renderer: one Available balance, supported scoped allowances
   separately, and balance composition in the existing disclosure. Accounting totals
-  belong in analytics. Never add card rows just because a provider returns more fields;
+  belong in analytics. A subscription's additional funds belong in its footer beside
+  free resets, as a compact amount with a disclosure, in both dashboard and compact.
+  Their history belongs in the separate subscription-funds widget; wallet budget charts
+  and tables exclude subscription funds. It shares the money renderer and time axis,
+  with its own series selection and visibility.
+  They never add a balance row to the subscription's main body.
+  Keep the last known amount visible in the warning tone when stale, just like free
+  resets; do not replace it with a warning icon or add another status mark. Its
+  disclosure uses the shared tray heading and detail table.
+  Never add card rows just because a provider returns more fields;
   each extra field needs a defined purpose, while safe financial observations are saved
   at capture for later analytics. Only reported caps have scales, and lifetime credits
   never become a wallet's percentage denominator. Totals, components and currency
@@ -197,10 +214,10 @@ and platform smoke checks still apply.
 - **Currency behavior belongs to the shared money layer.** Provider adapters capture
   native facts; shared services own rate integrations, cache, exact conversion and
   provenance. Widgets consume common presentation and formatting instead of choosing
-  provider-specific currencies or fetching rates. USD is the current display policy.
+  provider-specific currencies or fetching rates. USD is the initial display default.
   The user's display currency and personal currency definitions use one user-scoped
-  registry and persisted preference consumed by every monetary widget; future settings
-  forms must use that same contract.
+  registry and persisted preference consumed by every monetary widget; settings
+  forms use that same contract.
   Keep public reference rates separate from private user rates. Preserve original
   amounts and recorded conversion provenance; changing a display preference must not
   rewrite provider history or turn exchange movements into spending. Percentage quotas
@@ -220,6 +237,9 @@ and platform smoke checks still apply.
   a dialog, across its whole width, as its columns run edge to edge. A row of a list or a
   menu in a `Popover` or a `Modal`, inset with rounded corners (`.popover-row`), and a
   little brighter, to show on the glass.
+- Settings sections share their page's surface: `.settings-section` separates them
+  with space and a rule. Reuse `.settings-list` for aligned names, details and actions,
+  and `.button` for visible actions; do not nest decorative panels inside the content.
 - Colours come from the tokens at the top of `hub/ui/style.css`, and the colours of
   series from `hub/ui/lib/providers.ts`. Status colours (ok, warn, crit) are for status
   only: how much of a limit is left, a source or device in trouble, a destructive

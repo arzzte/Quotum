@@ -1,6 +1,7 @@
 import {memo, useCallback, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode, type RefObject} from 'react';
 import type {LiveSession} from '../lib/types';
-import {sourceLabel} from '../lib/quota';
+import {clientName} from '../../server/domain/clients';
+import {agentSourceLabel} from '../lib/agents';
 import {AGENTS, colorOf, columnShown, withColumn, withHidden, type Arrange} from '../lib/view';
 import {
   AGENT_WIDTHS,
@@ -25,13 +26,13 @@ import {
   type AgentsSort,
   type Dimension,
 } from '../lib/agents';
-import {stamp, workHours} from '../lib/format';
-import {useLineup, useSessionsOf, useTitles} from '../lib/board';
+import {recentActivity, stamp, workHours} from '../lib/format';
+import {useLineup, useSessionsOf, useTitles, useOwnSessions} from '../lib/board';
 import {setPrefs, usePrefs} from '../lib/prefs';
 import {hubNow} from '../lib/clock';
 import {t, useLocale, type Key} from '../i18n';
 import {HideRow, Popover, SlidersIcon, SwitchRow} from './Popover';
-import {Since} from './Time';
+import {RecentActivity, Since} from './Time';
 import {Modal} from './Kit';
 import {fillOf, pixels, useSizing} from './sizing';
 
@@ -50,7 +51,7 @@ const stateOf = (session: LiveSession) =>
   t(session.working ? 'agents.working' : session.origin === 'terminal' ? 'agents.idle' : 'agents.window');
 
 /** A cut name in full on hover: the project, and the folder on a line of its own. */
-const placeOf = (session: LiveSession) => [session.project, folderOf(session)].filter(Boolean).join('\n') || undefined;
+const placeOf = (session: LiveSession) => [session.clientId ? clientName(session.clientId) : null, session.project, folderOf(session)].filter(Boolean).join('\n') || undefined;
 
 const TerminalIcon = () => (
   <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true">
@@ -176,7 +177,7 @@ const stillSince = (from: number, className?: string) => <span className={classN
 const projectName = (project: string | null) => project ?? t('agents.noProject');
 
 /** How a row is drawn: laid out unseen to be measured (`still`: nothing that moves on, nothing to press), its marks each in its card's colour. */
-type Context = {still: boolean; color: (source: AgentSource) => CSSProperties};
+type Context = {still: boolean; color: (source: AgentSource | null) => CSSProperties};
 
 /** Credited time is unknown without a reliable producer identity. */
 function WorkTime({ms, labeled = false}: {ms: number | null; labeled?: boolean}) {
@@ -204,9 +205,9 @@ function Tally({group, color}: {group: AgentGroup; color: Context['color']}) {
   );
 }
 
-/** Last observed work: now while any agent works, its time when known, otherwise a dash. */
-function LastActivity({group}: {group: AgentGroup}) {
-  if (group.working) return <>{t('agents.now')}</>;
+/** Last observed work; the unseen sizing copy never subscribes to the page clock. */
+function LastActivity({group, still}: {group: AgentGroup; still: boolean}) {
+  if (group.working) return <>{t('time.now')}</>;
   if (group.lastWorkedAt === null)
     return (
       <span title={t('agents.activityUnknown')}>
@@ -214,12 +215,12 @@ function LastActivity({group}: {group: AgentGroup}) {
         <span className="sr-only">{t('agents.activityUnknown')}</span>
       </span>
     );
-  return <>{stamp(group.lastWorkedAt)}</>;
+  return still ? <span title={stamp(group.lastWorkedAt)}>{recentActivity(group.lastWorkedAt, hubNow())}</span> : <RecentActivity at={group.lastWorkedAt} />;
 }
 
 /** A dimension shown in a row: shared by the group, or belonging to its one agent. */
 const dimensionName = ({rows: [row]}: AgentGroup, column: Dimension) =>
-  column === 'project' ? projectName(row.session.project) : column === 'machine' ? row.session.device.name : sourceLabel(row.source);
+  column === 'project' ? projectName(row.session.project) : column === 'machine' ? row.session.device.name : agentSourceLabel(row.source);
 
 const isDimension = (column: AgentColumn): column is Dimension => (DIMENSIONS as readonly AgentColumn[]).includes(column);
 
@@ -230,7 +231,7 @@ const COLUMNS: Record<AgentColumn, {title: Key; hint?: Key; cell: (group: AgentG
   subscription: {title: 'agents.subscription', cell: group => dimensionName(group, 'subscription')},
   agents: {title: 'agents.agents', cell: (group, {color}) => <Tally group={group} color={color} />},
   worked: {title: 'agents.worked', hint: 'agents.workedHint', cell: group => <WorkTime ms={group.workedMs} />},
-  activity: {title: 'agents.lastActivity', hint: 'agents.lastActivityHint', cell: group => <LastActivity group={group} />},
+  activity: {title: 'agents.lastActivity', hint: 'agents.lastActivityHint', cell: (group, {still}) => <LastActivity group={group} still={still} />},
   running: {title: 'agents.running', cell: (group, {still}) => (still ? stillSince(group.startedAt) : <Since from={group.startedAt} />)},
 };
 
@@ -534,6 +535,7 @@ export const AgentsPanel = memo(function AgentsPanel({arrange}: {arrange: Arrang
   useLocale();
   const lineup = useLineup();
   const sessions = useSessionsOf(lineup);
+  const own = useOwnSessions();
   const titles = useTitles(arrange.view.names);
   const sources = useMemo(
     () => lineup.flatMap((id, i): AgentSource[] => (titles[id] ? [{id, provider: titles[id].provider, title: titles[id].title, sessions: sessions[i]}] : [])),
@@ -552,7 +554,7 @@ export const AgentsPanel = memo(function AgentsPanel({arrange}: {arrange: Arrang
   /** How many of the rows fit a height chosen for the widget, as last measured. */
   const [fit, setFit] = useState<number | null>(null);
   // Only what the board shows: a subscription whose card is hidden is left out here too.
-  const {rows, empty} = agentRows(sources, arrange.view);
+  const {rows, empty} = agentRows(sources, arrange.view, own);
   const working = rows.filter(row => row.session.working).length;
   const groups = groupsOf(rows, agentsBy);
   const view = arrange.view;
@@ -568,7 +570,7 @@ export const AgentsPanel = memo(function AgentsPanel({arrange}: {arrange: Arrang
   const shown = [name, ...columns];
   const active = visibleAgentsSort(agentsSort, shown);
   const ordered = sortedGroups(groups, active, shown);
-  const color = useCallback((source: AgentSource) => ({'--card-color': colorOf(view, source.id, source.provider)}) as CSSProperties, [view]);
+  const color = useCallback((source: AgentSource | null) => ({'--card-color': source ? colorOf(view, source.id, source.provider) : 'var(--other)'}) as CSSProperties, [view]);
   const sortBy = useCallback((from: AgentsSort, column: AgentColumn, cycle = true) => setPrefs({agentsSort: nextAgentsSort(from, column, cycle)}), []);
   const sorting: Sorting = {active, headers: shown.map(id => ({id, title: COLUMNS[id].title})), sortBy: (column, cycle) => sortBy(active, column, cycle)};
   const single = agentsBy === 'none';

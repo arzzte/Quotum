@@ -183,8 +183,9 @@ async function hub(options: Partial<EventsOptions> = {}, clock?: Clock) {
     const response = await app.inject({
       method,
       url,
-      payload: options.body,
+      payload: method==='POST'&&url.endsWith('/view')&&options.body&&typeof options.body==='object'?{version:2,...options.body}:options.body,
       headers: {
+        ...(method==='POST'&&url.endsWith('/view')?{'X-Quotum-View-Version':'2','If-Match':'"'+directory.viewRevision(url.split('/')[3])+'"'}:{}),
         ...(options.as && cookies.get(options.as) ? {cookie: cookies.get(options.as)!} : {}),
         ...(options.token ? {authorization: `Bearer ${options.token}`} : {}),
         ...options.headers,
@@ -303,6 +304,20 @@ test('private credential failures and metadata never reach shared overview, SSE,
   }
 });
 
+test('private connection discovery reaches every window of its owner, without reaching another member', async t => {
+  const h=await hub();t.after(()=>h.app.close());
+  const personal=await h.person('alice'),team=(await h.call('POST','/api/boards',{as:'alice',body:{name:'Team'}})).body.id;
+  await h.person('bob',await h.invite('alice',team));
+  const one=await reading(h,'alice',personal),two=await reading(h,'alice',team),other=await reading(h,'bob',team);
+  t.after(()=>{one.close();two.close();other.close();});
+  await h.token('alice');
+  const frames=await Promise.all([one.within(),two.within(),other.within()]);
+  assert.equal(frames[0].filter(frame=>frame.type==='connections').length,1);
+  assert.equal(frames[1].filter(frame=>frame.type==='connections').length,1);
+  assert.equal(frames[2].filter(frame=>frame.type==='connections').length,0);
+  assert.deepEqual(Object.keys(frames[0].find(frame=>frame.type==='connections')!.data),['revision']);
+});
+
 test('a height the owner chose reaches every reader: in the view event of one already reading, in the snapshot of one who comes later', async t => {
   const h = await hub();
   t.after(() => (letGo(), h.app.close()));
@@ -313,7 +328,7 @@ test('a height the owner chose reaches every reader: in the view event of one al
   t.after(bob.close);
   const layout = {columns: 6, places: {history: {x: 0, y: 0, w: 6, h: 12}, agents: {x: 0, y: 12, w: 3}}};
   const saved = await h.call('POST', `/api/boards/${team}/view`, {as: 'alice', body: {layout}});
-  assert.deepEqual(saved.body.layout, layout);
+  assert.deepEqual(saved.body.view.layout, layout);
   const told = (await bob.within()).filter(e => e.type === 'view');
   assert.deepEqual(told.map(e => e.data.view.layout), [layout]);
   const later = await reading(h, 'bob', team);
@@ -381,13 +396,13 @@ test("the board's own events and each reader's own go apart: its owner and a mem
   // Whose agents' work the board shows changed with it: all of its history reads otherwise.
   assert.deepEqual(
     ofAlice.map(e => e.type),
-    ['card', 'sessions', 'cadence', 'refresh', 'forecast', 'lineup', 'mine', 'history'],
+    ['view', 'card', 'sessions', 'cadence', 'refresh', 'forecast', 'lineup', 'mine', 'history'],
   );
   assert.deepEqual(ofAlice.at(-2)!.data, {sources: [source]});
-  assert.deepEqual(ofAlice.at(-1)!.data, {sources: [source], since: 0});
+  assert.deepEqual(ofAlice.at(-1)!.data, {sources: [source], since: 0, changes: [{source,scope:'quota',since:0}]});
   assert.deepEqual(
     ofBob.map(e => e.type),
-    ['card', 'sessions', 'cadence', 'refresh', 'forecast', 'lineup', 'history'],
+    ['view', 'card', 'sessions', 'cadence', 'refresh', 'forecast', 'lineup', 'history'],
     "not Bob's: no mine for him",
   );
   for (const event of ofBob) assert.ok(!JSON.stringify(event.data).includes('"role"'), 'no role in what the board tells everyone');
@@ -489,9 +504,13 @@ test('what changes with time alone goes out when it does, with nothing told to t
     h.clock.now(),
   );
   h.clock.advance(200);
-  assert.equal((await s.next()).data.sessions.length, 1);
+  const started = await s.within(300);
+  assert.equal(started.find(event => event.type === 'sessions')?.data.sessions.length, 1);
+  assert.deepEqual(started.find(event => event.type === 'devices')?.data, {});
   h.clock.advance(5 * MIN + S);
-  assert.deepEqual((await s.next()).data.sessions, []);
+  const expired = await s.within(300);
+  assert.deepEqual(expired.find(event => event.type === 'sessions')?.data.sessions, []);
+  assert.deepEqual(expired.find(event => event.type === 'devices')?.data, {});
 
   // A holder following the pace: its plan shows while it asks, and goes when it falls silent.
   h.ingest.checkin(h.credential, {...h.agent, paced: true, subscriptions: [{provider: 'codex', account: ACCOUNT, active: false}]}, h.clock.now());
@@ -1100,12 +1119,12 @@ test('every change a reader sees is told: what each request touches reaches the 
     [
       'a list of agents',
       () => h.call('POST', '/v1/sessions', {token: secret, body: {...agent, sentAt: iso(Date.now()), sessions: [session]}}),
-      ['sessions'],
-      ['sessions'],
+      ['sessions', 'devices'],
+      ['sessions', 'devices'],
       [],
     ],
-    ['a project renamed', () => h.call('POST', '/api/projects', {as: 'alice', body: {groups: ['quotum'], name: 'Quotum'}}), ['sessions'], ['sessions'], []],
-    ['a project given its name back', () => h.call('POST', '/api/projects/restore', {as: 'alice', body: {reported: ['quotum']}}), ['sessions'], ['sessions'], []],
+    ['a project renamed', () => h.call('POST', '/api/projects', {as: 'alice', body: {groups: ['quotum'], name: 'Quotum'}}), ['sessions', 'devices', 'history'], ['sessions', 'devices'], []],
+    ['a project given its name back', () => h.call('POST', '/api/projects/restore', {as: 'alice', body: {reported: ['quotum']}}), ['sessions', 'devices', 'history'], ['sessions', 'devices'], []],
     ['a view saved', () => h.call('POST', `/api/boards/${team}/view`, {as: 'alice', body: {layout: {columns: 6, places: {history: {x: 0, y: 0, w: 6}}}}}), [], ['view'], []],
     ['a height chosen', () => h.call('POST', `/api/boards/${team}/view`, {as: 'alice', body: {layout: {columns: 6, places: {history: {x: 0, y: 0, w: 6, h: 9}}}}}), [], ['view'], []],
     ['the height given back to the content', () => h.call('POST', `/api/boards/${team}/view`, {as: 'alice', body: {layout: {columns: 6, places: {history: {x: 0, y: 0, w: 6}}}}}), [], ['view'], []],
@@ -1113,8 +1132,8 @@ test('every change a reader sees is told: what each request touches reaches the 
     ['a board made', () => h.call('POST', '/api/boards', {as: 'alice', body: {name: 'Solo'}}), ['boards'], ['boards'], []],
     ['a name changed', () => h.call('POST', '/api/account', {as: 'alice', body: {name: 'Alicia'}}), ['card'], ['card'], []],
     ['a source taken off', () => h.call('DELETE', `/api/boards/${team}/shares/${source}`, {as: 'alice'}), [], ['lineup', 'mine'], []],
-    ['a device renamed', () => h.call('POST', `/api/devices/${devices[0].id}`, {as: 'alice', body: {name: 'Book'}}), [], [], []],
-    ['a device disconnected', () => h.call('DELETE', `/api/devices/${devices[0].id}`, {as: 'alice'}), ['lineup', 'mine'], [], []],
+    ['a device renamed', () => h.call('POST', `/api/devices/${devices[0].id}`, {as: 'alice', body: {name: 'Book'}}), ['sessions', 'connections', 'devices'], ['connections', 'devices'], []],
+    ['a device disconnected', () => h.call('DELETE', `/api/devices/${devices[0].id}`, {as: 'alice'}), ['lineup', 'mine', 'connections', 'devices', 'history'], ['connections', 'devices'], []],
   ];
   for (const [what, act, onOwn, onShared, onBobs] of rows) {
     const done = await act();
@@ -1140,7 +1159,7 @@ test('all of a board’s history is news when whose agents’ work it shows, or 
   const laptop = (await h.call('GET', '/api/devices', {as: 'alice'})).body[0].id;
   const s = await reading(h, 'alice', board);
   t.after(s.close);
-  const all = {sources: [source], since: 0};
+  const all = {sources: [source], since: 0, ownSince: 0, changes: [{source,scope:'quota',since:0}]};
   const history = async () => (await s.within()).filter(e => e.type === 'history').map(e => e.data);
 
   await h.call('POST', `/api/boards/${board}/view`, {as: 'alice', body: {layout: {columns: 6, places: {}}, hidden: [`source:${source}`]}});
@@ -1204,13 +1223,13 @@ test('what each change of data touches reaches the boards it shows on: people jo
       'a subscription measured for the first time',
       () => h.measure(desk, Date.now() - MIN, {account: 'c0c0c0c0c0c0c0c0c0c0c0c0', device: 'box'}),
       // Sent whole as it comes; the page reads its history for the new lineup, all of it.
-      ['card', 'sessions', 'cadence', 'refresh', 'forecast', 'lineup', 'mine', 'history'],
-      [],
+      ['card', 'sessions', 'cadence', 'refresh', 'forecast', 'lineup', 'mine', 'connections', 'history'],
+      ['connections'],
       [],
     ],
-    ['the machine that told of agents is disconnected', () => h.call('DELETE', `/api/devices/${laptop}`, {as: 'alice'}), ['sessions', 'refresh'], [], []],
-    ['a machine tells of its agents', () => agents('desk', [session]), ['sessions'], [], []],
-    ['and then of none', () => agents('desk', []), ['sessions'], [], []],
+    ['the machine that told of agents is disconnected', () => h.call('DELETE', `/api/devices/${laptop}`, {as: 'alice'}), ['sessions', 'refresh', 'connections', 'devices'], ['connections', 'devices'], []],
+    ['a machine tells of its agents', () => agents('desk', [session]), ['sessions', 'devices'], ['devices'], []],
+    ['and then of none', () => agents('desk', []), ['sessions', 'devices'], ['devices'], []],
     ['the trackers asked', () => h.resets.round(), ['resets'], ['resets'], ['resets']],
   ];
   for (const [what, act, onOwn, onShared, onCarols] of rows) {
@@ -1261,4 +1280,21 @@ test('refresh deadlines and terminal expiry reach both boards without polling', 
   assert.deepEqual([ended.request.status, ended.unavailable], ['no_result', 'silent']);
   h.clock.advance(start + 7 * MIN + 200 - h.clock.now());
   assert.equal((await states()).request, null);
+});
+
+test('history coalesces each resource scope independently and keeps monetary news beside a work refresh',async t=>{
+  const clock=new ManualClock(Date.now()),h=await hub({},clock);t.after(()=>{letGo();return h.app.close();});
+  const board=await h.person('alice'),secret=await h.token('alice');await h.measure(secret,clock.now()-MIN);
+  const source=h.store.sources(board)[0].id,s=await reading(h,'alice',board);t.after(s.close);
+  h.events.history(source,clock.now()-MIN,['budget']);h.events.history(source,clock.now()-2*MIN,['quota']);
+  h.events.history(source,clock.now()-MIN/2,['budget']);h.events.history('inaccessible',0,['budget']);
+  clock.advance(config.events.smoothMs);
+  const packet=(await s.within()).find(event=>event.type==='history')!.data;
+  assert.deepEqual(packet.sources,[source]);assert.equal(packet.since,clock.now()-config.events.smoothMs-2*MIN);
+  assert.deepEqual(packet.changes,[{source,scope:'budget',since:clock.now()-config.events.smoothMs-MIN},{source,scope:'quota',since:clock.now()-config.events.smoothMs-2*MIN}]);
+  const since=clock.now()-MIN;h.events.history(source,since,['budget']);
+  const view=h.directory.view(board);h.directory.saveView(board,{...view,hidden:[...view.hidden,'source:'+source]},h.directory.credentials('alice@example.com')!.user.id,clock.now());
+  clock.advance(config.events.smoothMs);
+  const combined=(await s.within()).find(event=>event.type==='history')!.data;
+  assert.deepEqual(combined.changes,[{source,scope:'budget',since},{source,scope:'quota',since:0}]);
 });

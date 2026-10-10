@@ -17,12 +17,16 @@ measures this machine once.
 
 After building the hub, `npm run bench -- --ci` in `hub/` checks dashboard costs in
 Chrome (`QUOTUM_CHROME`, one on `PATH`, or `--cdp http://host:port`). It includes native
-wheel and Shift-drag on both charts at 24h and 30d, with at least twelve real series and
+wheel and Shift-drag starting from the quota, budget and subscription-funds charts at
+24h and 30d, moving all four charts with at least twelve real series per resource family and
 CPU throttled fourfold. The scenario covers delayed history, strip rebuilding, reversal
 and returning to live. Moving-frame intervals must stay within 34 ms at p95 and 50 ms
 at p99; input to an actually updated chart frame must stay within 34 ms at p95. Empty
 callbacks and missing samples fail. The previous idle, measurement, work and native
-frequency-focus checks retain their budgets. No browser means the check was not run.
+frequency-focus checks retain their budgets. Mixed Codex subscriptions also exercise
+changed credit balances and unchanged-value heartbeats: each updates its own card and
+funds history without waking quota or wallet analytics. No browser means the check
+was not run.
 The owned headless browser uses one raster worker: concurrent software raster jobs
 in Chrome 154 can leave a tile unfinished and deadlock an input frame's commit.
 An attached CDP browser retains its own launch settings.
@@ -206,13 +210,23 @@ the monetary cases on Ana's personal board: balance and caps, large key inventor
 revoked and expired access, a history gap, negative balance, zero cap and an unknown
 provider. `DEV_SET=quotas DEV_STILL=true make dev` shows personal z.ai subscription
 quotas in credits, unknown resets, exhausted and closed allowances, partial and
-unsupported readings, and private access failures. The other catalogue cards remain available in the widget menu.
+unsupported readings, and private access failures. The other catalogue cards remain
+available through Add widget.
+`DEV_SET=analytics DEV_STILL=true make dev` shows native quotas, z.ai, OpenRouter and DeepSeek with the quota and budget analytics and the separate subscription-funds chart.
+`DEV_SET=onboarding DEV_STILL=true make dev` exercises board and account onboarding.
+Ana owns *Studio* and *New board*; Boris is a member of both. OpenRouter starts
+unconnected. Add widget offers synthetic keys for successful, partial and failed
+answers, a lost-reply control, and an explicit subset from a synthetic device report.
+Services, encrypted storage, receipts and board events use production code; only
+external answers and device reports are synthetic. No real provider or client is
+contacted. Use `make info` for the actual address and synthetic sign-in.
+
 `DEV_MODE=hub make dev` starts an ordinary hub on
 isolated persistent data with reset trackers disabled. No mode starts coding clients.
-To connect trusted sources in hub mode, set `QUOTUM_SECRET_KEY_FILE` in `.env` to a
-private file containing the encryption key described in the README. Relative paths
-start at the checkout root. Keep it outside `hub-data` and version control; only its
-path enters the stand's configuration. Demo, builds and component checks do not inherit
+Hub mode provisions its persistent key automatically in the private `hub-keys`
+directory outside `hub-data`. Explicit `QUOTUM_SECRET_KEY_FILE` overrides remain
+supported; relative paths start at the checkout root and must stay outside data and
+version control. Demo, builds and component checks do not inherit
 it. After changing a key file's contents, restart with `make down` and `make dev`.
 Changing mode restarts the owned stand. Demo data goes away on stop; hub data stays in
 `.quotum-dev/hub-data` until the tree is removed. Managed state, build stamps and logs
@@ -354,13 +368,16 @@ one already running. CI runs it on every push; run it when you change the dashbo
 and have Chrome.
 
 The completed measurement phase's React/DOM observer is disconnected before native
-panning. Panning keeps its own movement and mutation checks; resetting the measurement
+panning. Native wheel and Shift-drag start separately from the subscription limit, budget and subscription-funds
+charts at both periods. Each input owner starts with fresh readers, captures its own
+events and must move all four plots within the same budgets.
+Panning keeps its own movement and mutation checks; resetting the measurement
 probe resumes full observation for money updates. Money-view controls wait for a
 populated, committed drawing and stable layout before switching, then require the
 line to remain present and inside its scale on every frame until the new view commits.
 
 The same run checks pan traffic separately from the native frame budget, using the
-dense 75-day fixture and both charts at 24h and 30d. Controlled production-loader
+dense 75-day fixture and all four charts at 24h and 30d. Controlled production-loader
 replays and native browser gestures use 0, 100 and 400 ms answer delays. Cached
 return and repeat must start no history GETs; half-width movements allow at most
 seven attempts from the history chart and five from activity, and a 4% movement

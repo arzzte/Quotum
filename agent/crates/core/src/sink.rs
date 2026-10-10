@@ -14,7 +14,7 @@ use ureq::{Body, ResponseExt};
 use crate::config::Hub;
 use crate::model::{
     Batch, ErrorKind, Failure, INGEST_VERSION, Machine, Millis, Outcome, Provider, RunningSession, STALE_LIMIT_MS,
-    Snapshot, now_ms, parse_time, ts,
+    SessionReport, Snapshot, now_ms, parse_time, ts,
 };
 
 /// One subscription this device could measure now, as a check-in asks about it.
@@ -68,6 +68,10 @@ pub trait Sink {
     /// Tells the hub which coding agents run on this machine now (all of them); whether it took the list.
     fn sessions(&mut self, _sessions: &[RunningSession]) -> bool {
         false
+    }
+
+    fn report(&mut self, report: &SessionReport) -> bool {
+        self.sessions(&report.sessions)
     }
 
     /// Why the hub will never take anything from this device again, once it said so.
@@ -357,7 +361,11 @@ impl HubSink {
                     size = (size * 2).min(CHUNK);
                 }
                 Err(Trouble::Rejected(_)) if count > 1 => size = count / 2,
-                Err(Trouble::Rejected(reason)) => {
+                Err(Trouble::Rejected(mut reason)) => {
+                    if matches!(chunk.first(), Some(Item::Snapshot(s)) if s.provider == Provider::Codex && s.windows.is_empty() && s.resource_status.is_some())
+                    {
+                        reason.push_str("; this Codex resource observation needs a hub with credit-balance support");
+                    }
                     self.spool.pop_front();
                     dropped = Some((dropped.map_or(0, |(n, _)| n) + 1, reason));
                 }
@@ -489,6 +497,10 @@ impl Sink for HubSink {
     /// agent: its own `not_found`, not a proxy's 404) is asked again in an hour, when it
     /// may have been upgraded.
     fn sessions(&mut self, sessions: &[RunningSession]) -> bool {
+        Sink::report(self, &SessionReport { sessions: sessions.to_vec(), ..SessionReport::default() })
+    }
+
+    fn report(&mut self, report: &SessionReport) -> bool {
         if !self.takes_sessions() || self.sessions_retry_at.is_some_and(|at| Instant::now() < at) {
             return false;
         }
@@ -497,7 +509,13 @@ impl Sink for HubSink {
             "agent": AGENT,
             "machine": self.machine,
             "sentAt": ts::format(now_ms()),
-            "sessions": sessions,
+            "sessions": report.sessions.iter().map(|s| {
+                let mut value = serde_json::to_value(s).expect("session serialization");
+                value["clientId"] = serde_json::json!(crate::clients::ClientId::from(s.provider));
+                value
+            }).collect::<Vec<_>>(),
+            "clientSessions": report.client_sessions,
+            "clients": report.clients,
         });
         let url = format!("{}/v1/sessions", self.base);
         let answer = self
@@ -511,6 +529,10 @@ impl Sink for HubSink {
         let (status, older) = match answer {
             Ok(mut response) => {
                 let status = response.status().as_u16();
+                let refusal = if status == 403 { trouble(&mut response) } else { None };
+                if let Some(Trouble::Refused(reason)) = refusal {
+                    self.refused = Some(reason);
+                }
                 let older = status == 404
                     && not_the_hub(&response).is_none()
                     && response.body_mut().read_json::<Value>().is_ok_and(|body| body["error"] == "not_found");
@@ -568,7 +590,7 @@ fn read_directive(directive: &Value, now: Millis) -> Directive {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpListener;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -648,6 +670,33 @@ mod tests {
         let sink =
             HubSink::new(&hub, machine, spool, Box::new(move |line: &str| log.lock().unwrap().push(line.into())));
         (sink, lines)
+    }
+
+    pub(crate) fn legacy_sessions(value: &Value) -> Value {
+        let mut sessions = value.clone();
+        for item in sessions.as_array_mut().unwrap() {
+            item.as_object_mut().unwrap().remove("clientId");
+            item.as_object_mut().unwrap().remove("route");
+        }
+        sessions
+    }
+
+    pub(crate) fn capture_report(report: &SessionReport) -> Value {
+        let (url, seen) = hub(|_, _| json(200, json!({"accepted": 3})));
+        let (mut sender, _) = sink(&url, "client-report");
+        assert!(Sink::report(&mut sender, report));
+        let (path, body) = seen.lock().unwrap()[0].clone();
+        assert_eq!(path, "/v1/sessions");
+        body
+    }
+
+    pub(crate) fn capture_sessions(sessions: &[RunningSession]) -> Value {
+        let (url, seen) = hub(|_, _| json(200, json!({"accepted": 3})));
+        let (mut sender, _) = sink(&url, "shared-runtime-attribution");
+        assert!(sender.sessions(sessions));
+        let (path, body) = seen.lock().unwrap()[0].clone();
+        assert_eq!(path, "/v1/sessions");
+        body
     }
 
     #[test]
@@ -842,6 +891,29 @@ mod tests {
     }
 
     #[test]
+    fn rich_credit_observations_survive_the_disk_spool_and_name_an_old_hub_rejection() {
+        let (url, seen) = hub(|_, _| json(400, json!({"error":"invalid_batch","detail":"snapshots.0.windows"})));
+        let (mut sink, log) = sink(&url, "codex-credits");
+        let snapshot: crate::model::Snapshot = serde_json::from_value(json!({
+            "provider":"codex", "account":"aaaaaaaaaaaaaaaaaaaaaaaa", "plan":"pro",
+            "observedAt":"2026-10-01T00:00:00Z", "via":"codex/app-server", "staleAfterMs":60000,
+            "windows":[], "resourceStatus":{"windows":"missing","resets":"missing"},
+            "balances":[{"id":"balance:credits","unit":"credits:codex","status":"finite","amount":"1234.5678912","hasCredits":false}]
+        })).unwrap();
+        sink.spool.push_back(Item::Snapshot(snapshot));
+        sink.save_spool();
+        let text = fs::read_to_string(&sink.spool_file).unwrap();
+        sink.spool = text.lines().map(|line| serde_json::from_str::<Item>(line).unwrap()).collect();
+        sink.send(true);
+        assert!(sink.spool.is_empty());
+        assert_eq!(seen.lock().unwrap()[0].1["snapshots"][0]["balances"][0]["amount"], "1234.5678912");
+        let message = log.lock().unwrap().join("\n");
+        assert!(message.contains("needs a hub with credit-balance support"));
+        assert!(!message.contains("1234.5678912"));
+        let _ = fs::remove_file(&sink.spool_file);
+    }
+
+    #[test]
     fn a_refused_batch_is_split_so_one_bad_measurement_does_not_take_the_rest_along() {
         let bad = |body: &Value| body["failures"].as_array().into_iter().flatten().any(|f| f["detail"] == "bad");
         let (url, seen) = hub(move |_, body| {
@@ -957,7 +1029,7 @@ mod tests {
         let (path, body) = seen.lock().unwrap()[0].clone();
         assert_eq!(path, "/v1/sessions");
         assert_eq!(
-            body["sessions"],
+            legacy_sessions(&body["sessions"]),
             json!([
                 {"provider": "codex", "account": "4b7e0c1d2e3f4a5b6c7d8e9f", "origin": "terminal", "project": "quotum", "folder": "quotum.feat-18-desktop-app", "startedAt": "2026-09-21T14:13:20Z", "working": true},
                 {"provider": "codex", "account": "4b7e0c1d2e3f4a5b6c7d8e9f", "origin": "terminal", "startedAt": "2026-09-21T14:13:20Z", "working": false}
@@ -1010,6 +1082,29 @@ mod tests {
         assert!(!proxied.sessions(&[]));
         assert!(proxied.takes_sessions());
         assert!(proxied.sessions_retry_at.is_some());
+    }
+
+    #[test]
+    fn sessions_alone_stop_a_removed_or_conflicting_device_and_retry_other_failures() {
+        for code in ["device_revoked", "device_conflict", "forbidden"] {
+            let (url, seen) = hub(move |_, _| json(403, json!({"error": code})));
+            let (mut sender, _) = sink(&url, &format!("session-{code}"));
+            assert!(!Sink::report(&mut sender, &SessionReport::default()));
+            assert_eq!(sender.refused().is_some(), code != "forbidden", "{code}");
+            if code != "forbidden" {
+                assert!(!sender.takes_sessions());
+                assert!(!Sink::report(&mut sender, &SessionReport::default()));
+                assert_eq!(seen.lock().unwrap().len(), 1, "permanent refusal sends nothing further");
+            } else {
+                assert!(sender.takes_sessions());
+                assert!(sender.sessions_retry_at.is_some());
+            }
+        }
+        let (url, _) = hub(|_, _| (403, "content-type: text/html\r\n", "<html>proxy login</html>".into()));
+        let (mut sender, _) = sink(&url, "session-proxy-refusal");
+        assert!(!Sink::report(&mut sender, &SessionReport::default()));
+        assert!(sender.refused().is_none());
+        assert!(sender.sessions_retry_at.is_some());
     }
 
     #[test]

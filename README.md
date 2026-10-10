@@ -22,7 +22,7 @@ or account to set up. For several machines or a team, run the hub and agent belo
 
 ```sh
 # The hub; `docker logs quotum` shows the setup code of the first account
-docker run -d --name quotum -p 8080:8080 -v quotum:/data ghcr.io/padurets/quotum-hub
+docker run -d --name quotum -p 8080:8080 -v quotum:/data -v quotum-keys:/keys ghcr.io/padurets/quotum-hub
 
 # On every machine: confirm the code in the browser, then keep measuring in the background
 npx quotum connect http://<the hub>:8080
@@ -107,18 +107,32 @@ Codex         api                  idle     started 25m ago · editor
   in the panel. Credit belongs to the current subscription and is unknown without a
   reliable session ID; a dash keeps that distinct from known zero. Terminals, editors
   and the Codex app alike.
+- **Purchased Codex credits.** Additional funds appear in the subscription's footer,
+  beside free resets, with the same compact amount and disclosure in the compact view.
+  The initial estimate is 0.04 USD per credit; Currencies lets you set a personal
+  USD-per-credit rate or restore the default. Hover over the amount for the exact
+  native balance; open it for the rate and measurement time.
+  **Subscription extra funds trends** shows balance history in its own widget, with its own
+  subscription selection. It also appears in the board's **+** menu. Wallet budgets
+  keep their separate chart and table.
+  Shared boards require separate permission to show funds and subsequent history.
+  Credit changes do not imply spending or top-ups.
 - **Free resets.** When a provider grants resets of the limits (Codex does now and
   then), the card shows how many you have and until when.
 - **A weekly spending plan.** By default you spend 30 / 25 / 15 / 15 / 10 / 5% on the
   six days after the reset and nothing on the seventh. Each subscription can have its
   own plan: a day at 0 is a day you don't spend, and it can be any day of the week.
+- **Separate subscription limit and budget charts and metrics**, each movable, resizable and
+  hideable. They share one time interval with agent activity; weekly/session switches
+  affect only subscription limits. Budget history opens with balances, with spending in its settings.
 - **A chart of the weekly or the 5-hour windows** over the last hour up to the last 30
   days. Ahead of now it draws the plan, where each window is going (a weekly one nearly
   flat over the hours its subscription usually spends nothing) and the next resets, as
   far as you choose; behind, it marks when limits came back early and when free resets
   were granted. Drag across it to zoom into a burst of work (on a phone, hold a finger
   on it first). ‹ and › move it by half its length; a horizontal touchpad swipe,
-  Shift with the wheel, or Shift-drag moves both charts continuously through time.
+  Shift with the wheel, or Shift-drag moves the activity, limit, budget and subscription-funds
+  charts together continuously through time.
   The open page keeps the history it has read and fetches only missing
   or changed parts as measurements and agent work arrive.
 - **A table with two forecasts:** what the period spent, each subscription's active time
@@ -163,7 +177,9 @@ Codex         api                  idle     started 25m ago · editor
   it; a board's owner alone cannot. A device's own interval remains its minimum and
   can make measurements less frequent. Refresh and error pauses still apply.
 - **Fresh limits on demand.** Choose **Refresh data** in a card's menu, or **Refresh all
-  data** in the header for every visible card on the board. A circular loader by the
+  data** in the header's **Board controls** menu for every visible card on the board. Opening
+  the menu shows the last measurement and errors; refreshing needs an explicit click.
+  A circular loader by the
   logo shows that the card is waiting for fresh numbers. Refresh respects the device's
   interval and error pauses, and accepts one new request per minute per subscription.
   Every reader of a shared card can use it.
@@ -191,7 +207,8 @@ day, not a script thrown together over a weekend. In practice that meant:
   down to once every 15 minutes. The machine on duty asks the hub every 15 seconds, which
   starts nothing.
 - **Client credentials stay where they are.** The agent never reads, stores or sends provider
-  tokens or cookies. What leaves the machine: percentages and reset times, plan names,
+  tokens or cookies. What leaves the machine: percentages and reset times, reported
+  Codex credit balances and resource availability, plan names,
   a one-way hash of each account id (so the hub can tell two machines share one
   account), the machine's name and random id, the short message of a client that
   failed, and which coding agents run on the machine: working or idle, since when, and
@@ -212,11 +229,12 @@ day, not a script thrown together over a weekend. In practice that meant:
   consumption. The agent says when its next measurement is due, so a sparse series isn't
   mistaken for a gap.
 - **Few moving parts.** The agent has nine direct dependencies. The hub is Fastify and
-  the SQLite built into Node, and the UI is plain React with about 199 KB of gzipped
+  the SQLite built into Node, and the UI is plain React with about 244 KB of gzipped
   JavaScript. There is no telemetry. The hub reads the two reset trackers (or the
   mirror you name) every ten minutes; `QUOTUM_RESETS=off` turns that off. When you
-  connect OpenRouter, it also reads that account's balance and key limits through
-  fixed HTTPS requests using the management key you supplied.
+  connect OpenRouter, DeepSeek or z.ai, it also reads their balances or quotas through
+  fixed HTTPS requests using the dedicated keys you supplied. Currency conversion uses
+  public reference rates; your private balances and personal rates are not sent to the rate service.
 - **Written down and tested.** The protocol between the agent and the hub is a spec
   ([spec/ingest-v1.md](spec/ingest-v1.md)). Tests cover the spending rules,
   resets, duty, scheduling, permissions, sharing, device pairing, the clients' answers and the
@@ -240,7 +258,7 @@ are still ahead ([roadmap](#roadmap)).
 **1. Start the hub.**
 
 ```sh
-docker run -d --name quotum --restart unless-stopped -p 8080:8080 -v quotum:/data ghcr.io/padurets/quotum-hub
+docker run -d --name quotum --restart unless-stopped -p 8080:8080 -v quotum:/data -v quotum-keys:/keys ghcr.io/padurets/quotum-hub
 docker logs quotum            # shows the setup code for the first account
 ```
 
@@ -283,7 +301,7 @@ have your system start `quotum run`, the same in the foreground (a systemd user
 service, launchd, Windows autostart). With npx, put `npx` before every command.
 
 **Many machines at once** (images, VMs, containers): create a machine token in the
-dashboard (*My connections → Connect → Device*) and start every machine with it. Each one joins as
+dashboard (*Settings → Devices → Device tokens*) and start every machine with it. Each one joins as
 yours by itself:
 
 ```sh
@@ -299,11 +317,12 @@ QUOTUM_HUB_URL=https://quotum.example.com QUOTUM_HUB_TOKEN=qt_m_… quotum start
 ```
 
 A machine token is one person's: every teammate creates their own. Machines are named
-in *My connections*, so an image doesn't need a name per copy.
+in *Settings → Devices*, so an image doesn't need a name per copy.
 
-**Sharing with a team.** Create a shared board, invite people with a link, and share
-your subscriptions with it (*People and subscriptions → Subscriptions*). You can take
-yours off again at any time; the board's owner can take any card off their board.
+**Sharing with a team.** Create a shared board and invite people with a link from
+*Board controls → Members*. Share your subscriptions through the board's *Add widget*
+menu. In *Board settings → Provided data*, you can take yours off again at any time;
+the board's owner can take any shared source off their board.
 
 **By hand:** every [release](https://github.com/padurets/quotum/releases) has the agent
 for Linux, macOS and Windows as an archive (`quotum-cli-<version>-<platform>`, with the
@@ -326,10 +345,13 @@ Key expiry is unknown and saving it requires an explicit acknowledgement. Server
 desktop modes use the same encrypted credential protection described in [SECURITY.md](SECURITY.md).
 
 The card and compact panel use the same budget layout as OpenRouter: one
-**Available balance** in USD, followed by any supported limits. DeepSeek has no limit
-scales. USD is the initial shared display policy. The currency registry supports owner-scoped
-personal units and a persisted reader preference through the API; the settings form is
-not yet exposed. Reported reference currency takes precedence. When only CNY is reported,
+**Available balance** in your display currency, followed by any supported limits. DeepSeek has no limit
+scales. USD is the initial display currency. **Settings → Currencies** lets you choose a
+standard currency or create a personal unit with your own rates. Your choice applies to
+monetary cards, the compact panel, tables and charts on every board, independently of
+other readers. Edit names and precision, add dated rate versions, or archive and restore
+a currency. Archiving the selected currency requires a replacement. Saved estimates
+keep their original rate; unavailable conversion is distinct from zero. Reported reference currency takes precedence. When only CNY is reported,
 the shared hub currency service uses
 the [ECB daily reference rates](https://www.ecb.europa.eu/stats/policy_and_exchange_rates/euro_reference_exchange_rates/html/index.en.html)
 to record a separate USD estimate, marked **≈**. Click the balance amount for its
@@ -338,8 +360,8 @@ and rate date. Native observations are saved before a rate read; the shared, per
 rate cache contains no credentials or account information. Historical estimates keep
 their original rate. Without a usable rate, CNY is retained and USD stays unknown or stale.
 All original balances, estimates, rate provenance, funds status and safe provider
-context are retained within the history retention period. Choose **USD** in analytics;
-connecting an account keeps your existing subscription view. Totals are selected by
+context are retained within the history retention period. Budget history and its table
+appear beside subscription analytics. Totals are selected by
 default; components can be added in the chart's settings. The total is not added to its
 components. Reported USD and converted CNY are never summed. Spending and top-up events
 are **unavailable** because the endpoint has no spending counter; a balance change
@@ -351,13 +373,25 @@ Only holders may refresh the source.
 
 ## Connecting OpenRouter
 
-Open **My connections**, choose **Connect**, then **OpenRouter**.
+On the chosen board, open **Add widget** (+) in the header, then **Connect** → **OpenRouter**.
 Create a dedicated OpenRouter management key in
-[OpenRouter key settings](https://openrouter.ai/settings/keys), give it an expiry and
-paste it into the password field. A key without expiry needs an explicit confirmation.
+[OpenRouter management-key settings](https://openrouter.ai/settings/management-keys)
+and paste it into the password field. **Connect and add** verifies it, saves your access
+and shows its balance on that board in one action. Keys without expiry are supported
+without a second confirmation. On a shared board, the form explains which data its
+members will see before you submit.
 The key can create, edit and delete provider API keys; Quotum uses only fixed read
-operations. A server hub needs its separate encryption key configured, and its operator
+operations. A new server creates its encryption key in separate persistent storage, and its operator
 can decrypt saved access. See [SECURITY.md](SECURITY.md) for the protection and limits.
+
+The avatar opens full settings pages for your profile, connections, devices, projects
+and interface. The Quotum logo returns to the selected board and its time range.
+Board settings belong to the selected board. Add lists only absent or
+hidden widgets you may add; the lock switches between free arrangement and a locked
+layout. Connecting from **Settings → My connections** keeps access personal until you
+explicitly choose a board. Existing access is reused; replacing its key is a separate
+action. **Recent additions and recovery** finds saved results after a lost response or
+reload, without duplicating access or restoring a later hidden or removed card.
 
 The original plan label stays beside the title; a small second line identifies the
 resource as **Subscription** or **Budget**. The budget card shows only current state:
@@ -369,8 +403,8 @@ Settings show at most ten keys per page. Access turns amber seven days before ex
 expired, revoked or forbidden access is red. Working keys without expiry have no expiry
 mark. Temporary read failures are amber.
 The chart's own settings select
-key usage and remaining limits for analytics. Choose **USD** in the
-shared analytics controls for the money chart and table. Account balances are selected
+key usage and remaining limits for the independent budget chart and table.
+Account balances are selected
 by default; at most 32 logical series are drawn, with visible overflow. The chart uses
 one unit per axis and keeps the same time range and gestures as subscription history.
 Wallet balances have no percentage; only positive key limits do.
@@ -380,7 +414,7 @@ Before the first baseline, history is unknown. Partial history and spending obse
 after a gap retain their uncertainty and original interval. Key names and monetary
 measurements are shared with board members, while saved access details stay private.
 Only holders can refresh a hub-measured source. Replace or remove your saved access in
-the same panel; removing it does not revoke the provider key. Revoked or expired access
+**Settings → My connections**; removing it does not revoke the provider key. Revoked or expired access
 preserves the last measurements. The compact panel displays money too; tray minimums
 and quota notifications continue to use percentage windows only.
 
@@ -471,6 +505,14 @@ on a server hub, configure its separate encryption key as described in
 [deploy/README.md](deploy/README.md); back it up separately from the data directory.
 The desktop app manages its encryption key as described in [SECURITY.md](SECURITY.md).
 
+Upgrading from 0.6 preserves measurements, agent-work history, boards, settings and
+encrypted connections. Existing analytics widgets become separate limit and budget
+widgets with their saved choices preserved. The initial display currency is USD;
+choose another or define personal rates in **Account settings → Currencies**.
+Purchased Codex credits require an updated agent and appear after its next measurement.
+Sharing a subscription does not automatically share its extra funds: enable that
+separately on each shared board. Reload open dashboard tabs after the upgrade.
+
 On each machine, run `quotum update`, then restart the background agent with
 `quotum stop` and `quotum start` (or restart its service). With npm, use the latest
 `quotum` package. Update the hub first: older agents still deliver measurements to the
@@ -558,8 +600,9 @@ notification preferences and language belong to the app.
   `~/.cache/com.padurets.quotum/logs` on Linux.
 - **Network access:** the app reads reset announcements from Codex Resets and Claude
   Resets, as every hub does (`QUOTUM_RESETS=off` in the app's environment turns that
-  off). If you connect OpenRouter, its hub also reads your account through fixed HTTPS
-  requests with the management key you supplied. The local hub listens on `127.0.0.1`
+  off). Connected OpenRouter, DeepSeek and z.ai accounts are read through fixed HTTPS
+  requests with the dedicated keys you supplied. Currency conversion fetches public
+  reference rates without sending balances or personal rates. The local hub listens on `127.0.0.1`
   alone, behind a key only the app's windows get; it does not send measurements to a
   server hub.
 - **Size:** Linux packages carry both Chromium for the window and Node.js for the hub.
@@ -590,6 +633,11 @@ name = "work-laptop"    # the name the machine reports (default: host name); ren
 url = "https://quotum.example.com"
 token = "qt_m_…"
 
+[clients.opencode]
+enabled = true          # track independently of subscription measurement
+route = false           # reserved consent for route observations (not collected yet)
+# path = "/opt/opencode/bin/opencode"
+
 [providers.antigravity]
 interval = 300
 account = "work"        # tells two Antigravity subscriptions apart (agy doesn't say which one it is)
@@ -604,6 +652,18 @@ commands: `quotum --json` (one measurement in the ingest format), `quotum --only
 says whether there is a newer release; `QUOTUM_RELEASES_URL` points it at a mirror). An
 agent running in the background keeps its version until it is started again.
 
+Coding clients are tracked independently of subscription measurement. OpenCode native
+CLI sessions and installed client versions appear in My connections → Devices. Work
+without a known held subscription remains on your personal Agents and Agent activity
+widgets, including on an empty board; add them through Add widget. Shared boards never
+show that private work. `[clients.<id>] enabled = false` disables one client's tracking;
+`[providers.<id>] enabled = false` disables only its measurements. A client's `path`
+overrides its legacy provider path. Native OpenCode local project attribution is
+available on Linux; shared or unproven invocations, and macOS/Windows, report presence
+without a project. Generic Node/bun hosts are not detected. Version probes are bounded
+and never read credentials or make model requests. Working states estimate process CPU
+activity; they are not provider reports of model work.
+
 ### Hub
 
 | Variable | Default | Meaning |
@@ -614,7 +674,8 @@ agent running in the background keeps its version until it is started again.
 | `QUOTUM_PUBLIC_URL` | taken from the request | The address shown to agents and used in invite links |
 | `QUOTUM_TRUST_PROXY` | — | Believe a proxy about the client's address and protocol: `true`, a number of hops, or addresses and CIDR ranges |
 | `QUOTUM_DATA_DIR` | `hub/data` (image: `/data`) | Where the SQLite database lives |
-| `QUOTUM_SECRET_KEY`, `QUOTUM_SECRET_KEY_FILE` | — | Encryption key for trusted connector credentials: 32 random bytes as unpadded base64url, or a protected file outside the data directory containing it. Set one input only; see [server deployment](deploy/README.md) |
+| `QUOTUM_SECRET_KEY`, `QUOTUM_SECRET_KEY_FILE` | automatic separate storage | Optional explicit encryption key: 32 random bytes as unpadded base64url, or a protected file outside the data directory. Set one input only; explicit inputs override automatic storage. See [server deployment](deploy/README.md) |
+| `QUOTUM_SECRET_DIR` | POSIX: sibling of the real data directory with `.keys`; image: `/keys` | Optional separate persistent key directory, outside data. Not used with an explicit key. Windows standalone uses private HKCU registry storage instead and rejects this option in automatic mode |
 | `QUOTUM_SECRET_KEY_PREVIOUS`, `QUOTUM_SECRET_KEY_PREVIOUS_FILE` | — | Matching previous encryption key during rotation. Set one previous input only; back up keys separately and retain the old key for its matching backups |
 | `QUOTUM_SETUP_CODE` | random, printed at start | The code the first account needs while the hub has none |
 | `QUOTUM_SIGNUP` | `invite` | `open` lets anyone sign up; otherwise only the first person and people with an invite |
@@ -683,11 +744,11 @@ Add the hashes of any new database layout steps to `RELEASED` in
 Refresh the README screenshots in both languages from the demo board, check the upgrade
 instructions and prepare the release notes outside the repository.
 
-For example, to prepare 0.6.0 on that branch:
+For example, to prepare 0.7.0 on that branch:
 
 ```sh
-(cd hub && npm version 0.6.0 --no-git-tag-version)
-# agent/Cargo.toml and desktop/Cargo.toml: version = "0.6.0"
+(cd hub && npm version 0.7.0 --no-git-tag-version)
+# agent/Cargo.toml and desktop/Cargo.toml: version = "0.7.0"
 (cd agent && cargo metadata --format-version 1 >/dev/null)
 (cd desktop && cargo metadata --format-version 1 >/dev/null)
 ```
@@ -701,8 +762,8 @@ commit to tag. Only after the maintainer approves that specific release:
 git fetch origin
 git switch main
 git pull --ff-only origin main
-git tag -a v0.6.0 -F /path/to/release-notes.md --cleanup=verbatim
-git push origin v0.6.0
+git tag -a v0.7.0 -F /path/to/release-notes.md --cleanup=verbatim
+git push origin v0.7.0
 ```
 
 [release.yml](.github/workflows/release.yml) refuses a tag that is not annotated or
