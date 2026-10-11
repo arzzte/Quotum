@@ -361,6 +361,17 @@ export const STEPS = [
     source_id TEXT NOT NULL, meter_id TEXT NOT NULL, unit TEXT NOT NULL, payload TEXT NOT NULL,
     PRIMARY KEY (source_id,meter_id,unit)) WITHOUT ROWID;
   `,
+  // 23 — current monetary observations replace imported organization reports.
+  `
+  DROP TABLE reported_intervals;
+  DROP TABLE reported_components;
+  DELETE FROM readings WHERE meter_id='monthly' AND source_id IN (SELECT id FROM sources WHERE provider='openai_platform');
+  DELETE FROM meter_spans WHERE meter_id='monthly' AND source_id IN (SELECT id FROM sources WHERE provider='openai_platform');
+  UPDATE state SET payload=json_set(json_remove(payload,'$.reportQuality','$.reportAttemptedAt','$.reportDigest'),
+    '$.meters',json('[]'),'$.successAt',null,'$.error','unmeasured')
+    WHERE source_id IN (SELECT id FROM sources WHERE provider='openai_platform');
+  `,
+
 ];
 
 export const SCHEMA_VERSION = STEPS.length;

@@ -4,7 +4,7 @@ import path from 'node:path';
 import {DEEPSEEK_SCENES,DEEPSEEK_KEY,deepSeekPayload,demoRates} from './deepseek.js';
 import {QUOTA_KEY,QUOTA_SCENES,quotaFixture} from './quotas.js';
 import {MONEY_KEY} from './money.js';
-import {REPORT_KEY,REPORT_SCENES,reportFixture} from './reports.js';
+import {OPENAI_KEY,OPENAI_SCENES,openAIFixture} from './openai.js';
 import {readFileSync} from 'node:fs';
 import {demoAdditionControls} from './additions.js';
 process.umask(0o077);
@@ -82,12 +82,12 @@ quotaTransport.send=async(_operation,secret)=>{
   return decodeZai(JSON.stringify(quotaFixture(index,quotaStart)));
 };
 (connectors as Map<string,import('../server/connectors/registry.js').Connector>).set('zai',zai(quotaTransport));
-const reportTransport=new ConnectorTransport({host:'127.0.0.1',port:443,operations:{}});
-reportTransport.send=async(operation,secret,query={})=>{
-  const index=REPORT_SCENES.findIndex((_,i)=>REPORT_KEY(i)===secret.toString('ascii'));if(index<0)throw new SecretError('credential_invalid');
+const openAITransport=new ConnectorTransport({host:'127.0.0.1',port:443,operations:{}});
+openAITransport.send=async(operation,secret,query={})=>{
+  const index=OPENAI_SCENES.findIndex((_,i)=>OPENAI_KEY(i)===secret.toString('ascii'));if(index<0)throw new SecretError('credential_invalid');
   if(operation==='limit'&&(index===4||index===5))throw new ConnectorStatus(index===4?403:404,null);
-  return {organization:'org-demo-reports-'+index,data:decodeOpenAI(JSON.stringify(reportFixture(index,operation,Number(query.start_time)*1000,Number(query.end_time)*1000,Date.now())))};
+  return {organization:'org-demo-openai-'+index,data:decodeOpenAI(JSON.stringify(openAIFixture(index,operation,Number(query.start_time)*1000,Number(query.end_time)*1000,Date.now())))};
 };
-(connectors as Map<string,import('../server/connectors/registry.js').Connector>).set('openai_platform',openAIPlatform(reportTransport));
+(connectors as Map<string,import('../server/connectors/registry.js').Connector>).set('openai_platform',openAIPlatform(openAITransport));
 const {runHub}=await load('main.js') as typeof import('../server/main.js');
 await runHub(demoAdditionControls);

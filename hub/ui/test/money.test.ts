@@ -2,7 +2,7 @@ import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import {money,capPercent,capStale,capChangesAt,accessTone,accessChangesAt} from '../lib/money';
 import {setLocale} from '../i18n';
-import {archivedKeyGroups,moneySelection,readMoney,chooseMoney} from '../lib/moneySelection';
+import {archivedKeyGroups,moneySelection,readMoney} from '../lib/moneySelection';
 import {moneyTotal,type MeterHistory} from '../lib/moneyView';
 import type {Card} from '../lib/types';
 import type {Meter} from '../../server/domain/meters';
@@ -12,6 +12,17 @@ import {INITIAL,reduce,type Snapshot} from '../lib/board';
 
 const meter=(id:string,value='1'):Meter=>({id,amount:value,kind:'balance',unit:'USD',limit:null,at:1,stale:false,staleAfterMs:1000,resetAt:null,minutes:null,scope:null,label:null});
 const card=(id:string):Card=>({id,provider:'openrouter',plan:'',successAt:1,error:null,stale:false,windows:[],resets:null,owners:[],staleAfterMs:1000,measureIntervalMs:null,meters:[meter('balance'),...Array.from({length:10},(_,i)=>meter('key:'+i))]});
+test('a source with expenses and no funds selects its current counter through both existing views',()=>{
+  const source:Card={...card('openai'),provider:'openai_platform',meters:[{...meter('usage','30000000'),kind:'counter',resetAt:100000,scope:'monthly'}]};
+  for(const view of ['balance','spending'] as const)assert.deepEqual(moneySelection([source],[],readMoney({unit:'USD',view})).selection?.ids,[['openai','usage']]);
+  assert.deepEqual(moneySelection([source],['source:openai'],readMoney({unit:'USD'})).selection?.ids,[]);
+  assert.deepEqual(moneySelection([source],[],readMoney({unit:'USD',selected:{USD:[]}})).selection?.ids,[]);
+});
+test('saved OpenAI report choices follow the current sample without losing other selected accounts',()=>{
+  const source='openai_platform:fixture',selected={USD:[[source,'costs'],[source,'monthly'],['openrouter:fixture','balance']]};
+  assert.deepEqual(readMoney({unit:'USD',selected}).selected.USD,[[source,'usage'],['openrouter:fixture','balance']]);
+  assert.deepEqual(readMoney({unit:'USD',view:'spending',selected:{USD:[]},modes:{spending:selected}}).selected.USD,[[source,'usage'],['openrouter:fixture','balance']]);
+});
 test('unknown spending stays unknown, and a known subtotal identifies missing coverage',()=>{
   const series:MeterHistory={sourceId:'s',meterId:'balance',kind:'balance',unit:'USD',semantics:null,start:null,end:'10',spent:'0',topup:'0',unlocated:[],topupUnlocated:[],coveredMs:0,points:[]};
   assert.deepEqual(moneyTotal(series,0,86400000),{amount:null,unknown:true,partial:true});
@@ -58,7 +69,6 @@ test('a selected cap stays fresh until its own deadline or earlier reset',()=>{
   assert.equal(capChangesAt(cap,100),800);assert.equal(capStale(cap,799),false);assert.equal(capStale(cap,800),true);assert.equal(capChangesAt(cap,800),null);
   const lifetime={...cap,resetAt:null};assert.equal(capChangesAt(lifetime,1100),1101);assert.equal(capStale(lifetime,1100),false);assert.equal(capStale(lifetime,1101),true);
 });
-
 test('explicit card scales outside the bounded preview survive saving, reload and preview changes',()=>{
   const preview=[{id:'first'}],source='openrouter:fixture';
   assert.equal(keyShown(EMPTY_VIEW,source,'first',preview),true);
@@ -90,15 +100,6 @@ test('source access is an independent private slice and disappears with its line
   const gone=reduce(next,{type:'hub',event:{type:'lineup',data:{sources:[]}}});assert.deepEqual(gone.board?.sourceAccess,{});
 });
 
-test('reported-only sources default to Spending and mode choices preserve earlier explicit selections',()=>{
-  const reported={...card('report'),meters:[{...meter('monthly','30000000'),kind:'cap' as const,limit:'100000000',scope:'monthly'}],reportQuality:[]};
-  const legacy=readMoney({unit:'USD',view:'balance',selected:{USD:[['one','balance']]}});
-  const spending=chooseMoney({...legacy,view:'spending'},'USD',[['report','costs']]);
-  assert.deepEqual(moneySelection([card('one'),reported],[],spending).selection?.ids,[['report','costs']]);
-  assert.deepEqual(moneySelection([card('one'),reported],[],{...spending,view:'balance'}).selection?.ids,[['one','balance']]);
-  assert.deepEqual(moneySelection([reported],[],readMoney({unit:'USD',view:'spending'})).selection?.ids,[['report','costs']]);
-  assert.deepEqual(moneySelection([reported],[],readMoney({unit:'USD',view:'balance'})).selection?.ids,[]);
-});
 
 test('mixed credits select one native meter through USD context and grant metadata changes selection identity',()=>{
   const source:Card={...card('codex'),provider:'codex',meters:[{...meter('balance:credits','12345678912'),unit:'credits:codex',scale:7}],budget:{enabled:true,since:10,anchor:20,revision:'first'}};

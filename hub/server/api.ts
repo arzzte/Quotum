@@ -204,7 +204,6 @@ export async function buildApp(hub: Hub, extend?: ExtendHub) {
       try {meters=selectionOf(JSON.parse(request.query.meters??''),request.query.unit);} catch {return reply.code(400).send({error:'invalid_request'});}
       // A shared hidden source is not a history capability, even when its id is known.
       if (meters.ids.some(([source])=>!shown.has(source))) return reply.code(404).send({error:'not_found'});
-      if(meters.ids.some(([source,meter])=>meter==='costs'&&!(providerOf(store.state(source).provider)?.meterKinds as readonly string[]|undefined)?.includes('reported')))return reply.code(400).send({error:'invalid_request'});
       const financial=new Map(store.sources(board).map(s=>[s.id,s]));
       if(meters.ids.some(([source,id])=>{const s=financial.get(source);return s?.budget?.enabled===false && budgetMeter(providerOf(s.provider),id);} ))return reply.code(404).send({error:'not_found'});
       if(request.query.currency!==undefined)meters={...meters,nativeCurrencies:true};

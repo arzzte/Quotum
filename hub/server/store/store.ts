@@ -4,7 +4,6 @@ import {createHash, randomBytes} from 'node:crypto';
 import {DatabaseSync} from 'node:sqlite';
 import {config} from '../config.js';
 import {providers, sourceId, type Provider, type Source} from '../domain/sources.js';
-import {ReportStore} from './reports.js';
 import {deliveryOf, type Measurement, type SourceState} from '../domain/quota.js';
 import {cellsOf, workFrom, type CellSamples} from '../domain/cells.js';
 import {tileOf, type Chunk, type HistoryMeta} from '../domain/history.js';
@@ -72,7 +71,6 @@ export type BoardSource = Source & {holders: string[]; sharedBy: string | null; 
 export class Store {
   readonly db: DatabaseSync;
   readonly meters: MeterStore;
-  readonly reports:ReportStore;
   readonly currencies:CurrencyStore;
   private monetaryRecords=new Set<(source:string,state:SourceState)=>void>();
   private currencyChanges=new Set<(owner:string)=>void>();
@@ -91,7 +89,6 @@ export class Store {
     this.currencies.onChange=owner=>{if(owner){for(const listener of this.currencyChanges)listener(owner);tell(this.observer,o=>o.touchUser(owner));}};
     importLegacyCurrencies(this.db,this.currencies);
     this.meters = new MeterStore(this.db,this.currencies);
-    this.reports=new ReportStore(this.db);
     this.created = Number((this.db.prepare("SELECT value FROM meta WHERE key = 'historyStart'").get() as {value: string}).value);
   }
 
@@ -104,7 +101,7 @@ export class Store {
    */
   historyStart(now: number): number {
     const kept = now - config.retention.sampleDays * 86_400_000;
-    const oldest = (this.db.prepare('SELECT min(at) AS at FROM (SELECT min(at) AS at FROM samples WHERE at>=? UNION ALL SELECT min(at) AS at FROM readings WHERE at>=? UNION ALL SELECT max(min(from_at),?) AS at FROM reported_intervals WHERE to_at>?)').get(kept, kept,kept,kept) as {at: number | null}).at;
+    const oldest = (this.db.prepare('SELECT min(at) AS at FROM (SELECT min(at) AS at FROM samples WHERE at>=? UNION ALL SELECT min(at) AS at FROM readings WHERE at>=?)').get(kept, kept) as {at: number | null}).at;
     return oldest === null ? this.created : Math.min(this.created, oldest);
   }
 
@@ -428,7 +425,7 @@ export class Store {
       const at = measurement.observedAt, ttl = measurement.staleAfterMs;
       let state = previous, quotaSince: number | null = null, budgetSince: number | null = null;
       if ('meters' in measurement) {
-        if (at <= Math.max(previous.successAt ?? -Infinity, previous.balanceStatus?.at ?? -Infinity, previous.reportAttemptedAt ?? -Infinity)) return result;
+        if (at <= Math.max(previous.successAt ?? -Infinity, previous.balanceStatus?.at ?? -Infinity,previous.monthlyLimit?.observedAt ?? -Infinity)) return result;
         const recorded = this.meters.record(id, previous, measurement);
         state = recorded.state;
         result.accepted = true;
@@ -570,11 +567,7 @@ export class Store {
       const chunks=cellsOf([],[],{},cellMs,from,to,this.historyKnown(shown));
       if(meters) {
         const groups=this.financialGroups(board,meters,from,to,now);
-        const reports=this.reports.series(meters,from,to);
-        for(const chunk of chunks) {
-          chunk.meterSeries=this.meters.cells(meters,chunk.from,chunk.to,cellMs,groups);
-          if(reports.length)chunk.reportSeries=reports.map(series=>({...series,intervals:series.intervals.filter(row=>row.to>chunk.from&&row.from<chunk.to)})).filter(series=>series.intervals.length);
-        }
+        for(const chunk of chunks)chunk.meterSeries=this.meters.cells(meters,chunk.from,chunk.to,cellMs,groups);
       }
       return chunks;
     }
@@ -614,11 +607,7 @@ export class Store {
     for (const event of grants) chunks[tileOf(event.at, cellMs) - tileOf(from, cellMs)].grants.push([event.source_id, event.at, Number(event.detail)]);
     if (meters) {
       const groups=this.financialGroups(board,meters,from,to,now);
-      const reports=this.reports.series(meters,from,to);
-      for (const chunk of chunks) {
-        chunk.meterSeries = this.meters.cells(meters,chunk.from,chunk.to,cellMs,groups);
-        if(reports.length)chunk.reportSeries=reports.map(series=>({...series,intervals:series.intervals.filter(row=>row.to>chunk.from&&row.from<chunk.to)})).filter(series=>series.intervals.length);
-      }
+      for (const chunk of chunks) chunk.meterSeries = this.meters.cells(meters,chunk.from,chunk.to,cellMs,groups);
     }
     return chunks;
   }
@@ -899,7 +888,6 @@ export class Store {
     // Each successful deletion counts immediately: a later statement may fail.
     if (this.db.prepare('DELETE FROM samples WHERE at < ?').run(cutoff).changes) this.pruned++;
     if (this.meters.prune(cutoff)) this.pruned++;
-    if(this.reports.prune(cutoff))this.pruned++;
     if (this.db.prepare('DELETE FROM agent_work WHERE to_at < ?').run(cutoff).changes) this.pruned++;
     // A session without work is not needed; one still running is made again when credited.
     this.db.prepare('DELETE FROM agent_sessions WHERE NOT EXISTS (SELECT 1 FROM agent_work WHERE session_id = agent_sessions.id)').run();

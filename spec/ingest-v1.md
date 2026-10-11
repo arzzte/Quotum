@@ -563,7 +563,7 @@ Dropped hub-provider elements are not stored and grant no visibility. OpenAI Pla
 organization identity is a hub-only pseudonym: the first 24 hex characters of SHA-256
 over `quotum/account/v1\nopenai_platform\n` and the exact validated organization
 response header. Opaque organization identifiers retain case; raw headers and keys
-never enter agent traffic. Clients cannot submit reported costs. Only the hub
+never enter agent traffic. Clients cannot submit OpenAI monetary observations. Only the hub
 can measure a source of such a provider, including DeepSeek balances; the agent contract sends no provider secret or declared account identity.
 
 What never leaves the machine: provider tokens, cookies, account ids and emails,

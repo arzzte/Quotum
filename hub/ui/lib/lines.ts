@@ -11,15 +11,15 @@ import {covered, type Coverage} from './historyPlot';
 /** A series of the history as the chart and the table show it: named, coloured, with its value now. */
 export type PlotBlock = {from: number; to: number; gap: boolean; points: readonly [at: number, remaining: number, segment: number, hold: number, validUntil?: number][]};
 export type CapCell = {at:number;from:number;to:number;value:number};
-export type PlotSeries = Pick<HistorySeries, 'sourceId' | 'windowId' | 'points' | 'staleAfterMs'> & {pointMode?:'cell'|'observation';capCells?:readonly CapCell[]} & {blocks?: {block: PlotBlock; join: boolean}[];intervals?:{from:number;to:number;value:number}[]};
+export type PlotSeries = Pick<HistorySeries, 'sourceId' | 'windowId' | 'points' | 'staleAfterMs'> & {pointMode?:'cell'|'observation';capCells?:readonly CapCell[]} & {blocks?: {block: PlotBlock; join: boolean}[]};
 type LineName = Pick<Win, 'kind' | 'label' | 'minutes'> & {provider: string; key: string; name: string; color: string; dash: string; current: number|null};
 export type PlotLine = PlotSeries & LineName;
-export type Line = HistorySeries & LineName & {pointMode?:'cell'|'observation';capCells?:readonly CapCell[]} & Pick<PlotSeries,'intervals'>;
+export type Line = HistorySeries & LineName & {pointMode?:'cell'|'observation';capCells?:readonly CapCell[]};
 
 const boundedPoints = new WeakMap<PlotSeries['points'], boolean>();
 /** Published points are immutable; pointer motion never rescans a native history. */
-export function preciseReadout(line: Pick<PlotSeries,'pointMode'|'capCells'|'points'|'intervals'>): boolean {
-  if (line.pointMode === 'observation' || line.capCells || line.intervals) return true;
+export function preciseReadout(line: Pick<PlotSeries,'pointMode'|'capCells'|'points'>): boolean {
+  if (line.pointMode === 'observation' || line.capCells) return true;
   let bounded = boundedPoints.get(line.points);
   if (bounded === undefined) {
     bounded = line.points.some(point => point[3] !== undefined);

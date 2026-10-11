@@ -137,6 +137,7 @@ export function KeyForm({
   demo,
   available,
   storageReason,
+  local = false,
   onClose,
   onSaved,
   onAddToBoard,
@@ -149,6 +150,7 @@ export function KeyForm({
   demo?: Demo;
   available: boolean;
   storageReason?: string | null;
+  local?: boolean;
   onClose: () => void;
   onSaved?: () => void;
   onAddToBoard?: (sourceId: string) => void;
@@ -309,6 +311,7 @@ export function KeyForm({
         {t(openai ? 'sources.openaiRights' : namedAccounts ? 'sources.deepseekRights' : provider === 'zai' ? 'sources.zaiRights' : 'add.keyRights')}
       </p>
       {openai && <p className="dialog-text">{t('sources.openaiExpiryAdvice')}</p>}
+      <p className="drawer-note">{t(local?'trustedKeys.localProtection':'trustedKeys.operator')}</p>
       <a
         className="provider-link"
         href={

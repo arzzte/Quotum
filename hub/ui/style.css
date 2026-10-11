@@ -943,6 +943,7 @@ body:has(.compact)::before, body:has(.compact)::after { display: none; }
 .money-balance .picker { margin-left: 0; }
 .money-balance-values { display: grid; gap: 6px; min-width: 0; max-width: 100%; margin-left: auto; text-align: right; }
 .money-balance .limit-value { max-width: 100%; overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
+.money-spend-limit .limit-value { font-size: 1rem; }
 .money-limits { min-width: 0; }
 .money-limits:not(:empty) { border-top: 1px solid var(--hair); padding-top: 16px; margin-top: 4px; }
 .money-partial { margin-left: 4px; color: var(--text-3); }
@@ -1125,9 +1126,6 @@ body:has(.compact)::before, body:has(.compact)::after { display: none; }
 .money-breakdown-total { padding-bottom: 4px; color: var(--text); }
 .money-balance .is-stale,.money-breakdown .is-stale {opacity:.6;}
 
-.report-name small { color: var(--text-3); }
-.report-periods { display: flex; flex-wrap: wrap; gap: 6px 24px; color: var(--text-2); }
-.report-amount, .report-amount .report-periods { display: flex; flex-direction: column; gap: 6px; }
 /* Currency settings keep reading, editing and history at separate levels. */
 .dialog:has(> .currency-details, > .currency-form) .dialog-head h2 { min-width: 0; overflow-wrap: anywhere; }
 .currency-details, .currency-page { display: flex; flex-direction: column; gap: 24px; min-width: 0; }

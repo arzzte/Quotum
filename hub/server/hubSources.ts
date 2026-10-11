@@ -19,7 +19,6 @@ const resultContent=(result:import('./connectors/registry.js').ConnectorIdentity
 type Job={generation:number;next:number|null;last:number|null;retryAt:number;interval:number;failures:number;controller:AbortController|null;request:RefreshRequest|null;requestedAt:number|null};
 
 export function measurementFingerprint(state:SourceState,measurement?:MeterMeasurement):string {
-  if(measurement?.reportDigest??state.reportDigest)return measurement?.reportDigest??state.reportDigest!;
   if(!state.balanceStatus&&!measurement?.balanceStatus)return JSON.stringify((measurement?.meters??state.meters)?.map(m=>[m.id,m.amount,m.limit,m.resetAt]));
   const current=new Map((state.meters??[]).map(m=>[m.id,{...m,stale:measurement?true:m.stale}]));
   for(const meter of measurement?.meters??[])current.set(meter.id,{...meter,stale:false});
@@ -85,7 +84,7 @@ export class HubSources {
       // Freshness belongs to the accepted observation; it is never extended after failure.
       job.retryAt=Math.max(job.retryAt,this.credentials.retryNotBefore(source),this.clock.now()+(result.retryAfterMs??0));
       job.next=Math.max(this.clock.now()+(transient?Math.min(120_000*2**Math.min(job.failures-1,3),900_000):job.interval),job.retryAt);
-      if(job.request){job.request.status=transient||!result.measurement?'failed':result.measurement.reports?.status==='partial'?'updated_partially':'updated';job.request.finishedAt=this.clock.now();}
+      if(job.request){job.request.status=transient||!result.measurement?'failed':result.attempt?.outcome==='degraded'?'updated_partially':'updated';job.request.finishedAt=this.clock.now();}
     }catch(error){
       if(!valid())return;
       const code=error instanceof SecretError?error.code:'credential_failed';

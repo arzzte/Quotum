@@ -950,31 +950,34 @@ projected separately for each reader, outside the shared board cache.
 Frequency saves publish the new preference during an active poll; its cadence is
 recomputed after that poll finishes.
 
-OpenAI Platform uses separate reported daily intervals, keyed by source, meter, currency
-and original bounds. An accepted reread replaces a changed value; an unchanged read
-updates only confirmation metadata. Decimal lines are summed exactly before rounding,
-and integer-cent monthly thresholds convert independently. Retained values and current
-revision-bound confirmations feed one classifier on the server and dashboard. Missing
-or empty reports remain unknown; subday ranges never distribute a day’s costs.
+OpenAI Platform polls only fixed organization Costs and optional Spend Limit GET
+operations, with at most eight pages and 2048 cost results in a sixty-second round.
+The Costs request covers the current UTC month through the current day. Its daily
+buckets are transient adapter input: all original decimal tokens are summed before
+one rounding operation into a current `usage` counter observation. No supplier daily
+history or calendar report projection is stored. An empty or incomplete traversal
+cannot publish a partial sum or a confirmed zero; the previous meter is retained as
+unavailable. A signed net monthly amount is a bounded counter, not account funds.
 
-The connector reads only fixed organization Costs and Spend Limit GET operations,
-with at most eight pages and 2048 cost results in a sixty-second round. It rereads the
-retained ninety-day window to reconcile older corrections. One validated organization
-response header per successful component proves access, using a case-preserving
-provider-domain pseudonym. Same-organization rotation preserves history; every holder
-proves its own access. The selected methods leave key expiry unknown. Cost and optional
-limit outcomes are independent. Partial data commits separately from attempt outcome,
-and supplier retry deadlines persist through refresh, replacement and restart.
+The ordinary meter ledger keeps our sparse observations and heartbeat spans. A first
+sample establishes the baseline; a repeat adds no spending. Counter corrections use
+the existing positive-movement policy, without inferred refunds or top-ups. The month’s
+exclusive `resetAt` deadline ends value availability and a changed deadline breaks
+counter continuity and delta calculation. Current month totals never become lifetime
+counters. Common history tiles, charts, tables, currency conversion and recorded rate
+provenance apply without an additional analytics reader.
 
-Reported values travel through the existing history tiles in small byte leaves, with
-original daily bounds and value revisions. Current confirmation is a source projection,
-so quality-only changes need no history read and cannot mark an old cached value fresh.
-Cards and compact use the shared Available balance renderer. Reported costs and a
-monthly spending threshold do not supply account funds; an unsupported balance stays
-unavailable. The optional threshold and enforcement remain separate source metadata.
-Analytics show reported costs and UTC calendar summaries. The source projection derives remaining allowance only from
-confirmed monthly coverage and a fresh same-currency limit; it does not infer prepaid
-credits. These measurements never enter quota forecasts or notifications.
+One validated organization response header per successful component proves access,
+using a case-preserving provider-domain pseudonym. Same-organization rotation preserves
+history; every holder proves its own access. The selected methods leave key expiry
+unknown. Costs and limit outcomes are independent; supplier retry deadlines persist
+through refresh, replacement and restart. A failed component retains its last valid
+value without renewing freshness. The threshold is stored with its own status and time,
+uses shared display conversion, and never supplies a percentage denominator or funds.
+Cards and compact use the common Available balance renderer: these methods do not
+report account funds or grant expiry, so the balance stays unavailable. The configured
+threshold and enforcement are separate from balance and accounting. None of these
+observations enters percentage quota forecasts or native quota notifications.
 
 ## Trusted connector keys
 

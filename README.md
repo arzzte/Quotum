@@ -469,13 +469,17 @@ reported costs and monthly spending limits do not substitute for it. The optiona
 monthly threshold and enforcement state remain separate source metadata. An
 inaccessible limit, including a Spend Limit 404, stays unknown while valid costs survive.
 
-Choose **Spending** in analytics for reported daily costs and UTC calendar
-summaries (weeks begin on Monday). Repeated reports replace the same day; late data and
-corrections update its history. Empty or missing reports are not treated as zero.
-Current-day reports are provisional. A range covering only part of a day retains that
-whole-day amount separately: Quotum does not invent hourly spending. Costs and limits
-have independent freshness; unconfirmed history stays visible as last known. A remaining
-allowance is known only with fresh, complete monthly coverage in the same currency.
+Analytics use Quotum’s own samples of the current reported monthly cost. Each poll
+reads the current month’s Costs buckets and aggregates them into one observation;
+no supplier daily history is imported. **Value** shows that monthly amount, and
+**Spending** uses the existing changes-between-samples rules. The first observation
+is a baseline, rereading it adds no spending, and a new UTC month starts a new baseline.
+Downward corrections do not become top-ups or refunds. Positive changes after a
+correction use the corrected baseline. Signed net adjustments are retained. Empty,
+invalid or incomplete replies preserve the last valid value as unavailable, never zero.
+The values reflect what OpenAI has reported by the poll, including later corrections;
+they are not a real-time billing balance or a final invoice. The configured threshold
+is shown separately, with its enforcement status in the existing disclosure.
 
 The fixed response organization proof binds the source independently of its key.
 Replacement for the same verified organization preserves history; another organization

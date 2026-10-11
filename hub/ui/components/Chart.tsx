@@ -331,10 +331,6 @@ export const Chart = memo(function Chart({
         const runs:[number,number][][]=[];
         for(const run of observed.runs){const mapped:[number,number][]=[];for(const [at,value] of run){mapped.push([x(at),y(value)]);yield;}runs.push(mapped);}
         paths.push({line:yield* plotPathPrepared(runs,true),last:observed.last?[x(observed.last[0]),y(observed.last[1])]:null,parts:null,latest});
-      } else if(line.intervals) {
-        let path='';
-        for(const interval of line.intervals){if(interval.from<drawNow&&interval.to>drawFrom)path+=`M${x(interval.from).toFixed(1)},${y(interval.value).toFixed(1)}L${x(interval.to).toFixed(1)},${y(interval.value).toFixed(1)}`;yield;}
-        paths.push({line:path,last:null,parts:null,latest});
       } else if(line.capCells) {
         let path='',last:[number,number]|null=null;
         for(const cell of line.capCells) {

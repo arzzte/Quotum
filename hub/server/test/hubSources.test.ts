@@ -137,7 +137,7 @@ test('polling updates known expiry metadata without confusing it with unknown ex
   }finally{h.sources.stop();h.store.close();}
 });
 
-for(const limited of ['limit','page'] as const)test('OpenAI '+limited+' rate limits commit certified data and keep retry deadlines through refresh, rotation and restart',async()=>{
+for(const limited of ['limit','page'] as const)test('OpenAI '+limited+' rate limits keep complete current samples and keep retry deadlines through refresh, rotation and restart',async()=>{
   const clock=new TestClock(),store=new Store(':memory:',clock.now()),directory=new Directory(store.db);
   const owner=directory.createUser('report-retry@fixture.example','Retry','unused',clock.now());
   const key=SecretKey.parse(Buffer.from(Buffer.alloc(32,7).toString('base64url'))),report=startSecrets(store.db,{current:key,previous:null,reset:null,storageAtStart:null,wasFileAtStart:false});
@@ -152,7 +152,7 @@ for(const limited of ['limit','page'] as const)test('OpenAI '+limited+' rate lim
   try {
     const saved=await credentials.create(owner.id,connector.id,'sk-admin-'+'a'.repeat(32),{allowUnknownExpiry:true}),source=saved.sourceId!;
     assert.equal(calls,2,'a costs-page rate limit stops optional reads too');
-    assert.equal(store.reports.intervals(source,'costs','USD',0,clock.now()+86400000)[0].amount,'5000000');
+    assert.equal(store.state(source).meters?.find(m=>m.id==='usage')?.amount,limited==='limit'?'5000000':undefined,'a partial page never becomes a monthly sample');
     assert.equal(credentials.list(owner.id)[0].lastError,'connector_status');
     const before=calls,retryAt=credentials.retryNotBefore(source);assert.ok(retryAt>=clock.now()+7199000);
     sources.start();clock.tick();await settle();assert.equal(calls,before);
