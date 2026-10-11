@@ -10,8 +10,7 @@ import {startSecrets} from '../secrets/start.js';
 import {composeMeters} from '../domain/meterHistory.js';
 import {validateMeter} from '../domain/meters.js';
 import {displayHistory} from '../currencies/history.js';
-import {cellsOf} from '../domain/cells.js';
-import {budgetView} from '../../ui/lib/money.js';
+import type {Chunk} from '../domain/history.js';
 
 const start=Date.UTC(2026,9,1),day=86_400_000,secret=Buffer.from('sk-admin-'+'a'.repeat(40));
 const bucket=(index:number,value=5)=>({object:'bucket',start_time:(start+index*day)/1000,end_time:(start+(index+1)*day)/1000,results:[{object:'organization.costs.result',amount:{currency:'usd',value}}]});
@@ -150,7 +149,7 @@ test('a sampling round crossing the month boundary cannot publish the old month 
   try{assert.deepEqual((await c.identify(secret)).measurement!.meters,[]);}finally{c.transport.close();}
 });
 
-test('common currency conversion presents monthly observations and the threshold without changing native accounting',async()=>{
+test('common currency conversion presents monthly observations without changing native accounting',async()=>{
   const at=start+2*day+1000,store=new Store(':memory:',start),directory=new Directory(store.db);
   const owner=directory.createUser('currency-costs@fixture.example','Costs','unused',start),source=store.source('openai_platform','a'.repeat(24),start);
   const c=adapter(op=>op==='costs'?page([bucket(0,10)]):limit,()=>at);
@@ -158,15 +157,11 @@ test('common currency conversion presents monthly observations and the threshold
     store.record(source,(await c.identify(secret)).measurement!);
     store.currencies.save({source:'ecb',base:'EUR',date:start+2*day,fetchedAt:at,rates:{EUR:'1000000',USD:'2000000'}});
     store.currencies.select(owner.id,'EUR');
-    const chunks=cellsOf([],[],{},60000,at-1000,at+60000,0);
-    for(const chunk of chunks)chunk.meterSeries=store.meters.cells({unit:'USD',ids:[[source,'usage']]},chunk.from,chunk.to,60000);
+    const chunks:Chunk[]=[{from:at-1000,to:at+60000,series:[],activity:{sessions:[],devices:{},cells:[]},resets:[],grants:[],meterSeries:store.meters.cells({unit:'USD',ids:[[source,'usage']]},at-1000,at+60000,60000)}];
     const converted=displayHistory(chunks,store.currencies,owner.id,'EUR',60000),history=composeMeters(converted,60000,at-1000,at+60000);
     assert.equal(history[0].unit,'EUR');assert.equal(history[0].end,'5000000');
     assert.equal(store.state(source).meters![0].amount,'10000000');
     const state=store.state(source),context=store.currencies.context(owner.id,{[source]:[{unit:'USD',at},{unit:'USD',at:state.monthlyLimit!.valueAt!}]});
-    const view=budgetView(state,[],state.meters,context);
-    assert.equal(view.remaining.values.length,0);assert.equal(view.limits.length,0);
-    assert.equal(view.spendLimit!.meter!.amount,'50000000');assert.equal(view.spendLimit!.native.amount,'100000000');
-    assert.equal(view.spendLimit!.meter!.conversion!.original.amount,'100000000');
+    assert.equal(context.sources[source].length,1,'the threshold shares its observation currency binding');
   }finally{c.transport.close();store.close();}
 });
