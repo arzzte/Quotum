@@ -3,7 +3,7 @@ import {PERIOD_SCOPES,type PeriodScope,type PeriodReply,type PeriodRequest} from
 import assert from 'node:assert/strict';
 import {cellStart, expandHistory, type HistoryAnswer, type HistoryBasis, type HistoryReply} from '../server/domain/history';
 import {openTab, type Browser, type Cdp} from './cdp';
-import {HistoryCutChanged, bodyTotals, readUnion, stableHistory, trafficProblems, transferFor} from './historyTrafficBudget';
+import {HISTORY_COHORT_TAKES, historyCutInvalidation, historyIdentity, bodyTotals, readUnion, stableHistory, trafficProblems, transferFor} from './historyTrafficBudget';
 import {HISTORY_ATTEMPT_HEADER, historyBody, historyProxy, type BodyCount, type Transfer} from './historyProxy';
 import {observeReversal} from './reversalDiagnostic';
 import {writeFileSync} from 'node:fs';
@@ -28,7 +28,10 @@ export function historyReadSelection(url: URL) {
 export function stableHistoryReads(reads: readonly Pick<Read, 'selection' | 'answer'>[], seeds: ReadonlyMap<string, {answer: NonNullable<Read['answer']>}>, cell: number) {
   for (const read of reads) {
     const seed = seeds.get(read.selection); assert.ok(seed, 'the gesture must retain its seeded resource selection');
-    if (read.answer) stableHistory(read.answer, seed.answer, cell);
+    if (read.answer) historyIdentity(read.answer, seed.answer);
+  }
+  for (const read of reads) {
+    if (read.answer) stableHistory(read.answer, seeds.get(read.selection)!.answer, cell);
   }
 }
 
@@ -197,7 +200,7 @@ async function historyPage(browser: Browser, proxy: TrafficProxy, cookie: string
 export async function browserHistoryTraffic(browser: Browser, proxy: TrafficProxy, cookie: string, board: string) {
   const reports = [], invalidated = [], problems: string[] = [];
   for (const length of [DAY, 30 * DAY]) for (const future of [DAY, 0]) for (const latency of [0, 100, 400]) for (const fraction of [.5, .04]) {
-    for (let take = 1; take <= 3; take++) {
+    for (let take = 1; take <= HISTORY_COHORT_TAKES; take++) {
       const name = `browser/${length / DAY}d/${future ? 'history' : 'activity'}/${latency}ms/${fraction}/take${take}`;
       const poolEvidence=process.env.QUOTUM_BENCH_DIAGNOSE_HISTORY_POOL==='1'&&name==='browser/30d/activity/0ms/0.5/take1';
       const {cdp, bodies, settled, geometry, cell, seeds, close} = await historyPage(browser, proxy, cookie, name, length, future,poolEvidence);
@@ -216,8 +219,11 @@ export async function browserHistoryTraffic(browser: Browser, proxy: TrafficProx
         assert.ok(Math.abs(pose.to - pose.poses[0].origin + (length + future) * fraction) <= 3 * (length + future) / geometry.width, 'native gesture did not move by its named fraction');
         const physical=bodies.reads.filter(read=>read.phase===phase),cold = bodies.resources.filter(read => read.phase === phase);
         await proxy.settled(phase);
-        const families = [];
-        for (const selection of new Set(cold.map(read => read.selection))) {
+        assert.ok(physical.every(read=>read.count),'every attempt needs a terminal body count');
+        const physicalTotals=bodyTotals(physical.map(read=>({count:read.count!,transfer:transferFor(read.count!,proxy.transfers)})));
+        const maxAttempts = fraction === .04 ? 2 : future ? 7 : 5;
+        // Check every resource before a changed cutoff can discard this cohort.
+        const groups = [...new Set(cold.map(read => read.selection))].map(selection => {
           const group = seeds.get(selection); assert.ok(group, 'the gesture must retain its seeded resource selection: '+JSON.stringify({selection,seeds:[...seeds.keys()]}));
           assert.equal(new URLSearchParams(selection).get('board'), board);
           const scope = new URLSearchParams(selection).get('scope'), reads = cold.filter(read => read.selection === selection);
@@ -225,21 +231,26 @@ export async function browserHistoryTraffic(browser: Browser, proxy: TrafficProx
           for (const {end, origin} of pose.poses) for (let at = cellStart(end - length, cell); at < Math.ceil(Math.min(origin, end + ahead) / cell) * cell; at += cell) visited.add(at);
           // Release can commit its final coalesced input before the observer's RAF.
           for (let at = cellStart(pose.from, cell); at < Math.ceil(Math.min(pose.poses[0].origin, pose.to + ahead) / cell) * cell; at += cell) visited.add(at);
-          for (const read of reads) {
-            assert.ok(read.count, 'every attempt needs a terminal body count');
-            if (read.answer) stableHistory(read.answer, group.answer, cell);
-            for (let at = read.from; at < read.to; at += cell) {assert.ok(!group.initial.has(at), 'browser reread fresh seed data in the same selection'); requested.add(at);}
-          }
+          assert.ok(reads.every(read=>read.count),'every attempt needs a terminal body count');
           const totals = bodyTotals(reads.map(read => ({count: read.count!, transfer: transferFor(read.count!, proxy.transfers)})));
+          for (const read of reads) {
+            for (let at = read.from; at < read.to; at += cell) requested.add(at);
+          }
           const optional = [...requested].filter(at => !visited.has(at)); assert.ok(optional.length <= Math.min(60, Math.ceil(length / cell / 4)), 'browser traffic has an unbounded optional footprint');
+          assert.ok(reads.length <= maxAttempts, 'browser history exceeded its request cap');
+          return {selection, group, scope, reads, requested, optional, totals};
+        });
+        stableHistoryReads(cold, seeds, cell);
+        const families = [];
+        for (const {selection, group, scope, reads, requested, optional, totals} of groups) {
+          for (const at of requested) assert.ok(!group.initial.has(at), 'browser reread fresh seed data in the same selection');
           proxy.phase(`${name}/reference/${scope}`); let referenceDecoded = 0, referenceEncoded = 0;
           for (const [from, to] of readUnion(requested, cell)) {
             const answer = await historyBody(`${proxy.url}/api/history?${selection}&cell=${cell}&from=${from}&to=${to}`, cookie, undefined, body => {assert.ok(body.complete); referenceDecoded += body.decoded!; referenceEncoded += body.lower;}) as HistoryAnswer;
             stableHistory(answer, group.answer, cell);
           }
-          families.push({name: `${name}/${scope}`, attempts: reads.length, maxAttempts: fraction === .04 ? 2 : future ? 7 : 5, ...totals, referenceDecoded, referenceEncoded, ratios: fraction === .5, optionalUnvisitedCells: optional.length});
+          families.push({name: `${name}/${scope}`, attempts: reads.length, maxAttempts, ...totals, referenceDecoded, referenceEncoded, ratios: fraction === .5, optionalUnvisitedCells: optional.length});
         }
-        const physicalTotals=bodyTotals(physical.map(read=>({count:read.count!,transfer:transferFor(read.count!,proxy.transfers)})));
         const aggregate={name:name+'/all-accounting',attempts:physical.length,...physicalTotals,referenceDecoded:families.reduce((n,f)=>n+f.referenceDecoded,0),referenceEncoded:families.reduce((n,f)=>n+f.referenceEncoded,0),ratios:fraction===.5};
         problems.push(...trafficProblems(aggregate));reports.push(aggregate);
         console.error(`bench: ${aggregate.name}: ${JSON.stringify(aggregate)}`);
@@ -259,8 +270,7 @@ export async function browserHistoryTraffic(browser: Browser, proxy: TrafficProx
         }
         break;
       } catch (error) {
-        if (!(error instanceof HistoryCutChanged) || take === 3) throw new Error(`${name}: ${String(error)}`, {cause: error});
-        invalidated.push({name, reason: error.message, reads: bodies.reads.map(read => ({phase: read.phase, from: read.from, to: read.to, count: read.count}))});
+        invalidated.push({...historyCutInvalidation(error,name,take),reads:bodies.reads.map(read=>({phase:read.phase,from:read.from,to:read.to,count:read.count}))});
       } finally {
         if(poolEvidence)try{
           const receipt=await cdp.evaluate('window.__quotumHistoryPoolReceipt?.read()??({status:"unavailable"})');
@@ -276,72 +286,76 @@ export async function browserHistoryTraffic(browser: Browser, proxy: TrafficProx
 
 /** Native cancellation/reversal keeps one Shift-wheel token while responses are owned. */
 export async function browserCancellationTraffic(browser: Browser, proxy: TrafficProxy, cookie: string,diagnostic=false,profileBeforeInput=false) {
-  const reports = [];
+  const reports = [], invalidated = [];
   for (const length of [DAY, 30 * DAY]) for (const mode of ['before-headers', 'after-delivery', 'reversal'] as const) {
     if(diagnostic&&(length!==DAY||mode!=='reversal'))continue;
-    const name = `browser/${length / DAY}d/${mode}`;
-    console.error(`bench: ${name}: opening seed page`);
-    const {cdp, bodies, settled, geometry, cell, seeds, close} = await historyPage(browser, proxy, cookie, name, length, DAY);
-    let observer:Awaited<ReturnType<typeof observeReversal>>|null=null;
-    console.error(`bench: ${name}: seed page ready`);
-    const phase = `${name}/gesture`, reads = () => bodies.reads.filter(r => r.phase === phase);
-    let stage = 'start';
-    const step = async <T>(value: string, run: () => Promise<T>) => {
-      stage = value; cdp.at(`${name}/${stage}`);
-      console.error(`bench: ${name}: ${stage}`);
-      return diagnostic && observer ? observer.watch(value, run) : run();
-    };
-    const until = async (predicate: () => boolean | Promise<boolean>) => {const end = Date.now() + 10_000; while (!await predicate()) {if (bodies.errors.length) throw bodies.errors[0]; if (Date.now() > end) throw new Error(`${name}: lifecycle boundary not reached`); await cdp.evaluate('new Promise(resolve=>setTimeout(resolve,10))');}};
-    const key = (type: string, name: string, code: number, modifiers: number) => cdp.send('Input.dispatchKeyEvent', {type, key: name, code: name === 'Shift' ? 'ShiftLeft' : name, windowsVirtualKeyCode: code, modifiers});
-    const wheel = (pixels: number) => cdp.send('Input.dispatchMouseEvent', {type: 'mouseWheel', x: geometry.x, y: geometry.y, deltaX: pixels, deltaY: 0, modifiers: 8});
-    try {
-      // The canonical failing page is observed without changing V8 before input.
-      observer=mode==='reversal'?await observeReversal(cdp,browser,profileBeforeInput):null;
-      bodies.phase = phase; proxy.phase(phase, mode === 'after-delivery' ? 0 : 400);
-      await step('shift down', () => key('keyDown', 'Shift', 16, 8));
-      await step('first wheel', () => wheel(-geometry.width * .1));
-      await step('first request', () => until(() => reads()[0]?.attemptId !== undefined && proxy.transfers.some(t => t.id === reads()[0].attemptId)));
-      if (mode === 'after-delivery') await step('first delivery', () => until(() => reads()[0]?.count?.complete === true));
-      if (mode === 'reversal') {
-        await step('reverse wheel', () => wheel(geometry.width * .1));
-        await step('first cancellation', () => until(() => reads()[0]?.canceled === true));
-        await step('reversal frame', () => cdp.evaluate('new Promise(requestAnimationFrame)'));
-        await step('repeat wheel', () => !diagnostic&&observer?observer.watch('repeat wheel',()=>wheel(-geometry.width * .1)):wheel(-geometry.width * .1));
-        await step('repeat delivery', () => until(() => reads().length >= 2 && reads().slice(1).some(r => r.count?.complete)));
-        await step('shift up', () => key('keyUp', 'Shift', 16, 0));
-        await step('drawings settled', settled);
-        assert.equal(reads()[0].from, reads()[1].from); assert.equal(reads()[0].to, reads()[1].to, 'a repeated range needs a new attempt identity');
-      } else {
-        await step('escape down', () => key('keyDown', 'Escape', 27, 8));
-        await step('escape up', () => key('keyUp', 'Escape', 27, 8));
-        await step('shift up', () => key('keyUp', 'Shift', 16, 0));
-        await step('drawings settled', settled);
+    for (let take = 1; take <= HISTORY_COHORT_TAKES; take++) {
+      const name = `browser/${length / DAY}d/${mode}/take${take}`;
+      console.error(`bench: ${name}: opening seed page`);
+      const {cdp, bodies, settled, geometry, cell, seeds, close} = await historyPage(browser, proxy, cookie, name, length, DAY);
+      let observer:Awaited<ReturnType<typeof observeReversal>>|null=null;
+      console.error(`bench: ${name}: seed page ready`);
+      const phase = `${name}/gesture`, reads = () => bodies.reads.filter(r => r.phase === phase);
+      let stage = 'start';
+      const step = async <T>(value: string, run: () => Promise<T>) => {
+        stage = value; cdp.at(`${name}/${stage}`);
+        console.error(`bench: ${name}: ${stage}`);
+        return diagnostic && observer ? observer.watch(value, run) : run();
+      };
+      const until = async (predicate: () => boolean | Promise<boolean>) => {const end = Date.now() + 10_000; while (!await predicate()) {if (bodies.errors.length) throw bodies.errors[0]; if (Date.now() > end) throw new Error(`${name}: lifecycle boundary not reached`); await cdp.evaluate('new Promise(resolve=>setTimeout(resolve,10))');}};
+      const key = (type: string, name: string, code: number, modifiers: number) => cdp.send('Input.dispatchKeyEvent', {type, key: name, code: name === 'Shift' ? 'ShiftLeft' : name, windowsVirtualKeyCode: code, modifiers});
+      const wheel = (pixels: number) => cdp.send('Input.dispatchMouseEvent', {type: 'mouseWheel', x: geometry.x, y: geometry.y, deltaX: pixels, deltaY: 0, modifiers: 8});
+      try {
+        // The canonical failing page is observed without changing V8 before input.
+        observer=mode==='reversal'?await observeReversal(cdp,browser,profileBeforeInput):null;
+        bodies.phase = phase; proxy.phase(phase, mode === 'after-delivery' ? 0 : 400);
+        await step('shift down', () => key('keyDown', 'Shift', 16, 8));
+        await step('first wheel', () => wheel(-geometry.width * .1));
+        await step('first request', () => until(() => reads()[0]?.attemptId !== undefined && proxy.transfers.some(t => t.id === reads()[0].attemptId)));
+        if (mode === 'after-delivery') await step('first delivery', () => until(() => reads()[0]?.count?.complete === true));
+        if (mode === 'reversal') {
+          await step('reverse wheel', () => wheel(geometry.width * .1));
+          await step('first cancellation', () => until(() => reads()[0]?.canceled === true));
+          await step('reversal frame', () => cdp.evaluate('new Promise(requestAnimationFrame)'));
+          await step('repeat wheel', () => !diagnostic&&observer?observer.watch('repeat wheel',()=>wheel(-geometry.width * .1)):wheel(-geometry.width * .1));
+          await step('repeat delivery', () => until(() => reads().length >= 2 && reads().slice(1).some(r => r.count?.complete)));
+          await step('shift up', () => key('keyUp', 'Shift', 16, 0));
+          await step('drawings settled', settled);
+          assert.equal(reads()[0].from, reads()[1].from); assert.equal(reads()[0].to, reads()[1].to, 'a repeated range needs a new attempt identity');
+        } else {
+          await step('escape down', () => key('keyDown', 'Escape', 27, 8));
+          await step('escape up', () => key('keyUp', 'Escape', 27, 8));
+          await step('shift up', () => key('keyUp', 'Shift', 16, 0));
+          await step('drawings settled', settled);
+        }
+        await step('proxy settled', () => proxy.settled(phase));
+        const attempts = reads(); assert.ok(attempts.every(r => r.count?.id));
+        const totals = bodyTotals(attempts.map(r => ({count: r.count!, transfer: transferFor(r.count!, proxy.transfers)})));
+        const state = await step('read final state', () => cdp.evaluate<{tokens: string[]; poses: {end: number; origin: number}[]; pushes: number; selected: boolean; attempts: Record<string, {aborted: boolean}>}>('({tokens:__historyTraffic.tokens,poses:__historyTraffic.poses,pushes:__historyTraffic.pushes,selected:new URLSearchParams(location.search).has("from"),attempts:__quotumHistoryAttempts})'));
+        assert.equal(state.tokens.length, 1); assert.ok(state.poses.some(p => p.end < p.origin));
+        assert.equal(state.pushes, mode === 'reversal' ? 1 : 0); assert.equal(state.selected, mode === 'reversal');
+        const aborted = attempts.filter(r => r.canceled || state.attempts[r.count!.id!]?.aborted).length;
+        assert.ok(mode === 'after-delivery' || aborted > 0, 'cancel-before-delivery must exercise abort');
+        // A changed reference must not hide a failed native gesture or cancellation.
+        stableHistoryReads(bodies.resources.filter(r=>r.phase===phase), seeds, cell);
+        const report = {name, attempted: attempts.length, completed: attempts.filter(r => r.count?.complete).length, failed: attempts.filter(r => !r.count?.complete && !r.canceled && !state.attempts[r.count!.id!]?.aborted).length, aborted, transportAbortedDelivered: attempts.filter(r => r.count?.complete && state.attempts[r.count!.id!]?.aborted).length, stagingDisposition: 'not-observed', ...totals, finalComplete: true, movement: {tokens: state.tokens.length, poses: state.poses.length, pushes: state.pushes}, requests: attempts.map(r => ({from: r.from, to: r.to, id: r.count!.id, canceled: r.canceled}))};
+        reports.push(report); console.error(`bench: ${name}: ${report.attempted} attempts, ${aborted} aborted, ${totals.byteVerdict} body proof`);
+        break;
+      } catch (error) {
+        console.error(`bench: ${name}: failed at ${stage}; HTTP ${JSON.stringify({active: bodies.activeCount, pending: bodies.pending.size, reads: reads().map(r => ({from: r.from, to: r.to, canceled: r.canceled, complete: r.count?.complete}))})}`);
+        cdp.at(`${name}/failure state`);
+        const state = await cdp.evaluate('({visibility:document.visibilityState,ready:document.readyState,charts:[...document.querySelectorAll(".chart>svg")].map(svg=>({...svg.dataset})),selected:new URLSearchParams(location.search).has("from")})').catch(cause => String(cause));
+        console.error(`bench: ${name}: failure state ${JSON.stringify(state)}`);
+        invalidated.push({...historyCutInvalidation(error,name,take),reads:reads().map(r=>({from:r.from,to:r.to,count:r.count}))});
+      } finally {
+        await observer?.close();
+        cdp.at(`${name}/release shift`);
+        await key('keyUp', 'Shift', 16, 0).catch(() => {}); await close();
+        console.error(`bench: ${name}: page closed`);
       }
-      await step('proxy settled', () => proxy.settled(phase));
-      const attempts = reads(); assert.ok(attempts.every(r => r.count?.id));
-      const totals = bodyTotals(attempts.map(r => ({count: r.count!, transfer: transferFor(r.count!, proxy.transfers)})));
-      stableHistoryReads(bodies.resources.filter(r=>r.phase===phase), seeds, cell);
-      const state = await step('read final state', () => cdp.evaluate<{tokens: string[]; poses: {end: number; origin: number}[]; pushes: number; selected: boolean; attempts: Record<string, {aborted: boolean}>}>('({tokens:__historyTraffic.tokens,poses:__historyTraffic.poses,pushes:__historyTraffic.pushes,selected:new URLSearchParams(location.search).has("from"),attempts:__quotumHistoryAttempts})'));
-      assert.equal(state.tokens.length, 1); assert.ok(state.poses.some(p => p.end < p.origin));
-      assert.equal(state.pushes, mode === 'reversal' ? 1 : 0); assert.equal(state.selected, mode === 'reversal');
-      const aborted = attempts.filter(r => r.canceled || state.attempts[r.count!.id!]?.aborted).length;
-      assert.ok(mode === 'after-delivery' || aborted > 0, 'cancel-before-delivery must exercise abort');
-      const report = {name, attempted: attempts.length, completed: attempts.filter(r => r.count?.complete).length, failed: attempts.filter(r => !r.count?.complete && !r.canceled && !state.attempts[r.count!.id!]?.aborted).length, aborted, transportAbortedDelivered: attempts.filter(r => r.count?.complete && state.attempts[r.count!.id!]?.aborted).length, stagingDisposition: 'not-observed', ...totals, finalComplete: true, movement: {tokens: state.tokens.length, poses: state.poses.length, pushes: state.pushes}, requests: attempts.map(r => ({from: r.from, to: r.to, id: r.count!.id, canceled: r.canceled}))};
-      reports.push(report); console.error(`bench: ${name}: ${report.attempted} attempts, ${aborted} aborted, ${totals.byteVerdict} body proof`);
-    } catch (error) {
-      console.error(`bench: ${name}: failed at ${stage}; HTTP ${JSON.stringify({active: bodies.activeCount, pending: bodies.pending.size, reads: reads().map(r => ({from: r.from, to: r.to, canceled: r.canceled, complete: r.count?.complete}))})}`);
-      cdp.at(`${name}/failure state`);
-      const state = await cdp.evaluate('({visibility:document.visibilityState,ready:document.readyState,charts:[...document.querySelectorAll(".chart>svg")].map(svg=>({...svg.dataset})),selected:new URLSearchParams(location.search).has("from")})').catch(cause => String(cause));
-      console.error(`bench: ${name}: failure state ${JSON.stringify(state)}`);
-      throw error;
-    } finally {
-      await observer?.close();
-      cdp.at(`${name}/release shift`);
-      await key('keyUp', 'Shift', 16, 0).catch(() => {}); await close();
-      console.error(`bench: ${name}: page closed`);
     }
   }
-  return reports;
+  return {reports,invalidated};
 }
 
 /** An instrumented replay diagnoses an earlier failure and never replaces its verdict. */
