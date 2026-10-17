@@ -81,9 +81,17 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: System packages
         if: runner.os == 'Linux'
+        env:
+          RUNNER_ENVIRONMENT: ${{ runner.environment }}
         run: |
           sudo apt-get update
           sudo apt-get install -y libssl-dev libnss3 libgtk-3-dev libgbm1 libasound2 xvfb xauth strace dbus-daemon gnome-keyring python3-gi unzip rpm squashfs-tools bubblewrap socat
+          # The hosted image leaves /usr/share world-writable. Fresh package sources
+          # need trusted ancestry before native hook consent can use them.
+          test "$RUNNER_ENVIRONMENT" = github-hosted
+          test ! -L /usr/share
+          test "$(stat -c %u /usr/share)" = 0
+          sudo chmod go-w /usr/share
       - name: Disposable native QA account (Linux)
         if: runner.os == 'Linux'
         env:
