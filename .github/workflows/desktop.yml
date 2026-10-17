@@ -83,7 +83,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libssl-dev libnss3 libgtk-3-dev libgbm1 libasound2 xvfb xauth strace dbus-daemon gnome-keyring python3-gi unzip rpm squashfs-tools
+          sudo apt-get install -y libssl-dev libnss3 libgtk-3-dev libgbm1 libasound2 xvfb xauth strace dbus-daemon gnome-keyring python3-gi unzip rpm squashfs-tools bubblewrap socat
       - name: Disposable native QA account (Linux)
         if: runner.os == 'Linux'
         env:

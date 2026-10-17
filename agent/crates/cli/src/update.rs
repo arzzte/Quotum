@@ -152,7 +152,9 @@ fn latest(releases: &str) -> Result<String, String> {
     })?;
     let tag = location.trim_end_matches('/').rsplit('/').next().unwrap_or_default();
     let version = tag.strip_prefix('v').unwrap_or(tag);
-    if parts(version).is_none() {
+    if parts(version).is_none()
+        || !version.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'+'))
+    {
         return Err(format!("the latest release is not a version: {location}"));
     }
     Ok(version.to_string())
@@ -445,6 +447,16 @@ mod tests {
         let previous = dir.join(".quotum-hook-payloads").join(CURRENT);
         assert_eq!(fs::read(previous.join("payload-manifest.json")).unwrap(), b"old manifest");
         assert!(!dir.join(".quotum-hook-payloads/999.0.0").exists());
+    }
+
+    #[test]
+    fn a_release_tag_cannot_escape_the_versioned_payload_directory() {
+        let (base, _) = releases("v999.0.0-..\\..\\outside", vec![]);
+        let dir = scratch("unsafe-version");
+        let program = installed(&dir);
+        assert!(update(&base, &program, false, |_, _| true).is_err());
+        assert_eq!(fs::read(program).unwrap(), b"old");
+        assert!(!dir.join(".quotum-hook-payloads").exists());
     }
 
     #[test]

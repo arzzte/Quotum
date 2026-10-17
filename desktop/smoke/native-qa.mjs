@@ -17,6 +17,9 @@ export function launchChecked(actual,receipt,spawn) {validateBoundary(actual,rec
 
 export function checkedBoundary() {
   if(process.platform==='win32') {
+    // pwsh callers can export their v7 module paths to Windows PowerShell 5.
+    // Let the OS shell construct its own compatible built-in module path.
+    const shellEnv=Object.fromEntries(Object.entries(process.env).filter(([key])=>key.toUpperCase()!=='PSMODULEPATH'));
     const script=String.raw`
 $ErrorActionPreference='Stop'
 [Console]::OutputEncoding=[Text.UTF8Encoding]::new($false)
@@ -34,7 +37,7 @@ foreach($part in @($file,(Split-Path $file))) {
 if((Get-Item -LiteralPath $file).Length -gt 4096){throw 'Invalid QA receipt'}
 $actual=@{id=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value;home=[Environment]::GetFolderPath('UserProfile');localAppData=[Environment]::GetFolderPath('LocalApplicationData')}
 @{actual=$actual;receipt=(Get-Content -LiteralPath $file -Raw|ConvertFrom-Json)}|ConvertTo-Json -Depth 10 -Compress`;
-    const {actual,receipt}=JSON.parse(execFileSync('powershell.exe',['-NoProfile','-NonInteractive','-Command',script],{encoding:'utf8',stdio:['ignore','pipe','pipe']}));
+    const {actual,receipt}=JSON.parse(execFileSync('powershell.exe',['-NoProfile','-NonInteractive','-Command',script],{env:shellEnv,encoding:'utf8',stdio:['ignore','pipe','pipe']}));
     return validateBoundary(actual,receipt);
   }
   const file='/etc/quotum-native-qa.json';

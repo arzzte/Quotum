@@ -72,11 +72,11 @@ impl Drop for Tracker {
     }
 }
 impl Tracker {
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn fixture_probe(&mut self, program: &Path, work: &Path) -> Option<Route> {
         self.machine(Key { image: executable_image(program).unwrap(), metadata: Vec::new() }, program, work)
     }
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn fixture_expire(&mut self) {
         self.complete.as_mut().unwrap().due = Instant::now();
     }

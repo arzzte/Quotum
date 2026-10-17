@@ -114,6 +114,10 @@ disposable OS account, verified by `desktop/smoke/native-qa.mjs` before launch. 
 Quotum/XDG profile alone does not isolate consent. In an ephemeral runner, its administrator
 provisions the protected account receipt with `desktop/smoke/provision-native-qa.mjs`.
 Unsafe or unknown local accounts are refused before any native child starts.
+The explicit live-client check is `node desktop/smoke/hook.mjs --claude <executable>`
+in that disposable account, using the release CLI and canonical payloads built first.
+It makes no model request. On Linux, Claude's scrub scenario also requires bubblewrap
+and socat; missing client isolation dependencies fail the check rather than passing it.
 
 `node npm/build-hook.mjs <platform>` is the sole producer of release helper payloads,
 using the targets in `npm/platforms.mjs` with cargo-zigbuild and Zig 0.14.1. npm and desktop

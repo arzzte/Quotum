@@ -16,7 +16,7 @@ function run(program,argv,env={},cwd=account.home) {
   const shim=windows&&program.endsWith('.cmd');
   const output=spawnSync(shim?`"${program}"`:program,argv,{env:{...process.env,...env},cwd,input:'',encoding:'utf8',timeout:20_000,maxBuffer:128*1024,shell:shim});
   assert.equal(output.error,undefined,'native command could not start');
-  assert.equal(output.status,0,'native command did not exit successfully');
+  assert.equal(output.status,0,`native ${path.basename(program)} did not exit successfully (stdout ${Buffer.byteLength(output.stdout??'')} bytes, stderr ${Buffer.byteLength(output.stderr??'')} bytes)`);
   return output;
 }
 function finish(marker) {
@@ -80,6 +80,7 @@ if(args.includes('--finish')) {
       {name:'policy',project:{disableAllHooks:true},env:{},record:false},
     ];
     for(const scene of scenes) {
+      console.log(`Native hook case: ${scene.name}.`);
       writeFileSync(path.join(project,'.claude/settings.json'),JSON.stringify(scene.project));
       const before=new Set(records());
       const output=run(claude,['--init-only',...scene.bare?['--bare']:[]],{...env,...scene.env},project);

@@ -4,6 +4,7 @@ import {writeFileSync,chmodSync} from 'node:fs';
 
 if(!(process.env.GITHUB_ACTIONS==='true'&&process.env.RUNNER_ENVIRONMENT==='github-hosted')&&!process.argv.includes('--disposable-container'))throw new Error('Provision only an explicitly disposable OS environment');
 if(process.platform==='win32') {
+  const shellEnv=Object.fromEntries(Object.entries(process.env).filter(([key])=>key.toUpperCase()!=='PSMODULEPATH'));
   execFileSync('powershell.exe',['-NoProfile','-NonInteractive','-Command',String.raw`
 $ErrorActionPreference='Stop'
 $dir=Join-Path ([Environment]::GetFolderPath('CommonApplicationData')) 'Quotum'
@@ -19,7 +20,7 @@ foreach($path in @($dir,$file)){
   foreach($sid in @('S-1-5-18','S-1-5-32-544')){$acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new($sid),'FullControl','Allow'))}
   $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new('S-1-5-32-545'),'ReadAndExecute','Allow'))
   Set-Acl -LiteralPath $path -AclObject $acl
-}`],{stdio:'inherit'});
+}`],{env:shellEnv,stdio:'inherit'});
 } else {
   if(process.getuid()!==0)throw new Error('The disposable environment administrator must provision the receipt');
   const at=process.argv.indexOf('--user'),user=at<0?undefined:process.argv[at+1];
