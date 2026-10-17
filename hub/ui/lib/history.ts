@@ -15,7 +15,7 @@ import {dropTimeRange, onTimeRange, timeRange, timeRangeKey, type TimeRange} fro
 import type {History} from './types';
 import type {MeterSelection} from '../../server/domain/meterHistory';
 import type {MoneyFamily} from '../../server/domain/providers';
-import {moneySelection} from './moneySelection';
+import {moneyReadSelection} from './moneySelection';
 import {subscriptionSelection} from './subscription';
 import {pan, type Pan} from './pan';
 import {plotPrepared, type Coverage, type PlotBuffer} from './historyPlot';
@@ -28,6 +28,8 @@ const STORED_BYTES = 15 * 1024 * 1024;
 
 export type HistoryEnv = {
   clock?:PageClock;
+  /** Budget work may live outside this reader; quota history also owns activity. */
+  workInPresentation?:boolean;
   read(board: string, cell: number, from: number, to: number, signal?: AbortSignal, meters?: MeterSelection, meta?: HistoryBasis): Promise<HistoryAnswer>;
   now(): number;
   /** Elapsed time stays independent of corrections to the estimated hub clock. */
@@ -86,7 +88,9 @@ export class HistoryStore {
   private scheduled = false;
   private needsCompose = false;
   private readonly listeners = new Set<() => void>();
+  private readonly financialListeners=new Set<()=>void>();
   private state: Shown = {history: null, loading: false,presentation:0};
+  private financialState:Shown=this.state;
   private historyLimit=false;
   private readError=false;
   private interest: PlotInterest | null = null;
@@ -185,7 +189,7 @@ export class HistoryStore {
   }
 
   snapshot(lineup: string[], windows: Iterable<string> = this.windows, historyStart=0,workAuthority?:string,evidence?:string) {
-    const changedWork = this.scope !== 'budget' && this.workAuthority!==undefined&&(!workAuthority||workAuthority!==this.workAuthority);
+    const changedWork = (this.scope !== 'budget'||this.env.workInPresentation!==false&&this.meters?.work) && this.workAuthority!==undefined&&(!workAuthority||workAuthority!==this.workAuthority);
     this.workAuthority = workAuthority;
     const unchanged=evidence!==undefined&&evidence===this.snapshotEvidence;this.snapshotEvidence=evidence;
     if(this.ready&&unchanged&&!changedWork&&this.lineupKey===keyOf(lineup)&&historyStart<=this.historyStart)return;
@@ -275,6 +279,8 @@ export class HistoryStore {
   }
 
   get = () => {if(this.expirePlans())this.publish();return this.state;};
+  getFinancial=()=>{if(this.expirePlans())this.publish();return this.financialState;};
+  subscribeFinancial=(listener:()=>void)=>{this.financialListeners.add(listener);return()=>{this.financialListeners.delete(listener);};};
   getPlot = () => {if(this.expirePlans())this.publish();return this.plot;};
   getDrawingPlot = () => {if(this.expirePlans())this.publish();return this.drawingPlot;};
   subscribePlot = (listener: () => void) => {this.plotListeners.add(listener); return () => void this.plotListeners.delete(listener);};
@@ -376,6 +382,9 @@ export class HistoryStore {
     if (history === this.state.history && loading === this.state.loading&&error===this.state.error&&this.presentation===this.state.presentation) return;
     this.state = {history, loading,presentation:this.presentation,...(error?{error}:{})};
     for (const listener of this.listeners) listener();
+    const prior=this.financialState,old=prior.history;
+    const same=history===old||!!history&&!!old&&history.meterSeries===old.meterSeries&&history.range===old.range&&history.since===old.since&&history.cellMs===old.cellMs&&history.historyStart===old.historyStart;
+    if(!same||loading!==prior.loading||error!==prior.error||this.presentation!==prior.presentation){this.financialState={history:same?old:history,loading,presentation:this.presentation,...(error?{error}:{})};for(const listener of this.financialListeners)listener();}
   }
   private schedulePlanClock(){
     if(this.scope==='budget')return;
@@ -558,10 +567,17 @@ export class HistoryStore {
     const tiles = [...(this.grids.get(target.cell)?.values() ?? [])].filter(t => t.readTo > t.readFrom && t.readTo > target.k0 * target.cell && t.readFrom <= target.k1 * target.cell).sort((a, b) => a.from - b.from);
     const pins = this.pins(tiles);
     const valid = () => !this.interest && this.board === board && this.epoch === epoch && this.version === version && this.windows === windows && this.composeIdentity === identity && this.target().key === target.key && this.pinsValid(pins);
+    const owner=this;
     const work = function* (): Preparation<History> {
       const chunks: Chunk[] = [];
       for (const {tile} of pins) {chunks.push(yield* tile.chunkPrepared(meta.known,false,target.now)); yield;}
-      return {...yield* composePrepared(chunks, meta, target, windows), board};
+      const history={...yield*composePrepared(chunks,meta,target,windows),board},previous=owner.shown?.meterSeries;
+      if(owner.meters?.work&&history.meterSeries&&previous){
+        const stable=new Map(previous.map(series=>[JSON.stringify([series.sourceId,series.meterId,series.kind,series.unit]),series]));
+        for(let i=0;i<history.meterSeries.length;i++){const next=history.meterSeries[i],old=stable.get(JSON.stringify([next.sourceId,next.meterId,next.kind,next.unit]));if(old&&JSON.stringify(old)===JSON.stringify(next))history.meterSeries[i]=old;yield;}
+        if(history.meterSeries.length===previous.length&&history.meterSeries.every((series,i)=>series===previous[i]))history.meterSeries=previous;
+      }
+      return history;
     };
     prepare(this.composeOwner, work(), valid, history => {
       for (const {tile} of pins) tile.shownAt = this.env.now();
@@ -917,7 +933,8 @@ const keyOf = (lineup: string[]) => JSON.stringify([...lineup].sort());
 export {historyPool} from './historyPool';
 function reader(scope: HistoryScope, family: MoneyFamily = 'budget') {
   const value=new HistoryStore({
-    read: (_board, cell, from, to, signal, meters, meta) => boardPeriod.transport.read(family==='funds'?'funds':scope,{cell:String(cell),from:String(from),to:String(to),...(pan.get()?{evidence:'skip'}:{}),meta:meta?.meta??'',...(meters?{unit:meters.unit,meters:JSON.stringify(meters.ids),...(meters.displayCurrency?{currency:meters.displayCurrency}:{})}:{})},signal).then(reply=>expandHistory(reply,meta)),
+    workInPresentation:scope!=='budget',
+    read: (_board, cell, from, to, signal, meters, meta) => boardPeriod.transport.read(family==='funds'?'funds':scope,{cell:String(cell),from:String(from),to:String(to),...(pan.get()?{evidence:'skip'}:{}),meta:meta?.meta??'',...(meters?{unit:meters.unit,meters:JSON.stringify(meters.ids),...(meters.displayCurrency?{currency:meters.displayCurrency}:{}),...(meters.work?{work:'1'}:{})}:{})},signal).then(reply=>expandHistory(reply,meta)),
     now: hubNow,
     setTimeout: (run, ms) => setTimeout(run, ms),
     clearTimeout: timer => clearTimeout(timer as ReturnType<typeof setTimeout>),
@@ -933,7 +950,7 @@ let shellActive = false;
 const selectedMeters = (state: PageState, scope: HistoryScope, family: MoneyFamily = 'budget') => {
   const board=state.board;if(!board)return undefined;
   const cards=board.lineup.flatMap(id=>board.cards[id]??[]);
-  return scope==='budget'?moneySelection(cards,board.view.hidden,prefs()[family==='funds'?'funds':'money'],board.currencies,family).selection:subscriptionSelection(cards,board.view);
+  return scope==='budget'?moneyReadSelection(cards,board.view,prefs()[family==='funds'?'funds':'money'],board.currencies,family):subscriptionSelection(cards,board.view);
 };
 function activeReaders(state=page.get()) {
   const board=state.board;
@@ -961,7 +978,7 @@ export function follow(loader: HistoryStore, store: Store<PageState, PageEvent>,
       else if (hub.type === 'card'&&scope==='quota') loader.setWindows(windowsOf(state));
       else if (hub.type === 'history') {
         const selected=scope==='budget'?new Set(selectedMeters(state,scope,family)?.ids.map(([source])=>source)):new Set(state.board?.lineup??[]);
-        const changes=hub.data.changes?.filter(change=>change.scope===scope&&selected.has(change.source));
+        const changes=hub.data.changes?.filter(change=>change.scope===scope&&selected.has(change.source)&&(scope!=='budget'||change.workSince===undefined||change.since<change.workSince));
         const workSince = scope==='quota'?hub.data.workSince : undefined;
         if(changes?.length || workSince !== undefined)loader.news(Math.min(...(changes ?? []).map(change=>change.since), workSince ?? Infinity), hub.data.workAuthority);
         else if(!hub.data.changes&&hub.data.sources.some(source=>selected.has(source)))loader.news(hub.data.since, hub.data.workAuthority);
@@ -1006,10 +1023,10 @@ if (typeof window !== 'undefined') {
   };
   onPrefs(chosen);onTimeRange(chosen);chosen();
 }
-function usePeriodHistory(loader:HistoryStore,rolling=false):Shown&{drawing:History|null} {
-  const shown=useSyncExternalStore(loader.subscribe,loader.get,loader.get);
+function usePeriodHistory(loader:HistoryStore,rolling=false,financial=false):Shown&{drawing:History|null} {
+  const shown=useSyncExternalStore(financial?loader.subscribeFinancial:loader.subscribe,financial?loader.getFinancial:loader.get,financial?loader.getFinancial:loader.get);
   const panning=pan.active();
-  const revision=useSyncExternalStore(listener=>boardPeriod.subscribeProjection(loader===fundsHistory?'funds':loader.scope??'quota',listener),()=>boardPeriod.getProjectionRevision(loader===fundsHistory?'funds':loader.scope??'quota'));
+  const revision=useSyncExternalStore(listener=>boardPeriod.subscribeProjection(loader===fundsHistory?'funds':loader.scope??'quota',listener),()=>(financial?boardPeriod.getFinancialProjectionRevision:boardPeriod.getProjectionRevision)(loader===fundsHistory?'funds':loader.scope??'quota'));
   const retained=useRef<{board:string;history:History;deadline:number}|null>(null);
   const now=useClock(at=>{
     const next=Math.min(rolling?frameChangesAt(timeRange(),shown.history?.cellMs??60_000,at)??Infinity:Infinity,retained.current?.deadline??Infinity);
@@ -1021,7 +1038,7 @@ function usePeriodHistory(loader:HistoryStore,rolling=false):Shown&{drawing:Hist
   // Phase bookkeeping runs even when the retained accounting frame stays the
   // same. Only a changed snapshot should render a table or its static measure.
   const read=useMemo(()=>()=>{
-    const shownNow=loader.get(),revisionNow=boardPeriod.getProjectionRevision(loader===fundsHistory?'funds':loader.scope??'quota'),panning=pan.active();
+    const shownNow=(financial?loader.getFinancial:loader.get)(),revisionNow=(financial?boardPeriod.getFinancialProjectionRevision:boardPeriod.getProjectionRevision)(loader===fundsHistory?'funds':loader.scope??'quota'),panning=pan.active();
     const board=page.get().board?.id??'';
     const selected=timeRange(),target=board+':'+(selected?timeRangeKey(selected):prefs().range);
     const inputs=[shownNow,revisionNow,loader,panning,now,board,target],previous=snapshot.current,validAt=hubNow();
@@ -1052,7 +1069,7 @@ function usePeriodHistory(loader:HistoryStore,rolling=false):Shown&{drawing:Hist
     })();
     snapshot.current={inputs,phase:panning,phaseRevision:(previous?.phaseRevision??0)+(previous&&previous.phase!==panning?1:0),value:previous&&shallowEqual(previous.value,value)?previous.value:value};
     return snapshot.current.value;
-  },[shown,revision,loader,now]);
+  },[shown,revision,loader,now,financial]);
   const result=useSyncExternalStore(pan.onPhase,read,read);
   // Rolling totals change with the endpoints; their unchanged drawing evidence
   // must not restart line and stack preparation on the same clock wake.
@@ -1061,6 +1078,7 @@ function usePeriodHistory(loader:HistoryStore,rolling=false):Shown&{drawing:Hist
 }
 export function useHistory(rolling=false) {return usePeriodHistory(quotaHistory,rolling);}
 export function useBudgetHistory(family:MoneyFamily='budget',rolling=false) {return usePeriodHistory(family==='funds'?fundsHistory:budgetHistory,rolling);}
+export function useBudgetFinancialHistory(family:MoneyFamily='budget',rolling=false){return usePeriodHistory(family==='funds'?fundsHistory:budgetHistory,rolling,true);}
 export function useHistoryPlot(): PlotBuffer | null {return useSyncExternalStore(quotaHistory.subscribePlot, quotaHistory.getPlot, quotaHistory.getPlot);}
 export function useBudgetHistoryPlot(family: MoneyFamily = 'budget'): PlotBuffer | null {const reader=family==='funds'?fundsHistory:budgetHistory;return useSyncExternalStore(reader.subscribePlot, reader.getDrawingPlot, reader.getDrawingPlot);}
 /** A fresh answer from either resource family supersedes the board's initial snapshot. */

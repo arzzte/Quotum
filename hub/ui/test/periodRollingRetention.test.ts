@@ -11,6 +11,82 @@ import {drain,Preparations} from '../lib/prepare';
 import {PERIOD_SCOPES} from '../../server/domain/periodRead';
 import type {Meter} from '../../server/domain/meters';
 
+test('financial reuse follows effective retention coverage and native evidence',()=>{
+  const group:MoneyTape={source:'wallet',meter:'balance',displayUnit:'USD',retainedFrom:100,readings:[{id:'balance',at:5000,previousAt:null,kind:'balance',unit:'USD',amount:'1000000',limit:null,resetAt:null,minutes:null,scope:null,label:null,staleAfterMs:1000}],spans:[{from:5000,to:6000,staleAfterMs:1000}]};
+  const tape=(money:MoneyTape):PeriodTape=>({from:0,cut:7000,replaceFrom:0,cursor:'cursor',quota:[],money:[money]});
+  const prior=new PeriodAccounting(tape(group),null),range={from:0,to:7000};
+  const variants=[
+    {name:'retention before evidence',value:{...group,retainedFrom:200},reuse:true,covered:1000},
+    {name:'retention intersects evidence',value:{...group,retainedFrom:5500},reuse:false,covered:500},
+    {name:'retention removes coverage',value:{...group,retainedFrom:6000},reuse:false,covered:0},
+    {name:'availability interruption',value:{...group,spans:[{...group.spans[0],interruptedAt:5800}]},reuse:false,covered:800},
+    {name:'native readings removed',value:{...group,readings:[]},reuse:false,covered:1000},
+    {name:'native spans removed',value:{...group,spans:[]},reuse:false,covered:0},
+  ];
+  for(const {name,value,reuse,covered} of variants){
+    const nextTape=tape(value),next=drain(PeriodAccounting.prepare(nextTape,null,undefined,prior));
+    assert.equal(next.financialAuthority===prior.financialAuthority,reuse,name);
+    assert.deepEqual(next.fixed(range,1000),new PeriodAccounting(nextTape,null).fixed(range,1000),name);
+    assert.equal(next.moneySummary('wallet','balance','USD',range)?.coveredMs,covered,name);
+  }
+  const refreshed=mergeTape(tape(group),tape({...group,retainedFrom:200}));
+  assert.equal(refreshed.money[0].retainedFrom,200,'the tape retains its current cutoff even when the financial index is reusable');
+});
+
+test('financial index reuse releases retired native work evidence from its object graph',()=>{
+  const readings=Array.from({length:10000},(_,i)=>({id:'usage',at:i*2*M,previousAt:i?(i-1)*2*M:null,kind:'counter' as const,unit:'USD',amount:'0',limit:null,resetAt:null,minutes:null,scope:null,label:null,staleAfterMs:4*M}));
+  const spans=[{from:0,to:readings.at(-1)!.at,observedFrom:0,staleAfterMs:4*M}];
+  const counter={source:'wallet',unit:'USD',knownFrom:0,workFrom:0,readings,spans};
+  const tape:PeriodTape={from:0,cut:20000*M,replaceFrom:0,cursor:'cursor',quota:[],money:[{source:'wallet',meter:'balance',role:'total',readings:[{...readings[0],id:'balance',kind:'balance',amount:'1000000'}],spans,workCounter:counter}]};
+  const prior=drain(PeriodAccounting.prepare(tape,null)),kept=drain(retainTape(tape,readings.at(-10)!.at));
+  const next=drain(PeriodAccounting.prepare(kept,null,undefined,prior));
+  assert.equal(kept.money[0].workCounter!.readings.length,11);
+  assert.equal(next.financialAuthority,prior.financialAuthority,'native work retirement preserves the financial index');
+  const seen=new Set<object>(),pending:unknown[]=[next];let oldEvidence=false;
+  while(pending.length){
+    const value=pending.pop();if(!value||typeof value!=='object'||seen.has(value))continue;
+    if(value===counter||value===readings){oldEvidence=true;break;}seen.add(value);
+    if(value instanceof Map)for(const [key,item] of value){pending.push(key,item);}
+    else if(!ArrayBuffer.isView(value))pending.push(...Object.values(value));
+  }
+  assert.equal(oldEvidence,false,'the current accounting graph cannot retain the discarded native ledger');
+  const range={from:kept.from,to:kept.cut};
+  assert.deepEqual(next.moneySummary('wallet','balance','USD',range),new PeriodAccounting(kept,null).moneySummary('wallet','balance','USD',range));
+});
+
+test('a complete replacement reuses unchanged financial rows and discards every absent anchor and series',()=>{
+  const reading=(at:number)=>({id:'balance',at,previousAt:null,kind:'balance' as const,unit:'USD',amount:'1000000',limit:null,resetAt:null,minutes:null,scope:null,label:null,staleAfterMs:1000});
+  const group:MoneyTape={source:'wallet',meter:'balance',readings:[reading(0)],spans:[{from:0,to:100,staleAfterMs:1000}]};
+  for(const at of [0,100])bindRate(group,'USD\n'+at,null);
+  const before:PeriodTape={from:0,cut:101,replaceFrom:0,cursor:'old',quota:[],money:[group]};
+  const baseline=structuredClone(before);baseline.cursor='new';
+  const merged=mergeTape(before,baseline);
+  assert.equal(merged.money[0].readings,group.readings);assert.equal(merged.money[0].spans,group.spans);
+  assert.equal(merged.money[0].rateBindings,group.rateBindings);
+  const prior=new PeriodAccounting(before,null),next=drain(PeriodAccounting.prepare(merged,null,undefined,prior));
+  assert.equal(next.financialAuthority,prior.financialAuthority);
+
+  const obsolete=structuredClone(before);obsolete.from=10;
+  obsolete.money.push({...group,source:'removed'});
+  obsolete.quota=[{source:'removed',window:'weekly',samples:[]}];
+  obsolete.money[0].readings.unshift(reading(-100));bindRate(obsolete.money[0],'USD\n-100',null);
+  const clean=mergeTape(obsolete,baseline);
+  assert.equal(clean.from,baseline.from);assert.deepEqual(clean.quota,baseline.quota);
+  assert.deepEqual(JSON.parse(JSON.stringify(clean.money)),baseline.money,'a full baseline cannot restore an old anchor, rate or source');
+});
+
+test('unchanged monetary rows retain their minimal rate dictionary without copying it',()=>{
+  const group:MoneyTape={source:'wallet',meter:'balance',readings:[{id:'balance',at:0,previousAt:null,kind:'balance',unit:'USD',amount:'1000000',limit:null,resetAt:null,minutes:null,scope:null,label:null,staleAfterMs:1000}],spans:[{from:0,to:100,staleAfterMs:1000}]};
+  for(const at of [0,100])bindRate(group,'USD\n'+at,null);
+  const tape:PeriodTape={from:0,cut:101,replaceFrom:0,cursor:'cursor',quota:[],money:[group]};
+  let scratch=0;const kept=drain(retainTape(tape,50,bytes=>{scratch+=bytes;}));
+  assert.equal(kept,tape);assert.ok(scratch<1024);
+  for(const at of [5,10])bindRate(group,'USD\n'+at,null);
+  const trimmed=drain(retainTape(tape,50));
+  assert.equal(rateAt(trimmed.money[0],'USD\n5'),undefined,'older unreferenced bindings still retire');
+  for(const at of [0,10,100])assert.equal(rateAt(trimmed.money[0],'USD\n'+at),null,'native anchors and the predecessor remain');
+});
+
 test('a superseded money span tail is retired while complete rate transitions remain observable',()=>{
   const path=[{id:'first-proof',source:'manual',base:'USD',date:0,fetchedAt:0,from:'1000000',to:'2000000'}];
   const group=(to:number):MoneyTape=>({source:'wallet',meter:'balance',displayUnit:'EUR',readings:[{id:'balance',at:0,previousAt:null,kind:'balance',unit:'USD',amount:'9007199254741000',limit:null,resetAt:null,minutes:null,scope:null,label:null,staleAfterMs:1000}],spans:[{from:0,to,observedFrom:0,staleAfterMs:1000}]});
