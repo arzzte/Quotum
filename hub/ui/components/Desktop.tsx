@@ -1,4 +1,4 @@
-import {useRef, useState} from 'react';
+import {useLayoutEffect, useRef, useState} from 'react';
 import {stamp} from '../lib/format';
 import {PROVIDERS} from '../lib/providers';
 import {errorText} from '../lib/quota';
@@ -299,23 +299,33 @@ export function Measuring({state, onState}: {state: AppState; onState: (state: A
 
 function ClaudeHook({state,onState}:{state:AppState;onState:(state:AppState)=>void}) {
   const [busy,setBusy]=useState(false),[error,setError]=useState(false);
+  const pending=useRef(false);
+  const primary=useRef<HTMLButtonElement>(null),focusedAction=useRef<HTMLButtonElement|null>(null);
   const hook=state.claudeHook!,status=hook.status.state;
   const code=hook.error??hook.status.code;
   const on=status==='enabled_no_records'||status==='observing'||status==='update_pending'||status==='remove_pending';
-  const change=async()=>{
-    if(busy)return;
+  useLayoutEffect(()=>{
+    if(busy||!focusedAction.current)return;
+    const previous=focusedAction.current;focusedAction.current=null;
+    // The error-only removal action vanishes on success; keep focus in the control.
+    if(!previous.isConnected&&document.activeElement===document.body)primary.current?.focus();
+  },[busy,status]);
+  const change=async(wanted:boolean,trigger:HTMLButtonElement)=>{
+    if(pending.current)return;
+    pending.current=true;
+    focusedAction.current=document.activeElement===trigger?trigger:null;
     setBusy(true);setError(false);
-    try {onState(await app.setClaudeHook(!on));}
+    try {onState(await app.setClaudeHook(wanted));}
     catch {setError(true);}
-    finally {setBusy(false);}
+    finally {pending.current=false;setBusy(false);}
   };
   return <div className="settings-section">
     <h4>{t('hook.title')}</h4>
     <p className="drawer-note">{t('hook.consent')}</p>
     <ul className="settings-list"><li className="settings-list-row">
       <div className="settings-item-main">{t(`hook.status.${status}`)}</div><span/>
-      <div className="settings-item-actions"><button type="button" className="button" disabled={busy} aria-busy={busy} onClick={()=>void change()}>{t(on?'hook.disable':'hook.enable')}</button>
-        {status==='error'&&<button type="button" className="button" disabled={busy} onClick={()=>{setBusy(true);void app.setClaudeHook(false).then(onState,()=>setError(true)).finally(()=>setBusy(false));}}>{t('hook.disable')}</button>}
+      <div className="settings-item-actions"><button ref={primary} type="button" className="button" aria-disabled={busy||undefined} aria-busy={busy} onClick={event=>void change(!on,event.currentTarget)}>{t(on?'hook.disable':'hook.enable')}</button>
+        {status==='error'&&<button type="button" className="button" aria-disabled={busy||undefined} aria-busy={busy} onClick={event=>void change(false,event.currentTarget)}>{t('hook.disable')}</button>}
       </div>
     </li></ul>
     {(code||status==='error'||error)&&<p className="form-error" role="alert">{t(code==='untrusted_payload'||code==='unsafe_path'?'hook.safeInstall':'hook.failed')}</p>}
