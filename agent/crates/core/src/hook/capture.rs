@@ -21,11 +21,7 @@ pub(super) struct Record {
 
 /// Silence is established before even argv or environment are inspected.
 pub fn run() {
-    if !silence() {
-        return;
-    }
-    std::panic::set_hook(Box::new(|_| {}));
-    let _ = std::panic::catch_unwind(|| {
+    silently(|| {
         let mut args = std::env::args_os().skip(1);
         if args.next().as_deref() != Some(std::ffi::OsStr::new("--generation")) {
             return;
@@ -39,6 +35,13 @@ pub fn run() {
         };
         let _ = capture(&root, &generation, std::io::stdin().lock());
     });
+}
+fn silently(observe: impl FnOnce() + std::panic::UnwindSafe) {
+    if !silence() {
+        return;
+    }
+    std::panic::set_hook(Box::new(|_| {}));
+    let _ = std::panic::catch_unwind(observe);
 }
 
 fn capture(root: &Path, generation: &str, input: impl Read) -> Result<()> {
@@ -63,11 +66,12 @@ fn capture_with(
     }
     let session_id = event.get("session_id").and_then(|v| v.as_str()).filter(|v| valid_uuid(v)).map(str::to_owned);
     let lock = files::Lock::acquire(&root.join("lock"), false)?;
-    let manifest: Manifest = serde_json::from_slice(&files::read(&root.join("manifest.json"), 16 * 1024, true)?)
-        .map_err(|_| ErrorCode::InvalidManifest)?;
+    let manifest = super::Lifecycle { root: root.to_owned() }.manifest()?.ok_or(ErrorCode::InvalidManifest)?;
     if manifest.schema_version != 1
         || !matches!(manifest.stage, Stage::Enabled)
+        || manifest.next_payload.is_some()
         || manifest.installation_generation != generation
+        || !super::settings::contains(&manifest.settings_target, &manifest.entry)?
     {
         return Ok(());
     }
@@ -143,6 +147,11 @@ fn capture_flags(mut env: impl FnMut(&str) -> Option<std::ffi::OsString>) -> Cla
 }
 
 fn base_host(value: &str) -> Option<String> {
+    if !value.get(..7).is_some_and(|v| v.eq_ignore_ascii_case("http://"))
+        && !value.get(..8).is_some_and(|v| v.eq_ignore_ascii_case("https://"))
+    {
+        return None;
+    }
     if value.bytes().any(|b| b.is_ascii_control()) {
         return None;
     }
@@ -171,6 +180,14 @@ pub(super) fn routes(
     manifest: &Manifest,
     sessions: &[crate::activity::Session],
 ) -> Result<std::collections::BTreeMap<(u32, Vec<u8>), Route>> {
+    routes_with(root, manifest, sessions, crate::activity::matches_hook_parent)
+}
+fn routes_with(
+    root: &Path,
+    manifest: &Manifest,
+    sessions: &[crate::activity::Session],
+    mut current_parent: impl FnMut(u32, &[u8]) -> bool,
+) -> Result<std::collections::BTreeMap<(u32, Vec<u8>), Route>> {
     let mut result = std::collections::BTreeMap::new();
     let entries = std::fs::read_dir(root.join("records")).map_err(|_| ErrorCode::FileFailure)?;
     for entry in entries.take(MAX_RECORDS) {
@@ -197,7 +214,7 @@ pub(super) fn routes(
         if !matched {
             continue;
         }
-        if !crate::activity::matches_hook_parent(record.parent_pid, &record.native_birth) {
+        if !current_parent(record.parent_pid, &record.native_birth) {
             continue;
         }
         let key = (record.parent_pid, record.native_birth);
@@ -234,6 +251,90 @@ fn silence() -> bool {
 mod tests {
     use super::*;
     #[test]
+    fn panic_and_accidental_output_are_silent_in_an_isolated_process() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "hook::capture::tests::silence_child", "--nocapture"])
+            .env("QUOTUM_TEST_HOOK_PANIC", "1")
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), "running 1 test");
+        assert!(output.stderr.is_empty());
+    }
+    #[test]
+    fn silence_child() {
+        if std::env::var_os("QUOTUM_TEST_HOOK_PANIC").is_none() {
+            return;
+        }
+        silently(|| {
+            println!("stdout-secret-canary");
+            eprintln!("stderr-secret-canary");
+            panic!("panic-secret-canary");
+        });
+    }
+    #[test]
+    fn readers_match_only_the_current_root_birth_and_merge_conflicting_records() {
+        let f = crate::hook::tests::Fixture::new();
+        f.enable().unwrap();
+        let manifest = f.service.manifest().unwrap().unwrap();
+        let mut session = crate::activity::attribution::corrected_sessions()[0].clone();
+        session.client = crate::clients::ClientId::Claude;
+        session.pid = 42;
+        session.native_birth = Some(vec![1, 2, 3]);
+        let save = |pid, birth, generation, flags| {
+            let record = Record {
+                schema_version: 1,
+                installation_generation: generation,
+                parent_pid: pid,
+                native_birth: birth,
+                session_id: None,
+                flags,
+            };
+            files::atomic(
+                &f.service.root.join("records").join(format!("{}.json", super::super::uuid().unwrap())),
+                &serde_json::to_vec(&record).unwrap(),
+                false,
+            )
+            .unwrap();
+        };
+        // A folded descendant, reused PID and retired installation are never evidence for this root.
+        for (pid, birth, generation) in [
+            (43, vec![1, 2, 3], manifest.installation_generation.clone()),
+            (42, vec![9], manifest.installation_generation.clone()),
+            (42, vec![1, 2, 3], super::super::uuid().unwrap()),
+        ] {
+            save(pid, birth, generation, ClaudeFlags { api_key: true, ..Default::default() });
+        }
+        assert!(
+            routes_with(&f.service.root, &manifest, &[session.clone()], |_, _| panic!(
+                "unmatched record must not inspect native processes"
+            ))
+            .unwrap()
+            .is_empty()
+        );
+        save(
+            42,
+            vec![1, 2, 3],
+            manifest.installation_generation.clone(),
+            ClaudeFlags { api_key: true, ..Default::default() },
+        );
+        assert!(
+            routes_with(&f.service.root, &manifest, &[session.clone()], |_, _| false).unwrap().is_empty(),
+            "a dead or replaced native process is rejected"
+        );
+        for _ in 0..2 {
+            let routes = routes_with(&f.service.root, &manifest, &[session.clone()], |pid, birth| {
+                pid == 42 && birth == [1, 2, 3]
+            })
+            .unwrap();
+            assert_eq!(routes[&(42, vec![1, 2, 3])].class, crate::route::Class::Api);
+        }
+        save(42, vec![1, 2, 3], manifest.installation_generation.clone(), ClaudeFlags::default());
+        let routes = routes_with(&f.service.root, &manifest, &[session], |_, _| true).unwrap();
+        assert_eq!(routes[&(42, vec![1, 2, 3])].class, crate::route::Class::Unknown);
+        f.service.set_enabled(false).unwrap();
+    }
+    #[test]
     fn url_capture_keeps_only_dns_host() {
         for raw in ["https://secret:password@OpenRouter.AI:8443/private?key=secret#secret", "https://OPENROUTER.AI./"] {
             assert_eq!(base_host(raw).as_deref(), Some("openrouter.ai"));
@@ -247,6 +348,7 @@ mod tests {
             "https://host\n/",
             "",
             "https://-host/",
+            "https:api.anthropic.com",
         ] {
             assert!(base_host(raw).is_none());
         }
@@ -340,5 +442,63 @@ mod tests {
         assert!(record.flags.api_key);
         f.service.set_enabled(false).unwrap();
         assert!(!f.service.root.exists());
+    }
+
+    #[test]
+    fn paused_before_lock_cannot_publish_after_off_on_or_relocation() {
+        struct Paused {
+            ready: Option<std::sync::mpsc::Sender<()>>,
+            resume: std::sync::mpsc::Receiver<()>,
+            input: std::io::Cursor<Vec<u8>>,
+        }
+        impl Read for Paused {
+            fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+                if let Some(ready) = self.ready.take() {
+                    ready.send(()).unwrap();
+                    self.resume.recv().unwrap();
+                }
+                self.input.read(bytes)
+            }
+        }
+        for mode in [0, 1, 2] {
+            let f = crate::hook::tests::Fixture::new();
+            f.enable().unwrap();
+            let root = f.service.root.clone();
+            let generation = f.generation();
+            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+            let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+            let helper = std::thread::spawn(move || {
+                capture_with(
+                    &root,
+                    &generation,
+                    Paused {
+                        ready: Some(ready_tx),
+                        resume: resume_rx,
+                        input: std::io::Cursor::new(br#"{"hook_event_name":"SessionStart"}"#.to_vec()),
+                    },
+                    || panic!("retired generation must not capture environment"),
+                    || Some(crate::activity::HookParent::fixture()),
+                )
+            });
+            ready_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+            if mode < 2 {
+                f.service.set_enabled(false).unwrap();
+            }
+            if mode == 1 {
+                f.enable().unwrap();
+            }
+            if mode == 2 {
+                f.service.enable(&f.payload, f.base.join("relocated.json")).unwrap();
+            }
+            resume_tx.send(()).unwrap();
+            let _ = helper.join().unwrap();
+            if mode == 0 {
+                assert!(!f.service.root.exists());
+            } else {
+                assert_eq!(std::fs::read_dir(f.service.root.join("records")).unwrap().count(), 0);
+                f.service.set_enabled(false).unwrap();
+            }
+            assert!(!f.service.root.exists());
+        }
     }
 }

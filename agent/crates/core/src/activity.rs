@@ -44,6 +44,7 @@ const HOLD_MS: u128 = 60_000;
 /// A running client: a coding agent's session on this machine.
 #[derive(Clone, PartialEq)]
 pub struct Session {
+    pub route: Option<crate::route::Route>,
     pub client: ClientId,
     pub pid: u32,
     pub(crate) native_birth: Option<Vec<u8>>,
@@ -933,6 +934,7 @@ impl Activity {
                 folders.push((key.clone(), f.pid));
             }
             result.push(Session {
+                route: None,
                 client: f.client,
                 pid: f.pid,
                 native_birth: root.native_birth.clone(),
@@ -2041,7 +2043,7 @@ mod sys {
     }
 
     pub fn hook_client(pid: u32) -> Option<Vec<u8>> {
-        if !mine(pid) {
+        if !mine(pid) || !crate::hook::same_process_user(pid) {
             return None;
         }
         named_birth(pid, "claude.exe")

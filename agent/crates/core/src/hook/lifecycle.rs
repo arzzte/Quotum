@@ -21,15 +21,50 @@ pub struct Payload {
 impl Payload {
     pub fn bundled() -> Result<Self> {
         let executable = std::env::current_exe().map_err(|_| ErrorCode::UntrustedPayload)?;
-        Self::at(executable.parent().ok_or(ErrorCode::UnsafePath)?)
+        Self::beside(&executable)
+    }
+    pub(super) fn beside(executable: &Path) -> Result<Self> {
+        drop(files::open(executable, false, false, false).map_err(|_| ErrorCode::UntrustedPayload)?);
+        let parent = executable.parent().ok_or(ErrorCode::UnsafePath)?;
+        let versioned = parent.join(".quotum-hook-payloads").join(env!("CARGO_PKG_VERSION"));
+        // A native update leaves the archive's older adjacent sidecar in place.
+        // Prefer the immutable pair staged for this frontend before its replacement.
+        if versioned.join("payload-manifest.json").try_exists().map_err(|_| ErrorCode::UnsafePath)? {
+            return Self::current(&versioned);
+        }
+        if parent.join("payload-manifest.json").try_exists().map_err(|_| ErrorCode::UnsafePath)? {
+            return Self::current(parent);
+        }
+        #[cfg(target_os = "linux")]
+        if executable.file_name().is_some_and(|name| name == "quotum-desktop") {
+            let resources = parent.join("../share/quotum/hook");
+            if resources.join("payload-manifest.json").try_exists().map_err(|_| ErrorCode::UnsafePath)? {
+                return Self::current(&resources);
+            }
+        }
+        Err(ErrorCode::UntrustedPayload)
+    }
+    fn current(directory: &Path) -> Result<Self> {
+        let payload = Self::at(directory)?;
+        if payload.manifest.version != env!("CARGO_PKG_VERSION") {
+            return Err(ErrorCode::UntrustedPayload);
+        }
+        Ok(payload)
     }
     pub(super) fn at(directory: &Path) -> Result<Self> {
+        files::chain(directory).map_err(|_| ErrorCode::UntrustedPayload)?;
+        fn ephemeral(directory: &Path) -> bool {
+            directory.components().any(|part| {
+                let name = part.as_os_str().to_string_lossy();
+                let name = if cfg!(windows) { name.to_ascii_lowercase() } else { name.into_owned() };
+                name == "_npx" || name.starts_with(".mount_")
+            })
+        }
+        if ephemeral(directory) {
+            return Err(ErrorCode::UntrustedPayload);
+        }
         let directory = std::fs::canonicalize(directory).map_err(|_| ErrorCode::UntrustedPayload)?;
-        if directory.components().any(|part| {
-            let name = part.as_os_str().to_string_lossy();
-            name == "_npx" || name.starts_with(".mount_")
-        }) || std::env::var_os("APPDIR").is_some_and(|appdir| directory.starts_with(appdir))
-        {
+        if ephemeral(&directory) || std::env::var_os("APPDIR").is_some_and(|appdir| directory.starts_with(appdir)) {
             return Err(ErrorCode::UntrustedPayload);
         }
         files::chain(&directory).map_err(|_| ErrorCode::UntrustedPayload)?;
@@ -59,7 +94,13 @@ impl Payload {
 }
 
 pub(super) fn platform() -> String {
-    let os = if cfg!(target_os = "macos") { "darwin" } else { std::env::consts::OS };
+    let os = if cfg!(target_os = "macos") {
+        "darwin"
+    } else if cfg!(windows) {
+        "win32"
+    } else {
+        std::env::consts::OS
+    };
     let arch = if cfg!(target_arch = "x86_64") { "x64" } else { "arm64" };
     format!("{os}-{arch}")
 }
@@ -99,6 +140,9 @@ impl Lifecycle {
         files::private_dir_existing(&self.root)?;
         let _lock = files::Lock::acquire(&self.root.join("lock"), false)?;
         let Some(manifest) = self.manifest()? else { return Ok(Status::Off) };
+        if manifest.next_payload.is_some() {
+            return Ok(Status::UpdatePending);
+        }
         match manifest.stage {
             Stage::Removing => Ok(Status::RemovePending),
             Stage::Installing => Ok(Status::UpdatePending),
@@ -108,11 +152,14 @@ impl Lifecycle {
                 }
                 let files = std::fs::read_dir(self.root.join("records")).map_err(|_| ErrorCode::FileFailure)?;
                 let has_record = files.take(capture::MAX_RECORDS).filter_map(std::result::Result::ok).any(|entry| {
-                    let Ok(bytes) = files::read(&entry.path(), capture::RECORD_LIMIT, true) else { return false };
-                    serde_json::from_slice::<serde_json::Value>(&bytes).ok().is_some_and(|v| {
-                        v.get("installationGeneration").and_then(|v| v.as_str())
-                            == Some(&manifest.installation_generation)
-                    })
+                    let path = entry.path();
+                    if path.extension().and_then(|v| v.to_str()) != Some("json")
+                        || !path.file_stem().and_then(|v| v.to_str()).is_some_and(super::valid_uuid)
+                    {
+                        return false;
+                    }
+                    let Ok(file) = files::open(&path, false, false, true) else { return false };
+                    file.metadata().is_ok_and(|meta| meta.len() > 0 && meta.len() <= capture::RECORD_LIMIT as u64)
                 });
                 Ok(if has_record { Status::Observing } else { Status::EnabledNoRecords })
             }
@@ -125,8 +172,10 @@ impl Lifecycle {
         if !self.root.try_exists().map_err(|_| ErrorCode::UnsafePath)? {
             return Ok(Status::Off);
         }
-        let lock = files::Lock::acquire(&self.root.join("lock"), false)?;
-        let Some(manifest) = self.manifest()? else { return Ok(Status::Off) };
+        files::private_dir_existing(&self.root)?;
+        let lock = files::Lock::acquire(&self.root.join("lock"), true)?;
+        files::clean_temps(&self.root)?;
+        let Some(manifest) = self.manifest()? else { return self.clean_orphan(lock) };
         if matches!(manifest.stage, Stage::Removing) {
             return self.finish_remove(manifest, lock);
         }
@@ -147,9 +196,16 @@ impl Lifecycle {
         files::parents(self.root.parent().ok_or(ErrorCode::UnsafePath)?)?;
         files::private_dir(&self.root)?;
         let lock = files::Lock::acquire(&self.root.join("lock"), true)?;
-        let existing = self.manifest()?;
+        files::clean_temps(&self.root)?;
+        let mut existing = self.manifest()?;
         if existing.as_ref().is_some_and(|m| matches!(m.stage, Stage::Removing)) {
             return Err(ErrorCode::RemovePending);
+        }
+        // Finish a previous relocation before accepting another target: its old
+        // fingerprint must never be lost from the recovery journal.
+        if existing.as_ref().is_some_and(|m| m.previous.is_some() || m.next_payload.is_some()) {
+            self.finish_enable(existing.take().unwrap(), payload, &lock)?;
+            existing = self.manifest()?;
         }
         if let Some(current) = &existing {
             let installed = semver::Version::parse(&current.payload.version).map_err(|_| ErrorCode::InvalidManifest)?;
@@ -160,7 +216,10 @@ impl Lifecycle {
         }
         let mut manifest = match existing {
             Some(mut current) => {
-                if current.settings_target != target {
+                if current.settings_target != target
+                    || matches!(current.stage, Stage::Enabled)
+                        && !super::settings::contains(&current.settings_target, &current.entry)?
+                {
                     current.previous = Some((current.settings_target.clone(), current.entry.clone()));
                     current.settings_target = target;
                     current.installation_generation = super::uuid()?;
@@ -192,6 +251,7 @@ impl Lifecycle {
     }
     fn finish_enable(&self, mut manifest: Manifest, payload: &Payload, lock: &files::Lock) -> Result<()> {
         lock.validate()?;
+        self.clean_temps(&manifest)?;
         files::private_dir(&self.root.join("records"))?;
         let path = self.root.join(super::helper_name());
         let bytes = payload.bytes()?;
@@ -216,6 +276,7 @@ impl Lifecycle {
                 return Err(ErrorCode::Conflict);
             }
             if next > installed {
+                manifest.stage = Stage::Installing;
                 manifest.next_payload = Some(payload.manifest.clone());
                 self.save(&manifest)?;
                 files::atomic(&path, &bytes, true).map_err(|_| ErrorCode::UpdatePending)?;
@@ -244,14 +305,16 @@ impl Lifecycle {
             return Ok(Status::Off);
         }
         files::private_dir_existing(&self.root)?;
-        let lock = files::Lock::acquire(&self.root.join("lock"), false)?;
-        let Some(mut manifest) = self.manifest()? else { return Err(ErrorCode::InvalidManifest) };
+        let lock = files::Lock::acquire(&self.root.join("lock"), true)?;
+        files::clean_temps(&self.root)?;
+        let Some(mut manifest) = self.manifest()? else { return self.clean_orphan(lock) };
         manifest.stage = Stage::Removing;
         self.save(&manifest)?;
         self.finish_remove(manifest, lock)
     }
     fn finish_remove(&self, manifest: Manifest, lock: files::Lock) -> Result<Status> {
         lock.validate()?;
+        self.clean_temps(&manifest)?;
         super::settings::edit(&manifest.settings_target, &manifest.entry, false)?;
         if let Some((target, entry)) = &manifest.previous {
             super::settings::edit(target, entry, false)?;
@@ -273,6 +336,31 @@ impl Lifecycle {
             }
         }
         lock.retire()?;
+        drop(lock);
+        std::fs::remove_dir(&self.root).map_err(|_| ErrorCode::RemovePending)?;
+        Ok(Status::Off)
+    }
+    fn clean_temps(&self, manifest: &Manifest) -> Result<()> {
+        files::clean_temps(&self.root)?;
+        files::clean_temps(&self.root.join("records"))?;
+        files::clean_temps(manifest.settings_target.parent().ok_or(ErrorCode::InvalidManifest)?)?;
+        if let Some((target, _)) = &manifest.previous {
+            files::clean_temps(target.parent().ok_or(ErrorCode::InvalidManifest)?)?;
+        }
+        Ok(())
+    }
+    fn clean_orphan(&self, lock: files::Lock) -> Result<Status> {
+        // With no manifest, only the empty pre-intent/post-removal namespace is known.
+        // Never guess a settings target or delete an unjournalled payload.
+        let entries = std::fs::read_dir(&self.root)
+            .map_err(|_| ErrorCode::FileFailure)?
+            .collect::<std::io::Result<Vec<_>>>()
+            .map_err(|_| ErrorCode::FileFailure)?;
+        if entries.iter().any(|entry| entry.file_name() != "lock") {
+            return Err(ErrorCode::InvalidManifest);
+        }
+        lock.retire()?;
+        drop(lock);
         std::fs::remove_dir(&self.root).map_err(|_| ErrorCode::RemovePending)?;
         Ok(Status::Off)
     }
@@ -321,6 +409,16 @@ impl Lifecycle {
             || !value.settings_target.is_absolute()
             || !valid_hash(&value.payload.sha256)
             || semver::Version::parse(&value.payload.version).is_err()
+            || value.payload.schema_version != 1
+            || value.payload.platform != platform()
+            || value.payload.target != target()
+            || value.next_payload.as_ref().is_some_and(|next| {
+                next.schema_version != 1
+                    || !valid_hash(&next.sha256)
+                    || semver::Version::parse(&next.version).is_err()
+                    || next.platform != platform()
+                    || next.target != target()
+            })
             || value.previous.as_ref().is_some_and(|(target, entry)| {
                 let generation = entry.get("args").and_then(|v| v.get(1)).and_then(|v| v.as_str());
                 !target.is_absolute() || generation.is_none_or(|g| !super::valid_uuid(g) || *entry != self.entry(g))
@@ -339,7 +437,10 @@ impl Lifecycle {
         }
         let _lock = files::Lock::acquire(&self.root.join("lock"), false)?;
         let Some(manifest) = self.manifest()? else { return Ok(Default::default()) };
-        if !matches!(manifest.stage, Stage::Enabled) {
+        if !matches!(manifest.stage, Stage::Enabled)
+            || manifest.next_payload.is_some()
+            || !super::settings::contains(&manifest.settings_target, &manifest.entry)?
+        {
             return Ok(Default::default());
         }
         capture::routes(&self.root, &manifest, sessions)

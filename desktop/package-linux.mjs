@@ -26,6 +26,8 @@ mkdirSync(bin, {recursive: true});
 mkdirSync(share, {recursive: true});
 copyFileSync(path.join(output, 'quotum-desktop'), path.join(bin, 'quotum-desktop'));
 copyFileSync(path.join(here, `binaries/quotum-node-${target}`), path.join(bin, 'quotum-node'));
+cpSync(path.join(here, 'resources/hook'), path.join(share, 'hook'), {recursive: true});
+chmodSync(path.join(share, 'hook/quotum-hook'), 0o755);
 for (const name of ['quotum-desktop', 'quotum-node']) chmodSync(path.join(bin, name), 0o755);
 for (const name of ['hub', 'licenses', 'electron', 'tray']) cpSync(path.join(here, 'resources', name), path.join(share, name), {recursive: true});
 mkdirSync(path.join(share, 'gui'), {recursive: true});

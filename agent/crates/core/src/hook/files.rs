@@ -1,7 +1,9 @@
 //! Checked regular files and one lock shared by the helper and both frontends.
 use super::{ErrorCode, Result};
 use sha2::{Digest, Sha256};
-use std::fs::{self, File, OpenOptions};
+#[cfg(unix)]
+use std::fs::OpenOptions;
+use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
@@ -75,6 +77,7 @@ pub(super) fn private_dir_existing(path: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn io_error(error: std::io::Error) -> ErrorCode {
     if error.kind() == std::io::ErrorKind::NotFound { ErrorCode::NoEntry } else { ErrorCode::FileFailure }
 }
@@ -124,10 +127,6 @@ pub(super) fn identity(file: &File) -> Result<(u64, u64)> {
     use std::os::unix::fs::MetadataExt;
     let meta = file.metadata().map_err(|_| ErrorCode::FileFailure)?;
     Ok((meta.dev(), meta.ino()))
-}
-#[cfg(windows)]
-pub(super) fn identity(file: &File) -> Result<(u64, u64)> {
-    super::windows::identity(file)
 }
 
 pub(super) fn same_name(file: &File, path: &Path) -> Result<()> {
@@ -195,6 +194,27 @@ pub(super) fn atomic(path: &Path, bytes: &[u8], executable: bool) -> Result<()> 
     Temporary::new(path)?.publish(path, bytes, executable)
 }
 
+/// Holding the lifecycle lock proves no current helper/installer owns these names.
+pub(super) fn clean_temps(directory: &Path) -> Result<()> {
+    if !directory.try_exists().map_err(|_| ErrorCode::UnsafePath)? {
+        return Ok(());
+    }
+    chain(directory)?;
+    for entry in fs::read_dir(directory).map_err(|_| ErrorCode::FileFailure)? {
+        let entry = entry.map_err(|_| ErrorCode::FileFailure)?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if !name.strip_prefix(".quotum-").and_then(|v| v.strip_suffix(".tmp")).is_some_and(super::valid_uuid) {
+            continue;
+        }
+        let path = entry.path();
+        let file = open(&path, false, false, false)?;
+        same_name(&file, &path)?;
+        fs::remove_file(&path).map_err(|_| ErrorCode::FileFailure)?;
+    }
+    Ok(())
+}
+
 pub(super) fn publish_record(next: &Path, target: &Path) -> Result<()> {
     #[cfg(unix)]
     {
@@ -203,7 +223,14 @@ pub(super) fn publish_record(next: &Path, target: &Path) -> Result<()> {
         let to = std::ffi::CString::new(target.as_os_str().as_bytes()).map_err(|_| ErrorCode::UnsafePath)?;
         #[cfg(target_os = "linux")]
         let status = unsafe {
-            libc::renameat2(libc::AT_FDCWD, from.as_ptr(), libc::AT_FDCWD, to.as_ptr(), libc::RENAME_NOREPLACE)
+            libc::syscall(
+                libc::SYS_renameat2,
+                libc::AT_FDCWD,
+                from.as_ptr(),
+                libc::AT_FDCWD,
+                to.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
         };
         #[cfg(target_os = "macos")]
         let status = unsafe { libc::renamex_np(from.as_ptr(), to.as_ptr(), libc::RENAME_EXCL) };
@@ -225,10 +252,10 @@ pub(super) fn replace(next: &Path, target: &Path) -> Result<()> {
 pub(super) fn replace(next: &Path, target: &Path) -> Result<()> {
     super::windows::replace(next, target)
 }
-pub(super) fn sync_parent(path: &Path) -> Result<()> {
+pub(super) fn sync_parent(_path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
-        File::open(path.parent().ok_or(ErrorCode::UnsafePath)?)
+        File::open(_path.parent().ok_or(ErrorCode::UnsafePath)?)
             .and_then(|f| f.sync_all())
             .map_err(|_| ErrorCode::FileFailure)?;
     }
@@ -268,7 +295,14 @@ impl Lock {
     }
     pub fn retire(&self) -> Result<()> {
         self.validate()?;
-        fs::remove_file(&self.path).map_err(|_| ErrorCode::RemovePending)
+        #[cfg(unix)]
+        {
+            fs::remove_file(&self.path).map_err(|_| ErrorCode::RemovePending)
+        }
+        #[cfg(windows)]
+        {
+            super::windows::retire_lock(&self.file, &self.path)
+        }
     }
 }
 impl Drop for Lock {

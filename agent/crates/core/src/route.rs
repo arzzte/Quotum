@@ -1,6 +1,8 @@
 //! Route evidence describes funding, never the identity or work of a process.
 
 use serde::{Deserialize, Serialize};
+mod acquisition;
+pub(crate) use acquisition::Tracker;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

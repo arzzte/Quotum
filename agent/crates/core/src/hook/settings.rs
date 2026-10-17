@@ -12,7 +12,7 @@ pub(super) fn target() -> Result<PathBuf> {
             }
             #[cfg(windows)]
             {
-                dirs::home_dir().ok_or(ErrorCode::UnsafePath)?.join(".claude")
+                super::windows::profile()?.join(".claude")
             }
         }
     };
@@ -24,6 +24,12 @@ pub(super) fn target() -> Result<PathBuf> {
 pub(super) fn canonical_target(path: &Path, create: bool) -> Result<PathBuf> {
     if !path.is_absolute() {
         return Err(ErrorCode::UnsafePath);
+    }
+    let parent = path.parent().ok_or(ErrorCode::UnsafePath)?;
+    if create {
+        files::parents(parent)?;
+    } else {
+        files::chain(parent)?;
     }
     let target = if std::fs::symlink_metadata(path).is_ok() {
         std::fs::canonicalize(path).map_err(|_| ErrorCode::UnsafePath)?
@@ -61,6 +67,9 @@ fn read(path: &Path) -> Result<(Option<std::fs::File>, Vec<u8>, serde_json::Valu
     Ok((file, bytes, value))
 }
 pub(super) fn contains(path: &Path, entry: &serde_json::Value) -> Result<bool> {
+    if !path.try_exists().map_err(|_| ErrorCode::UnsafePath)? {
+        return Ok(false);
+    }
     let (_, _, value) = read(path)?;
     Ok(value.get("hooks").and_then(|v| v.get("SessionStart")).and_then(|v| v.as_array()).is_some_and(|groups| {
         groups
@@ -69,6 +78,9 @@ pub(super) fn contains(path: &Path, entry: &serde_json::Value) -> Result<bool> {
     }))
 }
 pub(super) fn edit(path: &Path, entry: &serde_json::Value, on: bool) -> Result<()> {
+    if !on && !path.try_exists().map_err(|_| ErrorCode::UnsafePath)? {
+        return Ok(());
+    }
     let target = canonical_target(path, on)?;
     let (original, bytes, mut value) = read(&target)?;
     if !on && original.is_none() {
@@ -89,6 +101,9 @@ pub(super) fn edit(path: &Path, entry: &serde_json::Value, on: bool) -> Result<(
     let mut found = false;
     for group in groups.iter_mut() {
         let Some(handlers) = group.get_mut("hooks").and_then(|v| v.as_array_mut()) else { continue };
+        if handlers.iter().any(|handler| handler.get("command") == entry.get("command") && handler != entry) {
+            return Err(ErrorCode::Conflict);
+        }
         if handlers.contains(entry) {
             found = true;
         }

@@ -291,9 +291,36 @@ export function Measuring({state, onState}: {state: AppState; onState: (state: A
         <SwitchRow on={client.enabled} onChange={enabled => void save({clients: {[client.id]: {enabled}}}, `client.${client.id}`)}>{t('measure.trackClient', {name: client.id === 'opencode' ? 'OpenCode' : PROVIDERS[client.id]?.name ?? client.id})}</SwitchRow>
         <SaveError saving={saving} field={`client.${client.id}`} />
       </div>)}
+      {state.claudeHook && <ClaudeHook state={state} onState={onState} />}
       {idle && <p className="drawer-note">{t('measure.idle')}</p>}
     </section>
   );
+}
+
+function ClaudeHook({state,onState}:{state:AppState;onState:(state:AppState)=>void}) {
+  const [busy,setBusy]=useState(false),[error,setError]=useState(false);
+  const hook=state.claudeHook!,status=hook.status.state;
+  const code=hook.error??hook.status.code;
+  const on=status==='enabled_no_records'||status==='observing'||status==='update_pending'||status==='remove_pending';
+  const change=async()=>{
+    if(busy)return;
+    setBusy(true);setError(false);
+    try {onState(await app.setClaudeHook(!on));}
+    catch {setError(true);}
+    finally {setBusy(false);}
+  };
+  return <div className="settings-section">
+    <h4>{t('hook.title')}</h4>
+    <p className="drawer-note">{t('hook.consent')}</p>
+    <ul className="settings-list"><li className="settings-list-row">
+      <div className="settings-item-main">{t(`hook.status.${status}`)}</div><span/>
+      <div className="settings-item-actions"><button type="button" className="button" disabled={busy} aria-busy={busy} onClick={()=>void change()}>{t(on?'hook.disable':'hook.enable')}</button>
+        {status==='error'&&<button type="button" className="button" disabled={busy} onClick={()=>{setBusy(true);void app.setClaudeHook(false).then(onState,()=>setError(true)).finally(()=>setBusy(false));}}>{t('hook.disable')}</button>}
+      </div>
+    </li></ul>
+    {(code||status==='error'||error)&&<p className="form-error" role="alert">{t(code==='untrusted_payload'||code==='unsafe_path'?'hook.safeInstall':'hook.failed')}</p>}
+    <p className="drawer-note">{t('hook.limits')}</p>
+  </div>;
 }
 
 /** Start at login, which build this is, and quitting. */

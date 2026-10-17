@@ -87,6 +87,43 @@ fn relocation_retires_old_profile_and_generation() {
 }
 
 #[test]
+fn removal_of_the_own_entry_is_off_and_explicit_on_creates_a_new_generation() {
+    let f = Fixture::new();
+    f.enable().unwrap();
+    let manifest = f.service.manifest().unwrap().unwrap();
+    settings::edit(&f.settings, &manifest.entry, false).unwrap();
+    assert_eq!(f.service.status(), Status::Off);
+    assert!(f.service.routes(&[]).unwrap().is_empty());
+    f.enable().unwrap();
+    assert_ne!(f.generation(), manifest.installation_generation);
+    assert_eq!(f.service.status(), Status::EnabledNoRecords);
+    f.service.set_enabled(false).unwrap();
+}
+
+#[test]
+fn a_second_relocation_first_recovers_the_original_targets_fingerprint() {
+    let f = Fixture::new();
+    f.enable().unwrap();
+    let mut manifest = f.service.manifest().unwrap().unwrap();
+    manifest.previous = Some((manifest.settings_target.clone(), manifest.entry.clone()));
+    manifest.settings_target = f.base.join("interrupted.json");
+    manifest.installation_generation = uuid().unwrap();
+    manifest.entry["args"][1] = serde_json::json!(manifest.installation_generation);
+    manifest.stage = Stage::Installing;
+    files::atomic(&f.service.root.join("manifest.json"), &serde_json::to_vec(&manifest).unwrap(), false).unwrap();
+    let final_target = f.base.join("final.json");
+    f.service.enable(&f.payload, final_target.clone()).unwrap();
+    for target in [&f.settings, &manifest.settings_target] {
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&std::fs::read(target).unwrap()).unwrap(),
+            serde_json::json!({})
+        );
+    }
+    assert!(settings::contains(&final_target, &f.service.manifest().unwrap().unwrap().entry).unwrap());
+    f.service.set_enabled(false).unwrap();
+}
+
+#[test]
 fn malformed_and_oversized_settings_are_never_rewritten() {
     for bytes in [b"{broken json".to_vec(), b"[]".to_vec(), vec![b' '; 1024 * 1024 + 1]] {
         let f = Fixture::new();
@@ -161,6 +198,27 @@ fn payload_rejects_npx_appimage_and_unsafe_chain() {
 }
 
 #[test]
+fn updated_frontend_prefers_its_versioned_pair_over_an_old_archive_sidecar() {
+    let f = Fixture::new();
+    let directory = f.payload.path.parent().unwrap();
+    let frontend = directory.join(if cfg!(windows) { "quotum.exe" } else { "quotum" });
+    files::atomic(&frontend, b"synthetic frontend", true).unwrap();
+    assert!(
+        matches!(Payload::beside(&frontend), Err(ErrorCode::UntrustedPayload)),
+        "a stale adjacent payload is refused"
+    );
+    let versions = directory.join(".quotum-hook-payloads").join(env!("CARGO_PKG_VERSION"));
+    files::parents(&versions).unwrap();
+    let current = payload(&versions, env!("CARGO_PKG_VERSION"), b"current helper");
+    assert_eq!(Payload::beside(&frontend).unwrap().path, current.path);
+    std::fs::write(versions.join(helper_name()), b"damaged current helper").unwrap();
+    assert!(
+        matches!(Payload::beside(&frontend), Err(ErrorCode::UntrustedPayload)),
+        "a damaged current pair must not fall back to stale bytes"
+    );
+}
+
+#[test]
 fn lock_never_allows_an_old_waiter_to_mutate_a_new_installation() {
     let f = Fixture::new();
     f.enable().unwrap();
@@ -187,4 +245,61 @@ fn native_parent_order_rejects_pre_first_read_pid_reuse() {
         assert!(!accepts(boot, child, parent_boot, parent));
     }
     // No wall clock enters this decision.
+}
+
+#[test]
+fn recovery_commits_a_replaced_payload_and_never_reenables_remove_intent() {
+    let f = Fixture::new();
+    f.enable().unwrap();
+    let generation = f.generation();
+    let mut manifest = f.service.manifest().unwrap().unwrap();
+    let next =
+        PayloadManifest { version: "1.1.0".into(), sha256: files::hash(b"new helper"), ..manifest.payload.clone() };
+    manifest.next_payload = Some(next);
+    manifest.stage = Stage::Installing;
+    files::atomic(&f.service.root.join("manifest.json"), &serde_json::to_vec(&manifest).unwrap(), false).unwrap();
+    files::atomic(&f.service.root.join(helper_name()), b"new helper", true).unwrap();
+    // An older frontend recovers the committed new bytes without downgrading them.
+    f.enable().unwrap();
+    let mut manifest = f.service.manifest().unwrap().unwrap();
+    assert_eq!(manifest.payload.version, "1.1.0");
+    assert!(manifest.next_payload.is_none());
+    assert_eq!(generation, f.generation());
+    manifest.stage = Stage::Removing;
+    files::atomic(&f.service.root.join("manifest.json"), &serde_json::to_vec(&manifest).unwrap(), false).unwrap();
+    std::fs::remove_file(f.service.root.join(helper_name())).unwrap();
+    assert_eq!(f.service.status(), Status::RemovePending);
+    assert_eq!(f.service.reconcile_existing_consent().unwrap(), Status::Off);
+    assert!(!f.service.root.exists());
+}
+
+#[test]
+fn orphan_lock_and_stale_owned_temps_are_recovered_without_creating_consent() {
+    let f = Fixture::new();
+    files::private_dir(&f.service.root).unwrap();
+    drop(files::Lock::acquire(&f.service.root.join("lock"), true).unwrap());
+    let temp = f.service.root.join(format!(".quotum-{}.tmp", uuid().unwrap()));
+    let mut file = files::open(&temp, true, true, true).unwrap();
+    use std::io::Write;
+    file.write_all(b"incomplete").unwrap();
+    drop(file);
+    assert_eq!(f.service.reconcile_existing_consent().unwrap(), Status::Off);
+    assert!(!f.service.root.exists());
+    assert!(!f.settings.exists());
+}
+
+#[test]
+fn removal_reports_a_modified_own_handler_and_can_finish_after_repair() {
+    let f = Fixture::new();
+    f.enable().unwrap();
+    let original = std::fs::read(&f.settings).unwrap();
+    let mut edited: serde_json::Value = serde_json::from_slice(&original).unwrap();
+    edited["hooks"]["SessionStart"][0]["hooks"][0]["args"] = serde_json::json!(["--generation", "changed"]);
+    std::fs::write(&f.settings, serde_json::to_vec(&edited).unwrap()).unwrap();
+    assert_eq!(f.service.set_enabled(false), Err(ErrorCode::Conflict));
+    assert_eq!(f.service.status(), Status::RemovePending);
+    assert!(f.service.root.join(helper_name()).exists());
+    std::fs::write(&f.settings, original).unwrap();
+    f.service.set_enabled(false).unwrap();
+    assert!(!f.service.root.exists());
 }

@@ -44,7 +44,7 @@ unsafe fn read_wide(pointer: *const u16) -> Result<String> {
     }
     String::from_utf16(unsafe { std::slice::from_raw_parts(pointer, length) }).map_err(|_| ErrorCode::UnsafePath)
 }
-fn wide(path: &Path) -> Result<Vec<u16>, ErrorCode> {
+fn wide(path: &Path) -> Result<Vec<u16>> {
     let mut value: Vec<u16> = path.as_os_str().encode_wide().collect();
     if value.contains(&0) {
         return Err(ErrorCode::UnsafePath);
@@ -64,9 +64,12 @@ struct User {
     data: Vec<usize>,
 }
 impl User {
-    fn new() -> Result<Self, ErrorCode> {
+    fn new() -> Result<Self> {
+        Self::of_process(unsafe { GetCurrentProcess() })
+    }
+    fn of_process(process: HANDLE) -> Result<Self> {
         let mut token: HANDLE = null_mut();
-        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+        if unsafe { OpenProcessToken(process, TOKEN_QUERY, &mut token) } == 0 {
             return Err(ErrorCode::NoAccess);
         }
         let mut length = 0;
@@ -86,7 +89,7 @@ impl User {
     fn sid(&self) -> PSID {
         unsafe { (*(self.data.as_ptr().cast::<TOKEN_USER>())).User.Sid }
     }
-    fn descriptor(&self) -> Result<Descriptor, ErrorCode> {
+    fn descriptor(&self) -> Result<Descriptor> {
         let mut value = null_mut();
         if unsafe { ConvertSidToStringSidW(self.sid(), &mut value) } == 0 {
             return Err(ErrorCode::NoAccess);
@@ -157,7 +160,7 @@ fn trusted_ancestor(sid: PSID, user: &User) -> bool {
             && EqualSid(sid, buffer.as_mut_ptr().cast()) != 0
     }
 }
-fn check_handle(file: &File, private: bool) -> Result<(), ErrorCode> {
+fn check_handle(file: &File, private: bool) -> Result<()> {
     if file.metadata().map_err(|_| ErrorCode::UnsafePath)?.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
         return Err(ErrorCode::UnsafePath);
     }
@@ -226,7 +229,7 @@ enum Mode {
     Create,
     ReadWrite,
 }
-fn handle(path: &Path, mode: Mode, descriptor: Option<&Descriptor>) -> Result<File, ErrorCode> {
+fn handle(path: &Path, mode: Mode, descriptor: Option<&Descriptor>) -> Result<File> {
     let name = wide(path)?;
     let create = matches!(mode, Mode::Create);
     let access = match mode {
@@ -259,7 +262,7 @@ fn handle(path: &Path, mode: Mode, descriptor: Option<&Descriptor>) -> Result<Fi
     }
     Ok(unsafe { File::from_raw_handle(handle.cast()) })
 }
-pub fn check_chain(path: &Path) -> Result<(), ErrorCode> {
+pub fn check_chain(path: &Path) -> Result<()> {
     for ancestor in path.ancestors() {
         let file = handle(ancestor, Mode::Read, None)?;
         if !file.metadata().map_err(|_| ErrorCode::UnsafePath)?.is_dir() {
@@ -269,7 +272,7 @@ pub fn check_chain(path: &Path) -> Result<(), ErrorCode> {
     }
     Ok(())
 }
-pub fn private_directory(path: &Path) -> Result<(), ErrorCode> {
+pub fn private_directory(path: &Path) -> Result<()> {
     check_chain(path.parent().ok_or(ErrorCode::UnsafePath)?)?;
     let descriptor = User::new()?.descriptor()?;
     let attributes = SECURITY_ATTRIBUTES {
@@ -355,6 +358,47 @@ pub fn unlock(file: &File) {
     use windows_sys::Win32::Storage::FileSystem::UnlockFileEx;
     let mut overlapped = unsafe { std::mem::zeroed() };
     unsafe { UnlockFileEx(file.as_raw_handle().cast(), 0, 1, 0, &mut overlapped) };
+}
+pub fn retire_lock(locked: &File, path: &Path) -> Result<()> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FILE_DISPOSITION_INFO_EX,
+        FILE_READ_ATTRIBUTES, FileDispositionInfoEx, SetFileInformationByHandle,
+    };
+    let name = wide(path)?;
+    let raw = unsafe {
+        CreateFileW(
+            name.as_ptr(),
+            DELETE | READ_CONTROL | FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            null(),
+            OPEN_EXISTING,
+            FILE_FLAG_OPEN_REPARSE_POINT,
+            null_mut(),
+        )
+    };
+    if raw == INVALID_HANDLE_VALUE {
+        return Err(ErrorCode::RemovePending);
+    }
+    let file = unsafe { File::from_raw_handle(raw.cast()) };
+    check_regular(&file, true)?;
+    if identity(&file)? != identity(locked)? {
+        return Err(ErrorCode::Conflict);
+    }
+    let info = FILE_DISPOSITION_INFO_EX { Flags: FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS };
+    // POSIX unlink retires the name even while an old, sharing waiter still holds it.
+    // Unsupported filesystems report pending; ordinary delete-on-close is not a pass.
+    if unsafe {
+        SetFileInformationByHandle(
+            raw,
+            FileDispositionInfoEx,
+            (&info as *const FILE_DISPOSITION_INFO_EX).cast(),
+            std::mem::size_of_val(&info) as u32,
+        )
+    } == 0
+    {
+        return Err(ErrorCode::RemovePending);
+    }
+    Ok(())
 }
 pub fn replace(next: &Path, target: &Path) -> Result<()> {
     use windows_sys::Win32::Storage::FileSystem::{MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW};
@@ -454,4 +498,29 @@ pub fn preserve_dacl(next: &Path, target: &Path) -> Result<()> {
         return Err(ErrorCode::UnsafePath);
     }
     Ok(())
+}
+
+pub fn profile() -> Result<PathBuf> {
+    use windows_sys::Win32::{
+        System::Com::CoTaskMemFree,
+        UI::Shell::{FOLDERID_Profile, SHGetKnownFolderPath},
+    };
+    let mut path = null_mut();
+    if unsafe { SHGetKnownFolderPath(&FOLDERID_Profile, 0, null_mut(), &mut path) } < 0 {
+        return Err(ErrorCode::UnsafePath);
+    }
+    let result = unsafe { read_wide(path) }.map(PathBuf::from);
+    unsafe { CoTaskMemFree(path.cast()) };
+    result
+}
+pub fn same_process_user(pid: u32) -> bool {
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
+    let Ok(current) = User::new() else { return false };
+    let process = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if process.is_null() {
+        return false;
+    }
+    let candidate = User::of_process(process);
+    unsafe { CloseHandle(process) };
+    candidate.is_ok_and(|candidate| unsafe { EqualSid(current.sid(), candidate.sid()) } != 0)
 }

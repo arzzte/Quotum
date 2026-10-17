@@ -11,6 +11,10 @@ mod windows;
 
 pub use capture::run;
 pub use lifecycle::{Lifecycle, Payload, Status};
+#[cfg(windows)]
+pub(crate) fn same_process_user(pid: u32) -> bool {
+    windows::same_process_user(pid)
+}
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 

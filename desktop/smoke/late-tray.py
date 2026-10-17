@@ -11,6 +11,8 @@ import tempfile
 
 from gi.repository import Gio, GLib
 
+subprocess.run(['node', str(Path(__file__).with_name('native-qa.mjs'))], check=True)
+
 if os.environ.get('QUOTUM_TEST_PRIVATE_BUS') != '1':
     raise SystemExit('run this check through tray.sh, on its private bus')
 
