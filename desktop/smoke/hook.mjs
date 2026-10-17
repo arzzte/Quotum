@@ -68,7 +68,7 @@ if(args.includes('--finish')) {
     const manifestPath=path.join(root,'manifest.json'),manifest=JSON.parse(readFileSync(manifestPath,'utf8'));
     const settings=JSON.parse(readFileSync(path.join(user,'settings.json'),'utf8'));
     const handler=settings.hooks.SessionStart[0].hooks[0];
-    assert.equal(handler.command,path.join(root,`quotum-hook${suffix}`));
+    assert.equal(path.normalize(handler.command),path.join(root,`quotum-hook${suffix}`));
     assert.deepEqual(handler.args,['--generation',manifest.installationGeneration]);
     const records=()=>readdirSync(path.join(root,'records')).filter(name=>name.endsWith('.json'));
     const canary='QUOTUM_LIVE_SECRET_CANARY';

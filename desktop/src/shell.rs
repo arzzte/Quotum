@@ -296,6 +296,14 @@ pub fn next(ending: Ending, port_retried: bool, exiting: bool, restarts: &mut Re
 /// A new start waits until the one before exited: two would share the database.
 pub fn run_hub(shell: Arc<Shell>) {
     shell.claude_hook.startup();
+    let hook = shell.claude_hook.state();
+    let error = hook.error.or(match hook.status {
+        quotum_core::hook::Status::Error { code } => Some(code),
+        _ => None,
+    });
+    if let Some(code) = error {
+        shell.hub_log.line(&format!("app: Claude hook {code}"));
+    }
     shell.attention.start(&shell);
     let mut restarts = Restarts::default();
     let mut port_retried = false;

@@ -31,7 +31,7 @@ foreach($part in @($file,(Split-Path $file))) {
   if($acl.GetOwner([Security.Principal.SecurityIdentifier]).Value -notin @('S-1-5-18','S-1-5-32-544')){throw 'Untrusted QA receipt owner'}
   foreach($ace in $acl.Access){
     $sid=$ace.IdentityReference.Translate([Security.Principal.SecurityIdentifier]).Value
-    if($ace.AccessControlType -eq 'Allow' -and ([int]$ace.FileSystemRights -band 0xD0156) -ne 0 -and $sid -notin @('S-1-5-18','S-1-5-32-544')){throw 'Writable QA receipt'}
+    if($ace.AccessControlType -eq 'Allow' -and ([int]$ace.FileSystemRights -band 0x500D0156) -ne 0 -and $sid -notin @('S-1-5-18','S-1-5-32-544')){throw 'Writable QA receipt'}
   }
 }
 if((Get-Item -LiteralPath $file).Length -gt 4096){throw 'Invalid QA receipt'}
