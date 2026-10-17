@@ -126,6 +126,17 @@ with tempfile.TemporaryDirectory(prefix='quotum-late-tray-') as directory:
                 child.wait()
             result['exit'] = child.returncode
 
+    hub_log = root / 'app/logs/hub.log'
+    result['hookErrors'] = []
+    if hub_log.exists():
+        for line in hub_log.read_text().splitlines():
+            if 'app: Claude hook ' in line:
+                code = line.rsplit('app: Claude hook ', 1)[1]
+                if code in {'unsafe_path', 'untrusted_payload', 'invalid_manifest', 'invalid_settings',
+                            'conflict', 'busy', 'file_failure', 'no_entry', 'no_access',
+                            'update_pending', 'remove_pending'}:
+                    result['hookErrors'].append(code)
+
     print(result)
     if not (result.get('lateRegistration') and result.get('controllerAlive')
             and result.get('controllerAdvertisedBeforeWatcher')

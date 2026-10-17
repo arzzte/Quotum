@@ -82,6 +82,11 @@ pub(crate) fn matches_hook_parent(pid: u32, birth: &[u8]) -> bool {
     sys::hook_client(pid).is_some_and(|current| current == birth)
 }
 
+pub(crate) fn hook_record_dead(pid: u32, birth: &[u8]) -> bool {
+    // Missing telemetry alone proves nothing; a different native birth cannot return.
+    sys::birth(pid).is_some_and(|current| current != birth) || sys::gone(pid)
+}
+
 #[cfg(any(windows, test))]
 pub(crate) fn hook_parent_order(self_boot: u32, self_sequence: u64, parent_boot: u32, parent_sequence: u64) -> bool {
     self_boot == parent_boot && parent_sequence > 0 && self_sequence > parent_sequence
@@ -2015,9 +2020,25 @@ mod sys {
             let status = query(process, 64, header.0.as_mut_ptr().cast(), 96, &mut returned);
             CloseHandle(process);
             if status < 0 {
+                #[cfg(test)]
+                if pid == std::process::id() {
+                    eprintln!(
+                        "Own fixed telemetry query: NTSTATUS {status:#x}, returned {returned}, header size {}",
+                        u32::from_le_bytes(header.0[..4].try_into().unwrap())
+                    );
+                }
                 return None;
             }
-            telemetry_facts(&header.0, returned, pid)
+            let facts = telemetry_facts(&header.0, returned, pid);
+            #[cfg(test)]
+            if facts.is_none() && pid == std::process::id() {
+                eprintln!(
+                    "Own fixed telemetry validation: returned {returned}, header size {}, matching PID {}",
+                    u32::from_le_bytes(header.0[..4].try_into().unwrap()),
+                    u32::from_le_bytes(header.0[4..8].try_into().unwrap()) == pid
+                );
+            }
+            facts
         }
     }
 
@@ -3056,6 +3077,12 @@ mod tests {
         let before = sys::birth(pid);
         let after = sys::birth(pid);
         assert!(before == after, "native process birth changed during own-process probe");
+        if let Some(birth) = &before {
+            assert!(!hook_record_dead(pid, birth), "a live native birth must survive pruning");
+            let mut replaced = birth.clone();
+            replaced.push(0);
+            assert!(hook_record_dead(pid, &replaced), "a different native birth proves the recorded one ended");
+        }
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         assert!(before.is_some(), "own process must have a native boot and birth token");
         #[cfg(any(target_os = "linux", target_os = "macos"))]

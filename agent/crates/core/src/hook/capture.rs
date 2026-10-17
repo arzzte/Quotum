@@ -175,6 +175,38 @@ fn valid_host(host: &str) -> bool {
         })
 }
 
+/// The caller holds the shared lock. Unknown liveness never authorizes deletion.
+pub(super) fn prune(root: &Path, manifest: &Manifest) -> Result<()> {
+    prune_with(root, manifest, crate::activity::hook_record_dead)
+}
+fn prune_with(root: &Path, manifest: &Manifest, mut dead: impl FnMut(u32, &[u8]) -> bool) -> Result<()> {
+    let entries = std::fs::read_dir(root.join("records")).map_err(|_| ErrorCode::FileFailure)?;
+    for entry in entries.take(MAX_RECORDS) {
+        let entry = entry.map_err(|_| ErrorCode::FileFailure)?;
+        let path = entry.path();
+        if path.extension().and_then(|v| v.to_str()) != Some("json")
+            || !path.file_stem().and_then(|v| v.to_str()).is_some_and(valid_uuid)
+        {
+            continue;
+        }
+        let Ok(file) = files::open(&path, false, false, true) else { continue };
+        let Ok(raw) = files::read_file(&file, RECORD_LIMIT) else { continue };
+        let Ok(record) = serde_json::from_slice::<Record>(&raw) else { continue };
+        if record.schema_version != 1
+            || record.installation_generation != manifest.installation_generation
+            || record.parent_pid == 0
+            || record.native_birth.is_empty()
+            || record.native_birth.len() > 128
+            || !dead(record.parent_pid, &record.native_birth)
+        {
+            continue;
+        }
+        files::same_name(&file, &path)?;
+        std::fs::remove_file(&path).map_err(|_| ErrorCode::FileFailure)?;
+    }
+    Ok(())
+}
+
 pub(super) fn routes(
     root: &Path,
     manifest: &Manifest,
@@ -250,6 +282,77 @@ fn silence() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    #[test]
+    fn both_frontend_status_and_agent_reads_reclaim_finished_standin_records() {
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "hook::capture::tests::silence_child"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        assert!(child.wait().unwrap().success());
+        drop(child);
+        let f = crate::hook::tests::Fixture::new();
+        f.enable().unwrap();
+        let record = Record {
+            schema_version: 1,
+            installation_generation: f.generation(),
+            parent_pid: pid,
+            native_birth: vec![1],
+            session_id: None,
+            flags: ClaudeFlags::default(),
+        };
+        let path = f.service.root.join("records").join(format!("{}.json", super::super::uuid().unwrap()));
+        let raw = serde_json::to_vec(&record).unwrap();
+        files::atomic(&path, &raw, false).unwrap();
+        assert_eq!(f.service.status(), super::super::Status::EnabledNoRecords);
+        assert!(!path.exists(), "both frontends reclaim a positively dead record through shared status");
+        files::atomic(&path, &raw, false).unwrap();
+        assert!(f.service.routes(&[]).unwrap().is_empty());
+        assert!(!path.exists(), "the agent reclaims it even when no current session matches");
+    }
+    #[test]
+    fn pruning_reclaims_only_checked_records_with_positive_native_death_proof() {
+        let f = crate::hook::tests::Fixture::new();
+        f.enable().unwrap();
+        let manifest = f.service.manifest().unwrap().unwrap();
+        let save = |pid, birth: Vec<u8>, generation| {
+            let path = f.service.root.join("records").join(format!("{}.json", super::super::uuid().unwrap()));
+            let record = Record {
+                schema_version: 1,
+                installation_generation: generation,
+                parent_pid: pid,
+                native_birth: birth,
+                session_id: None,
+                flags: ClaudeFlags::default(),
+            };
+            files::atomic(&path, &serde_json::to_vec(&record).unwrap(), false).unwrap();
+            path
+        };
+        let dead = save(41, vec![1], manifest.installation_generation.clone());
+        let replaced = save(42, vec![2], manifest.installation_generation.clone());
+        let live = save(43, vec![3], manifest.installation_generation.clone());
+        let unknown = save(44, vec![4], manifest.installation_generation.clone());
+        let retired = save(45, vec![5], super::super::uuid().unwrap());
+        let invalid = save(46, vec![], manifest.installation_generation.clone());
+        let linked = save(47, vec![7], manifest.installation_generation.clone());
+        let foreign = f.base.join("foreign.json");
+        std::fs::hard_link(&linked, &foreign).unwrap();
+        let lock = files::Lock::acquire(&f.service.root.join("lock"), true).unwrap();
+        prune_with(&f.service.root, &manifest, |pid, birth| {
+            assert!(!birth.is_empty());
+            assert!(![45, 46, 47].contains(&pid), "untrusted or foreign records never authorize a native query");
+            matches!(pid, 41 | 42)
+        })
+        .unwrap();
+        assert!(!dead.exists() && !replaced.exists());
+        for path in [&live, &unknown, &retired, &invalid, &linked, &foreign] {
+            assert!(path.exists());
+        }
+        drop(lock);
+    }
     #[test]
     fn panic_and_accidental_output_are_silent_in_an_isolated_process() {
         let output = std::process::Command::new(std::env::current_exe().unwrap())

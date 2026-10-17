@@ -150,6 +150,7 @@ impl Lifecycle {
                 if !super::settings::contains(&manifest.settings_target, &manifest.entry)? {
                     return Ok(Status::Off);
                 }
+                capture::prune(&self.root, &manifest)?;
                 let files = std::fs::read_dir(self.root.join("records")).map_err(|_| ErrorCode::FileFailure)?;
                 let has_record = files.take(capture::MAX_RECORDS).filter_map(std::result::Result::ok).any(|entry| {
                     let path = entry.path();
@@ -443,6 +444,7 @@ impl Lifecycle {
         {
             return Ok(Default::default());
         }
+        capture::prune(&self.root, &manifest)?;
         capture::routes(&self.root, &manifest, sessions)
     }
 }

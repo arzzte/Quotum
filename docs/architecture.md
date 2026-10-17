@@ -223,8 +223,10 @@ cannot colour an ancestor session.
 One protected per-user copy and channel serve both frontends, independently of their
 Quotum profile overrides. A common lock and installation-generation UUID serialize
 capture, install, update, relocation and removal. A successful Off removes the own
-entry, copy and records; a busy or incomplete removal is reported. Updates are
-monotonic; equal versions with different hashes conflict. Payload paths must be trusted
+entry, copy and records; a busy or incomplete removal is reported.
+Frontends reclaim checked records only when native evidence proves their process ended
+or its PID has a different birth; unknown liveness never authorizes deletion.
+Updates are monotonic; equal versions with different hashes conflict. Payload paths must be trusted
 throughout their chain; AppImage mounts and temporary npm caches cannot enable or
 update the hook, while either frontend may remove an existing installation. Package
 consumers use the same canonical helper bytes for an OS/architecture. Native CLI
