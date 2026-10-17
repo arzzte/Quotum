@@ -536,6 +536,7 @@ impl Runner {
                 };
                 let (project, folder) = names(session.project, session.folder, self.config.projects());
                 Some(RunningSession {
+                    route: None,
                     session_id: session.native_birth.as_deref().and_then(|native| {
                         salt.as_ref().map(|salt| crate::session_identity::identify(salt, session.client, native))
                     }),
@@ -590,6 +591,7 @@ impl Runner {
             };
             let (project, folder) = names(session.project, session.folder, self.config.projects());
             supplemental.push(ClientSession {
+                route: None,
                 client_id: session.client,
                 session_id: session.native_birth.as_deref().and_then(|native| {
                     salt.as_ref().map(|salt| crate::session_identity::identify(salt, session.client, native))
@@ -830,6 +832,7 @@ mod tests {
     #[test]
     fn a_long_list_keeps_the_working_sessions_and_then_the_newest() {
         let session = |working, started_at| RunningSession {
+            route: None,
             session_id: None,
             provider: Provider::Claude,
             account: None,
@@ -940,6 +943,7 @@ mod tests {
     #[test]
     fn a_list_of_running_agents_goes_out_first_on_change_and_then_in_time() {
         let session = |working| RunningSession {
+            route: None,
             session_id: None,
             provider: Provider::Claude,
             account: None,
