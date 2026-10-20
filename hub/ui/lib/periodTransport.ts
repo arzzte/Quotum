@@ -1,13 +1,32 @@
 import type {HistoryReply} from '../../server/domain/history';
-import {PERIOD_SCOPES,type PeriodScope,type HistoryQuery,type PeriodRequest,type PeriodReply} from '../../server/domain/periodRead';
+import {PERIOD_BODY_BYTES,PERIOD_SCOPES,type PeriodScope,type HistoryQuery,type PeriodRequest,type PeriodReply} from '../../server/domain/periodRead';
+import {executableWorkFilters,jsonBytes} from '../../server/domain/dataFilters';
 import {ApiError} from './http';
 import {expandPeriod,type PeriodWireReply} from '../../server/domain/periodWire';
 import type {HistoryPool,HistoryMember} from './historyPool';
 
-export type PeriodIntent={board:string;generation:number;revision:number;proofEpoch?:number;request:PeriodRequest};
-type Demand={scope:PeriodScope;query:HistoryQuery;signal?:AbortSignal;resolve(value:HistoryReply):void;reject(error:unknown):void};
+export type PeriodIntent={board:string;generation:number;resourceGeneration?:number;facetGeneration?:number;revision:number;proofEpoch?:number;request:PeriodRequest};
+type Demand={scope:PeriodScope;query:HistoryQuery;signal?:AbortSignal;activityOnly:boolean;releaseSlot?:()=>void;resolve(value:HistoryReply):void;reject(error:unknown):void};
 type Flight={role:'visible';intent:PeriodIntent;controller:AbortController;demands:Demand[];ownSlot:boolean;extras:boolean;preparing?:boolean};
 const aborted=()=>new DOMException('Aborted','AbortError');
+const cursorKey=(board:string,scope:PeriodScope,query:HistoryQuery)=>JSON.stringify([board,scope,query.meters,query.unit,query.currency,query.sources]);
+
+/** Only fixed summaries carry selected work; native evidence stays shared and immutable. */
+function withoutSelectedWork<T>(value:T,charge:(bytes:number)=>void):T{
+  if(!value||typeof value!=='object')return value;
+  const record=value as Record<string,unknown>;let copy:Record<string,unknown>|undefined;
+  for(const key in record){
+    if(!Object.hasOwn(record,key))continue;
+    const next=key==='selectedWork'?undefined:withoutSelectedWork(record[key],charge);
+    if(key!=='selectedWork'&&next===record[key])continue;
+    if(!copy){
+      let bytes=64;if(Array.isArray(value))bytes+=value.length*8;else for(const field in record)if(Object.hasOwn(record,field))bytes+=32+field.length*2;
+      charge(bytes);copy=(Array.isArray(value)?value.slice():{...record}) as Record<string,unknown>;
+    }
+    if(key==='selectedWork')delete copy[key];else copy[key]=next;
+  }
+  return (copy??value) as T;
+}
 
 /** One event-loop collection combines chart sections with the period's other visible consumers. */
 export class PeriodTransport implements HistoryMember {
@@ -20,7 +39,7 @@ export class PeriodTransport implements HistoryMember {
   private baselineKey='';
   private readonly baselineParts=new Set<string>();
   private readonly cursors=new Map<string,string>();
-  private readonly metadata=new Map<PeriodScope,{board:string;meters?:string;unit?:string;currency?:string;work?:string;tag:string}>();
+  private readonly metadata=new Map<PeriodScope,{board:string;sources?:string;meters?:string;unit?:string;currency?:string;work?:string;tag:string}>();
   constructor(private readonly pool:HistoryPool,private readonly intent:()=>PeriodIntent|null,private readonly receive:(reply:PeriodReply,intent:PeriodIntent,reserve?:(bytes:number)=>boolean)=>void|Promise<void>,
     private readonly send:(board:string,body:PeriodRequest,signal:AbortSignal,reserve:(bytes:number)=>boolean)=>Promise<PeriodReply>,private readonly accessLost:()=>void=()=>{}) {}
   get estimatedBytes(){return 0;}
@@ -30,38 +49,51 @@ export class PeriodTransport implements HistoryMember {
   forgetEvidence(scope?:PeriodScope){if(!scope){this.cursors.clear();this.metadata.clear();}else {for(const key of this.cursors.keys())if(JSON.parse(key)[1]===scope)this.cursors.delete(key);this.metadata.delete(scope);}}
   evidence(){return new Map(this.cursors);}
   restoreEvidence(cursors:ReadonlyMap<string,string>){this.cursors.clear();for(const [key,value] of cursors)this.cursors.set(key,value);}
-  reset(){this.resetEpoch++;this.completed=this.failed=this.baselineKey='';this.baselineParts.clear();this.cursors.clear();this.metadata.clear();for(const flight of this.flights)this.abort(flight);for(const demand of this.queue)demand.reject(aborted());this.queue=[];}
-  retry(){this.failed='';this.change();}
-  read(scope:PeriodScope,query:HistoryQuery,signal?:AbortSignal):Promise<HistoryReply> {
+  reset(){this.resetEpoch++;this.completed=this.failed=this.baselineKey='';this.baselineParts.clear();this.cursors.clear();this.metadata.clear();for(const flight of this.flights)this.abort(flight);for(const demand of this.queue){demand.reject(aborted());demand.releaseSlot?.();}this.queue=[];}
+  retry(){this.completed=this.failed='';this.change();}
+  read(scope:PeriodScope,query:HistoryQuery,signal?:AbortSignal,activityOnly=false,retainSlot?:()=>()=>void):Promise<HistoryReply> {
     return new Promise((resolve,reject)=>{
       if(signal?.aborted){reject(aborted());return;}
-      const demand={scope,query,signal,resolve,reject};this.queue.push(demand);
-      signal?.addEventListener('abort',()=>{reject(aborted());this.queue=this.queue.filter(d=>d!==demand);for(const flight of this.flights)if(flight.demands.includes(demand)&&flight.demands.every(d=>d.signal?.aborted)&&!flight.extras)this.abort(flight);this.schedule();},{once:true});
+      const demand={scope,query,signal,activityOnly,releaseSlot:retainSlot?.(),resolve,reject};this.queue.push(demand);
+      signal?.addEventListener('abort',()=>{reject(aborted());if(this.queue.includes(demand))demand.releaseSlot?.();this.queue=this.queue.filter(d=>d!==demand);for(const flight of this.flights)if(flight.demands.includes(demand)&&flight.demands.every(d=>d.signal?.aborted)&&!flight.extras)this.abort(flight);this.schedule();},{once:true});
       this.schedule();
     });
   }
   private schedule(){if(this.scheduled)return;this.scheduled=true;queueMicrotask(()=>queueMicrotask(()=>queueMicrotask(()=>{this.scheduled=false;this.flush();})));}
   // An answer already being prepared still owns its bytes and any borrowed
   // chart slot. Its cancellation settles with that preparation, before reuse.
-  private abort(flight:Flight){flight.controller.abort();if(flight.preparing)return;for(const demand of flight.demands)demand.reject(aborted());this.pool.release(flight);this.flights.delete(flight);}
+  private abort(flight:Flight){flight.controller.abort();if(flight.preparing)return;for(const demand of flight.demands){demand.reject(aborted());demand.releaseSlot?.();}this.pool.release(flight);this.flights.delete(flight);}
   private current(intent:PeriodIntent){const current=this.intent();return current?.board===intent.board&&this.key(current)===this.key(intent);}
-  private retire(){for(const flight of this.flights)if(flight.extras&&!this.current(flight.intent))this.abort(flight);}
+  private resourcesCurrent(intent:PeriodIntent){const current=this.intent();return current?.board===intent.board&&(intent.resourceGeneration===undefined?this.current(intent):current.resourceGeneration===intent.resourceGeneration);}
+  private retire(){for(const flight of this.flights)if(flight.extras&&!this.current(flight.intent)&&!this.resourcesCurrent(flight.intent))this.abort(flight);}
+  private async adopt(reply:PeriodReply,intent:PeriodIntent,flight:Flight,heldBytes=0){
+    flight.preparing=true;
+    await this.receive(reply,intent,bytes=>this.pool.reserve(flight,heldBytes+bytes));
+    if(flight.controller.signal.aborted||!this.current(intent))return false;
+    // Preparation can reject individual sections. Only adopted evidence can name a later delta.
+    for(const scope of PERIOD_SCOPES){const part=reply[scope],query=intent.request[scope];if(query&&part?.state==='complete'){
+      if(part.value.tape)this.cursors.set(cursorKey(intent.board,scope,query),part.value.tape.cursor);
+      if(part.value.meta)this.metadata.set(scope,{board:intent.board,meters:query.meters,unit:query.unit,currency:query.currency,sources:query.sources,work:query.work,tag:part.value.meta});
+    }}
+    return true;
+  }
   private flush() {
     this.retire();
     const intent=this.intent();if(!intent)return;
     const key=this.key(intent);
     if(this.baselineKey!==key){this.baselineKey=key;this.baselineParts.clear();}
-    const cursorKey=(scope:PeriodScope,query:HistoryQuery)=>JSON.stringify([intent.board,scope,query.meters,query.unit,query.currency]);
-    const baseline=PERIOD_SCOPES.some(scope=>intent.request[scope]&&!this.cursors.has(cursorKey(scope,intent.request[scope]!)));
+    const baseline=PERIOD_SCOPES.some(scope=>intent.request[scope]&&!this.cursors.has(cursorKey(intent.board,scope,intent.request[scope]!)));
     // First retain the bounded drawing cells, then its exact evidence. Their full
     // decoded bodies must not coexist while either is still waiting for preparation.
-    const extras=(!baseline||!this.queue.length&&!this.flights.size)&&(!!intent.request.values||!!intent.request.sessions||!!intent.request.quota||!!intent.request.budget||!!intent.request.funds)&&key!==this.completed&&key!==this.failed&&![...this.flights].some(f=>f.extras&&this.key(f.intent)===key);
+    const extras=(!baseline||!this.queue.length&&!this.flights.size)&&(!!intent.request.values||!!intent.request.sessions||!!intent.request.facets||!!intent.request.sourceWork||!!intent.request.quota||!!intent.request.budget||!!intent.request.funds)&&key!==this.completed&&key!==this.failed&&![...this.flights].some(f=>f.extras&&(this.key(f.intent)===key||this.resourcesCurrent(f.intent)));
     if(!this.queue.length&&!extras)return;
     const demands:Demand[]=[];
     for(const scope of PERIOD_SCOPES){const index=this.queue.findIndex(d=>d.scope===scope&&!d.signal?.aborted);if(index!==-1)demands.push(this.queue.splice(index,1)[0]);}
     const flight:Flight={role:'visible',intent,controller:new AbortController(),demands,ownSlot:!demands.length,extras};
     this.flights.add(flight);
-    const body:PeriodRequest={...intent.request,...(!extras?{values:undefined,sessions:undefined,quota:undefined,budget:undefined,funds:undefined}:{}),...Object.fromEntries(demands.map(d=>[d.scope,{...d.query}]))};
+    const body:PeriodRequest={...intent.request,...(!extras?{values:undefined,sessions:undefined,facets:undefined,sourceWork:undefined,quota:undefined,budget:undefined,funds:undefined}:{}),...Object.fromEntries(demands.map(d=>[d.scope,d.activityOnly&&d.scope==='quota'&&!intent.request.quota
+      ?{cell:d.query.cell,from:d.query.from,to:d.query.to,sources:'[]',evidence:'skip',meta:''}
+      :{...d.query}]))};
     const pendingBaseline=(['quota','funds','budget'] as const).filter(scope=>body[scope]&&!this.baselineParts.has(scope));
     const splitBaseline=baseline&&extras&&intent.request.selection.mode==='live';
     const deferredBaseline=splitBaseline&&pendingBaseline.length>1;
@@ -69,49 +101,67 @@ export class PeriodTransport implements HistoryMember {
       // Live ledgers remain independent by family. Compact fixed summaries and
       // changed measurements share one body and its bounded reservation.
       for(const scope of PERIOD_SCOPES)if(scope!==pendingBaseline[0])delete body[scope];
-      for(const part of ['values','sessions'] as const)if(this.baselineParts.has(part))delete body[part];
+      for(const part of ['values','sessions','facets'] as const)if(this.baselineParts.has(part))delete body[part];
     }
     for(const scope of PERIOD_SCOPES){const original=body[scope];if(!original)continue;const query=body[scope]={...original};
-      query.evidence??=!extras?'skip':this.cursors.get(cursorKey(scope,query));
+      query.evidence??=!extras?'skip':this.cursors.get(cursorKey(intent.board,scope,query));
       // Drawing readers own their captured basis. Only our evidence-only sections borrow our token.
       if(extras&&!demands.some(demand=>demand.scope===scope)){
         const prior=this.metadata.get(scope);
-        query.meta??=prior&&prior.board===intent.board&&prior.meters===query.meters&&prior.unit===query.unit&&prior.currency===query.currency&&prior.work===query.work?prior.tag:'';
+        query.meta??=prior&&prior.board===intent.board&&prior.meters===query.meters&&prior.unit===query.unit&&prior.currency===query.currency&&prior.sources===query.sources&&prior.work===query.work?prior.tag:'';
       }
     }
-    const appliedIntent={...intent,request:body};
+    if(body.sourceWork&&!body.quota&&body.budget?.work!=='1')delete body.sourceWork;
+    if(!body.quota&&!body.sessions&&!body.facets&&body.budget?.work!=='1')delete body.workFilter;
+    const activityOnly=demands.some(d=>d.activityOnly&&d.scope==='quota')&&!intent.request.quota;
+    // Empty-source activity has its own metadata. It cannot confirm a native baseline.
+    const appliedIntent={...intent,request:activityOnly?{...body,quota:undefined}:body};
     const resetEpoch=this.resetEpoch;
     const start=()=>{
       if(flight.controller.signal.aborted)return;
-      if(extras&&!this.current(intent)){this.abort(flight);this.schedule();return;}
-      this.send(intent.board,body,flight.controller.signal,bytes=>this.pool.reserve(flight,bytes)).then(async reply=>{
+      if(extras&&!this.current(intent)&&!this.resourcesCurrent(intent)){this.abort(flight);this.schedule();return;}
+      let decodedBytes=0;
+      const response=jsonBytes(body)>PERIOD_BODY_BYTES||body.workFilter&&(body.quota||body.sessions||body.facets||body.budget?.work==='1')&&!executableWorkFilters(body.workFilter)?Promise.reject(new ApiError(413,'history_limit')):this.send(intent.board,body,flight.controller.signal,bytes=>{if(!this.pool.reserve(flight,bytes))return false;decodedBytes=bytes;return true;});
+      response.then(async reply=>{
         if(flight.controller.signal.aborted)return;
         // A→B→A is three generations. Equal target text does not revive the first response.
         const current=this.intent();
+        const evidenceReply=activityOnly?{...reply,quota:undefined}:reply;
         if(current?.generation===intent.generation&&current.revision===intent.revision) {
-          flight.preparing=true;
-          await this.receive(reply,appliedIntent,bytes=>this.pool.reserve(flight,bytes));
+          const adopted=await this.adopt(evidenceReply,appliedIntent,flight);
           if(flight.controller.signal.aborted)return;
-          const latest=this.intent();
-          if(latest?.generation===intent.generation&&latest.revision===intent.revision){if(extras){if(!deferredBaseline)this.completed=key;if(baseline)for(const part of [...PERIOD_SCOPES,'values','sessions'] as const)if(body[part])this.baselineParts.add(part);}
-          for(const scope of PERIOD_SCOPES){const part=reply[scope],query=body[scope];if(query&&part?.state==='complete'){
-            if(part.value.tape)this.cursors.set(cursorKey(scope,query),part.value.tape.cursor);
-            if(part.value.meta)this.metadata.set(scope,{board:intent.board,meters:query.meters,unit:query.unit,currency:query.currency,work:query.work,tag:part.value.meta});
-          }}}
+          if(adopted&&extras){if(!deferredBaseline)this.completed=key;if(baseline)for(const part of [...PERIOD_SCOPES,'values','sessions','facets','sourceWork'] as const)if(appliedIntent.request[part])this.baselineParts.add(part);}
+        }
+        else if(this.resourcesCurrent(intent)){
+          const current=this.intent()!;
+          // A work-filter edit does not revoke source-wide evidence already in flight.
+          // Fixed summaries carry selected direct fields, which await their new cohort.
+          let copiedBytes=0;
+          const charge=(bytes:number)=>{copiedBytes+=bytes;if(!this.pool.reserve(flight,decodedBytes+copiedBytes))throw new ApiError(413,'history_limit');};
+          charge(512);
+          const resources={...evidenceReply,sessions:undefined,facets:undefined};
+          for(const scope of PERIOD_SCOPES){const part=resources[scope];if(part?.state==='complete'){
+            charge(512);
+            const tape=part.value.tape,fixed=withoutSelectedWork(tape?.fixed,charge);
+            resources[scope]={...part,value:{...part.value,chunks:[],...(tape?{tape:{...tape,...(fixed?{fixed}:{})}}:{})}};
+          }}
+          // The captured chart still needs the original body until adoption finishes.
+          await this.adopt(resources,{...current,request:{...appliedIntent.request,sessions:undefined,facets:undefined}},flight,decodedBytes+copiedBytes);
+          if(flight.controller.signal.aborted)return;
         }
         for(const demand of demands) {
-          const part=reply[demand.scope];
+          const part=activityOnly&&demand.scope!=='quota'?evidenceReply[demand.scope]:reply[demand.scope];
           if(part?.state==='complete'){const {tape:_tape,...value}=part.value;demand.resolve(value);}
           else demand.reject(new ApiError(part?.state==='error'&&part.error==='history_limit'?413:400,part?.state==='error'?part.error:'history_failed'));
         }
       }).catch(error=>{
         if(flight.controller.signal.aborted)return;
-        if(error instanceof ApiError&&[401,403,404].includes(error.status))this.accessLost();
-        if(extras){if(!deferredBaseline)this.failed=key;if(baseline&&this.baselineKey===key)for(const part of [...PERIOD_SCOPES,'values','sessions'] as const)if(body[part])this.baselineParts.add(part);}
+        if(error instanceof ApiError&&[401,403,404].includes(error.status)&&this.current(intent))this.accessLost();
+        if(extras){if(!deferredBaseline)this.failed=key;if(baseline&&this.baselineKey===key)for(const part of [...PERIOD_SCOPES,'values','sessions','facets','sourceWork'] as const)if(appliedIntent.request[part])this.baselineParts.add(part);}
         for(const demand of demands)demand.reject(error);
-        if(extras){const current=this.intent();if(current?.generation===intent.generation&&current.revision===intent.revision){const section={state:'error' as const,error:error instanceof ApiError&&error.code==='history_limit'?'history_limit' as const:'unavailable' as const};this.receive({basis:{run:'',revision:'',evaluatedAt:intent.request.evaluatedAt,evidenceCut:0,range:{from:0,to:0}},...Object.fromEntries(PERIOD_SCOPES.filter(scope=>body[scope]).map(scope=>[scope,section])),...(body.values?{values:section}:{}),...(body.sessions?{sessions:section}:{})},appliedIntent);}}
+        if(extras){const current=this.intent();if(current?.generation===intent.generation&&current.revision===intent.revision){const section={state:'error' as const,error:error instanceof ApiError&&error.code==='history_limit'?'history_limit' as const:'unavailable' as const};this.receive({basis:{run:'',revision:'',evaluatedAt:intent.request.evaluatedAt,evidenceCut:0,range:{from:0,to:0}},...Object.fromEntries(PERIOD_SCOPES.filter(scope=>appliedIntent.request[scope]).map(scope=>[scope,section])),...(body.values?{values:section}:{}),...(body.sessions?{sessions:section}:{}),...(body.facets?{facets:section}:{}),...(body.sourceWork?{sourceWork:section}:{})},appliedIntent);}}
       })
-        .finally(()=>{if(flight.controller.signal.aborted)for(const demand of demands)demand.reject(aborted());this.pool.release(flight);this.flights.delete(flight);if(resetEpoch===this.resetEpoch)this.schedule();});
+        .finally(()=>{for(const demand of demands){if(flight.controller.signal.aborted)demand.reject(aborted());demand.releaseSlot?.();}this.pool.release(flight);this.flights.delete(flight);if(resetEpoch===this.resetEpoch)this.schedule();});
     };
     if(flight.ownSlot)this.pool.request(this,flight,start,()=>this.abort(flight));else start();
     if(this.queue.length)this.schedule();

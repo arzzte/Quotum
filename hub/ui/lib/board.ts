@@ -1,3 +1,4 @@
+import {matchesSource,matchesSelection,type DataFilters,type FilterEnvelope} from '../../server/domain/dataFilters';
 import {budgetVisible} from './money';
 import {defaultCurrencyContext,DEFAULT_CURRENCY,type CurrencyContext} from '../../server/domain/currency';
 import {useMemo} from 'react';
@@ -33,6 +34,7 @@ export type Snapshot = {
   board: BoardMeta;
   view: View;
   viewRevision?: number;
+  filtersRevision?:number;filtersAuthority?:string;filters?:FilterEnvelope;
   connectionsRevision?: number;
   historyStart: number;
   workAuthority?: string;
@@ -54,6 +56,7 @@ export type HubEvent =
   | {type: 'hello'; data: {epoch: string}}
   | {type: 'snapshot'; data: Snapshot}
   | {type: 'board'; data: {board: BoardMeta}}
+  | {type:'filters';data:FilterEnvelope}
   | {type: 'view'; data: {view: View; revision?: number}}
   | {type: 'connections'; data: {revision: number}}
   | {type: 'lineup'; data: {sources: string[]}}
@@ -81,6 +84,7 @@ export type BoardState = {
   meta: BoardMeta;
   view: View;
   viewRevision?: number;
+  filtersRevision?:number;filtersAuthority?:string;filters?:FilterEnvelope;
   connectionsRevision?: number;
   historyStart: number;
   workAuthority?: string;
@@ -177,6 +181,7 @@ function snapshot(state: PageState, data: Snapshot): PageState {
     viewRevision: Math.max(old?.viewRevision ?? 0, data.viewRevision ?? 0),
     connectionsRevision: Math.max(old?.connectionsRevision ?? 0, data.connectionsRevision ?? 0),
     historyStart: data.historyStart,
+    filtersRevision:data.filtersRevision,filtersAuthority:data.filtersAuthority,filters:old?.filters&&old.filters.revision===data.filtersRevision&&old.filters.authority===data.filtersAuthority?old.filters:undefined,
     workAuthority: typeof data.workAuthority === 'string' && data.workAuthority ? data.workAuthority : undefined,
     lineup: keep(
       old?.lineup,
@@ -267,6 +272,8 @@ function hub(state: PageState, event: HubEvent): PageState {
       return patch(state, board => set(board, 'cadence', event.data.id, event.data.cadence));
     case 'refresh':
       return patch(state, board => set(board, 'refresh', event.data.id, event.data.refresh));
+    case 'filters':
+      return patch(state,board=>{if(board.filters&&board.filters.revision>event.data.revision)return board;return {...board,filters:keep(board.filters,event.data),filtersRevision:event.data.revision,filtersAuthority:event.data.authority};});
     case 'forecast':
       return patch(state, board => set(board, 'forecast', event.data.id, event.data.forecast));
     case 'mine':
@@ -336,12 +343,12 @@ export const useDevicesRevision = () => usePage(s => s.devicesRevision ?? 0);
 export const useDeviceContact = (device: string, baseline: number | null) => usePage(s => Math.max(s.deviceContacts?.[device] ?? 0,baseline ?? 0) || null);
 export const useHistoryStart = () => usePage(s => s.board?.historyStart ?? null);
 /** Membership only: changing a figure never re-renders the compact list itself. */
-export const useVisibleLimits = () => usePage(s => {
+export const useVisibleLimits = (filters:DataFilters|null) => usePage(s => {
   const b = s.board;
-  if (!b) return NONE;
+  if (!b||!filters) return NONE;
   return b.lineup.filter(id => {
     const card=b.cards[id],periods=card?quotaPeriods(card):[];
-    return !b.view.hidden.includes(`source:${id}`)&&(!!card&&budgetVisible(card)||!periods.length||periods.some(w=>!b.view.windows.includes(`${id}/${w.id}`)));
+    return matchesSource(filters,id)&&!b.view.hidden.includes(`source:${id}`)&&(!!card&&budgetVisible(card)||!periods.length||periods.some(w=>!b.view.windows.includes(`${id}/${w.id}`)&&matchesSelection(filters.windows,[id,w.id])));
   });
 }, shallowEqual);
 export const useLineup = () => usePage(s => s.board?.lineup ?? NONE);
@@ -381,6 +388,9 @@ export type Title = {title: string; provider: string};
 
 /** The names worked out lately, by what they were worked out of: the same object for the same names, whoever asks. */
 const titles = new Map<string, Record<string, Title>>();
+// Private updates share the immutable board; every name reader reuses its derivation.
+const titleInputs = new WeakMap<BoardState, WeakMap<Record<string, string>, Record<string, Title>>>();
+const noTitles: Record<string, Title> = {};
 
 /**
  * Every source of the open board named (`titled`): by the owners when that tells them
@@ -389,8 +399,12 @@ const titles = new Map<string, Record<string, Title>>();
  * name changes.
  */
 export function titlesOf(board: BoardState | null, names: Record<string, string> = board?.view.names ?? {}): Record<string, Title> {
-  const named = (board?.lineup ?? []).flatMap(id => {
-    const card = board!.cards[id];
+  if (!board) return noTitles;
+  let inputs = titleInputs.get(board);
+  const cached = inputs?.get(names);
+  if (cached) return cached;
+  const named = board.lineup.flatMap(id => {
+    const card = board.cards[id];
     return card ? [{id, provider: card.provider, owners: card.owners}] : [];
   });
   const key = JSON.stringify([named, names]);
@@ -401,6 +415,8 @@ export function titlesOf(board: BoardState | null, names: Record<string, string>
     if (titles.size >= 4) titles.delete(titles.keys().next().value!);
     titles.set(key, value);
   }
+  if (!inputs) {inputs = new WeakMap(); titleInputs.set(board, inputs);}
+  inputs.set(names, value);
   return value;
 }
 

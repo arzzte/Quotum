@@ -18,7 +18,7 @@ import {activityCreditProblems, chartProblems, creditRenderProblems, HISTORY_BYT
 import {attachedChrome, findChrome, launchChrome, openTab, type Browser, type Cdp} from './cdp.js';
 import {probeScript, type Reading} from './probe.js';
 import {delta, round, scriptPerSecond, tally, type Metrics} from './report.js';
-import {MARGIN_MS, overviewCards, stillProblems, stillSnapshot, warmUntil} from './still.js';
+import {overviewCards, quietAfter, stillProblems, stillSnapshot, warmUntil} from './still.js';
 import {hear, type Heard} from './stream.js';
 import {frequencyKeys, moneyView, selectMoney} from './controls.js';
 import {panning} from './panning.js';
@@ -451,20 +451,19 @@ async function creditPhase(demo:Demo,stand:Awaited<ReturnType<Demo['run']>>,cdp:
   const quotaAt=Date.now();
   await agent.ingest([stillSnapshot(card,stand.start,quotaAt)],[],quotaAt);
   await deliver('2500',quotaAt-25_000);
-  // A natural reset can reorder the quota table and end a forecast without a credit
-  // update. Reload after a nearby reset, then qualify the whole measured interval.
+  await selectMoney(cdp,[[source,'balance:credits']],'funds');
+  // A reset or the source's hourly forecast timer can change quota independently
+  // of credits. Finish selection, then wait outside those natural boundaries.
   const readCards=()=>overviewCards(path=>owner.get<Snapshot>(path),overview.board.id);
-  const windowMs=4*(2*SHOWN_WITHIN+100),setupUntil=Date.now()+60_000,waits:{from:number;until:number;resets:number[]}[]=[];
+  const windowMs=4*(2*SHOWN_WITHIN+100),setupUntil=Date.now()+60_000,waits:{from:number;until:number;resets:number[];forecasts:number[]}[]=[];
   for(;;) {
     const cards=await readCards(),from=Date.now();
-    const resets=cards.flatMap(card=>card.windows.map(window=>window.resetAt)).filter((at):at is number=>at!==null&&at>=from&&at<=from+windowMs+SHOWN_WITHIN);
-    if(!resets.length)break;
-    const until=Math.max(...resets)+MARGIN_MS;
-    if(until>setupUntil)throw new Stop('credit measurement has no quiet quota interval');
-    waits.push({from,until,resets});
-    await sleep(until-from);
+    const quiet=quietAfter(cards,from,from+windowMs+SHOWN_WITHIN);
+    if(!quiet)break;
+    if(quiet.until>setupUntil)throw new Stop('credit measurement has no quiet quota interval');
+    waits.push({from,...quiet});
+    await sleep(quiet.until-from);
   }
-  await selectMoney(cdp,[[source,'balance:credits']],'funds');
   const qualifiedFrom=Date.now(),qualifiedTo=qualifiedFrom+windowMs;
   const changing=stillProblems(await readCards(),qualifiedFrom,qualifiedTo,source);
   if(changing.length)throw new Stop('credit measurement baseline changes independently: '+changing.join('; '));
@@ -512,10 +511,10 @@ async function moneyPhase(demo:Demo,stand:Awaited<ReturnType<Demo['run']>>,cdp:C
   })()`);
   const record=await owner.post<Credential>('/api/credentials',{provider:'openrouter',secret:MONEY_KEY(1),allowNoExpiry:true});
   const source=record.sourceId!;
+  // The dense panning wallets must not exclude this newly connected account.
+  await selectMoney(cdp, [[source, 'balance']]);
   const shownBy=Date.now()+SHOWN_WITHIN;
   while(!await cdp.evaluate<boolean>(`!!document.querySelector('[data-card="${source}"] [data-money]')`)){if(Date.now()>shownBy)throw new Stop('money card did not appear');await sleep(20);}
-  // The dense panning wallets must not change the single-account update baseline.
-  await selectMoney(cdp, [[source, 'balance']]);
   const readyBy=Date.now()+SHOWN_WITHIN;
   while(!await cdp.evaluate<boolean>(`!!document.querySelector('[data-series="${source} balance"]')`)){if(Date.now()>readyBy)throw new Stop('money chart did not appear');await sleep(20);}
   await cdp.evaluate(`(async () => {
