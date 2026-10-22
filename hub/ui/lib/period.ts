@@ -39,6 +39,8 @@ import type {History} from '../../server/domain/history';
 import {canShift,shifted} from '../../server/domain/periodShift';
 import * as retention from '../../server/domain/periodRetention';
 
+export type ActivityFrame=Omit<History,'series'|'meterSeries'|'moneyWork'>;
+
 type Reading<T>={value:T|null;basis:PeriodBasis|null;loading:boolean;error:string|null};
 type WorkedSession=Omit<RecordedSession,'currentPresence'>&Pick<LiveSession,'currentPresence'>;
 const empty=<T>():Reading<T>=>({value:null,basis:null,loading:false,error:null});
@@ -106,6 +108,7 @@ class BoardPeriod {
   private activity:PeriodActivity|null=null;
   private activityRetained:History['activity']|null=null;
   private readonly tapes=new Map<PeriodScope,{tape:PeriodTape;accounting:PeriodAccounting;generation:number;proofEpoch:number;sourceEpoch?:number;selection:PeriodSelection;rangeKey:string;queryKey:string;basisRange?:PeriodBasis['range']}>();
+  private readonly projectFrames:Partial<Record<PeriodScope,{history:WeakRef<History>;tape:WeakRef<object>;work:WeakRef<object>;activity:WeakRef<PeriodActivity>|null;generation:number;projectionRevision:number;workRangeKey:string;from:number;to:number;value:WeakRef<History>}>>={};
   private readonly projectionRevision={quota:0,budget:0,funds:0};
   private readonly projectionErrors:Partial<Record<PeriodScope,'history_limit'|'history_failed'>>={};
   private readonly projectionListeners={quota:new Set<()=>void>(),budget:new Set<()=>void>(),funds:new Set<()=>void>()};
@@ -170,7 +173,8 @@ class BoardPeriod {
   getProjectionRevision=(scope:PeriodScope)=>this.projectionRevision[scope];
   projectionChangesAt=(scope:PeriodScope,now:number)=>this.selection.mode==='range'?this.tapes.get(scope)?.accounting.changesAt(now,0)??null:null;
   subscribeProjection=(scope:PeriodScope,listener:()=>void)=>{this.projectionListeners[scope].add(listener);return()=>{this.projectionListeners[scope].delete(listener);};};
-  private publishProjection(scopes:readonly PeriodScope[]=PERIOD_SCOPES){for(const scope of scopes){this.projectionRevision[scope]++;for(const listener of this.projectionListeners[scope])listener();}}
+  private publishProjection(scopes:readonly PeriodScope[]=PERIOD_SCOPES){this.forgetProjection(scopes);for(const scope of scopes){this.projectionRevision[scope]++;for(const listener of this.projectionListeners[scope])listener();}}
+  private forgetProjection(scopes:readonly PeriodScope[]=PERIOD_SCOPES){for(const scope of scopes)delete this.projectFrames[scope];}
   /** A discarded prefix cannot supply a new analytical range while replacement waits. */
   private workRange(now:number):PeriodBasis['range']|null {
     if(!this.work.basis)return null;
@@ -182,16 +186,40 @@ class BoardPeriod {
     const range=evaluatedRange(tape.selection,now);
     return range.from>=tape.tape.from?range:tape.basisRange??evaluatedRange(tape.selection,this.evaluatedAt);
   }
-  project(history:History,scope:PeriodScope,now=this.evaluatedAt) {
+  project(history:History,scope:PeriodScope,now=this.evaluatedAt,activityOnly=false) {
+    // Fixed endpoints share one exact frame across widgets. Weak slots leave
+    // its lifetime with the readers that display it.
+    const tape=this.tapes.get(scope),selection=tape?.selection;
+    const fixed=selection?.mode==='range'&&(scope!=='quota'||!this.activity||this.workSelection.mode==='range')?selection:null;
+    if(activityOnly&&scope==='quota'&&!fixed)return this.projectFrame(history,scope,now,true);
+    const entry=this.projectFrames[scope];
+    if(fixed&&entry&&entry.history.deref()===history&&entry.tape.deref()===tape&&entry.work.deref()===this.work&&(entry.activity?.deref()??null)===this.activity&&entry.generation===this.generation&&entry.projectionRevision===this.projectionRevision[scope]&&entry.workRangeKey===this.workRangeKey&&entry.from===fixed.from&&entry.to===fixed.to){
+      const value=entry.value.deref();if(value)return value;
+    }
+    const result=this.projectFrame(history,scope,now);
+    if(fixed&&tape&&typeof WeakRef==='function')this.projectFrames[scope]={history:new WeakRef(history),tape:new WeakRef(tape),work:new WeakRef(this.work),activity:this.activity?new WeakRef(this.activity):null,generation:this.generation,projectionRevision:this.projectionRevision[scope],workRangeKey:this.workRangeKey,from:fixed.from,to:fixed.to,value:new WeakRef(result)};
+    return result;
+  }
+  private projectFrame(history:History,scope:PeriodScope,now=this.evaluatedAt,activityOnly=false) {
     const tape=this.tapes.get(scope);
     let result=history;
-    if(tape?.rangeKey===history.range){const range=this.tapeRange(tape,now),values=new Map<string,PeriodValues>();if(tape.selection.mode==='range')for(const [id,reading] of this.values)if(reading.value&&reading.basis?.range.to===range.to)values.set(id,reading.value);result=tape.accounting.project(history,range,values,false,Math.min(range.to,now));}
+    if(tape?.rangeKey===history.range){
+      const range=this.tapeRange(tape,now);
+      if(activityOnly){
+        const fixed=tape.tape.fixed;
+        const fits=fixed?range.from===fixed.range.from&&range.to===fixed.range.to&&history.cellMs===fixed.cell:!(range.from<tape.tape.from);
+        if(fits)result={...history,exact:true,since:range.from,to:range.to};
+      }else{
+        const values=new Map<string,PeriodValues>();if(tape.selection.mode==='range')for(const [id,reading] of this.values)if(reading.value&&reading.basis?.range.to===range.to)values.set(id,reading.value);
+        result=tape.accounting.project(history,range,values,false,Math.min(range.to,now));
+      }
+    }
     if(scope==='quota'&&this.activity&&this.workRangeKey===history.range&&this.work.basis){const range=this.workRange(now)!;result={...result,since:range.from,to:range.to,activity:this.activity.project(history.activity,range)};}
-    if(scope==='quota'&&this.selectedPending())result={...result,series:result.series.map(series=>({...series,selectedWork:{from:result.to,ms:null,agentMs:0}})),activity:{...result.activity,known:null,activeMs:0,agentMs:0,agents:0,cells:[],by:{source:[],project:[],device:[]}}};
+    if(scope==='quota'&&this.selectedPending())result={...result,...(!activityOnly?{series:result.series.map(series=>({...series,selectedWork:{from:result.to,ms:null,agentMs:0}}))}:{}),activity:{...result.activity,known:null,activeMs:0,agentMs:0,agents:0,cells:[],by:{source:[],project:[],device:[]}}};
     return result;
   }
   private selectedPending(){return !!effectiveFilters()&&(this.workLimit||this.work.loading||!!this.work.error||!this.work.value);}
-  activityAt(history:History,by:import('./types').ActivityDimension,now:number,bar?:number,key?:string,retained=false) {
+  activityAt(history:ActivityFrame,by:import('./types').ActivityDimension,now:number,bar?:number,key?:string,retained=false) {
     let fallback=!retained&&effectiveFilters()&&(this.workLimit||this.work.loading||this.work.error||!this.work.value)?{...history.activity,known:null,activeMs:0,agentMs:0,agents:0,cells:[],by:{source:[],project:[],device:[]}}:history.activity;
     if(bar!==undefined){const cell=fallback.cells.find(([at])=>at===bar);fallback={...fallback,activeMs:cell?.[1]??0,agentMs:cell?.[2]??0,agents:cell?.[3]??0,by:{...fallback.by,[by]:fallback.by[by].map(group=>({...group,agentMs:group.cells.find(([at])=>at===bar)?.[1]??0}))}};}
     if(retained||!this.activity||this.workRangeKey!==history.range||!this.work.basis||this.workSelection.mode==='range')return fallback;
@@ -199,7 +227,7 @@ class BoardPeriod {
     if(bar!==undefined){range.from=Math.max(range.from,bar);range.to=Math.min(range.to,bar+history.activity.barMs);}
     return this.activity.numbers(fallback,range,by,key);
   }
-  activityChangesAt(history:History,by:import('./types').ActivityDimension,now:number,read:(at:number)=>string,key?:string) {
+  activityChangesAt(history:ActivityFrame,by:import('./types').ActivityDimension,now:number,read:(at:number)=>string,key?:string) {
     if(!this.workAdvances(now)||this.workRangeKey!==history.range)return null;
     const period=this.workSelection.mode==='live'?this.workSelection.periodMs:0;
     return periodTextChangesAt(now,at=>this.activity?.changesAt(at,period,by,key)??null,read);
@@ -225,6 +253,10 @@ class BoardPeriod {
     const tape=this.tapes.get('quota');if(!tape||tape.selection.mode!=='live'||rangeKey!==undefined&&tape.rangeKey!==rangeKey)return line;
     const summary=tape.accounting.quotaSummary(line.sourceId,line.windowId,this.tapeRange(tape,now));
     return summary?{...line,...summary,...(this.selectedPending()?{selectedWork:{from:now,ms:null,agentMs:0}}:{})}:line;
+  }
+  quotaSpendingAt(line:Line,now:number,rangeKey?:string):Pick<Line,'consumed'|'coveredMs'> {
+    const tape=this.tapes.get('quota');if(!tape||tape.selection.mode!=='live'||rangeKey!==undefined&&tape.rangeKey!==rangeKey)return line;
+    return tape.accounting.quotaSpendingSummary(line.sourceId,line.windowId,this.tapeRange(tape,now))??line;
   }
   quotaOrderAt(line:Line,now:number,rangeKey:string,active:boolean){
     const tape=this.tapes.get('quota');
@@ -260,15 +292,22 @@ class BoardPeriod {
     return this.index.trace.refs.reduce((sum,ref,i)=>sum+(selected.has(ref.ref)?this.index!.curves.contexts[i].read(range):0),0);
   }
   workedChangesAt(refs:readonly string[],now:number,read:(now:number)=>string){return refs.length?periodTextChangesAt(now,at=>this.workBoundary(at,refs),read):null;}
-  cellChangesAt(scope:PeriodScope,now:number,read:(now:number)=>string,extra?:(now:number)=>number|null,source?:string,rangeKey?:string){
+  cellBasis(scope:PeriodScope):object|undefined{return this.tapes.get(scope);}
+  cellChangesAt(scope:PeriodScope,now:number,read:(now:number)=>string,extra?:(now:number)=>number|null,source?:string,rangeKey?:string,window?:string,initial?:string,kind:'all'|'selectedWork'|'spending'='all'){
     const tape=this.tapes.get(scope);if(!tape||tape.selection.mode!=='live'||rangeKey!==undefined&&tape.rangeKey!==rangeKey)return extra?.(now)??null;
     if(evaluatedRange(tape.selection,now).from<tape.tape.from)return null;
     const period=tape.selection.periodMs;
-    return periodTextChangesAt(now,at=>{const next=Math.min(tape.accounting.changesAt(at,period,source)??Infinity,scope==='quota'?this.workBoundary(at,undefined,source)??Infinity:Infinity,extra?.(at)??Infinity);return Number.isFinite(next)?next:null;},read);
+    return periodTextChangesAt(now,at=>{
+      const scoped=scope==='quota'&&source!==undefined&&window!==undefined;
+      const selected=scoped&&kind==='selectedWork'&&!this.selectedPending()?tape.accounting.quotaSelectedWorkChangesAt(source,window,at,period):undefined;
+      const own=scoped&&kind==='spending'?tape.accounting.quotaSpendingStateChangesAt(source,window,at,period):selected===undefined?(scoped?tape.accounting.quotaChangesAt(source,window,at,period):undefined):selected;
+      const next=Math.min(own===undefined?tape.accounting.changesAt(at,period,source)??Infinity:own??Infinity,own===undefined&&scope==='quota'?this.workBoundary(at,undefined,source)??Infinity:Infinity,extra?.(at)??Infinity);
+      return Number.isFinite(next)?next:null;
+    },read,initial);
   }
-  projectionState(history:History,scope:PeriodScope){const tape=this.tapes.get(scope),range=evaluatedRange(this.selection,this.evaluatedAt);return {ready:!!tape&&tape.queryKey===this.scopeKeys[scope]&&tape.rangeKey===history.range&&this.tapeCovers(tape,range),error:this.projectionErrors[scope]};}
+  projectionState(history:Pick<History,'range'>,scope:PeriodScope){const tape=this.tapes.get(scope),range=evaluatedRange(this.selection,this.evaluatedAt);return {ready:!!tape&&tape.queryKey===this.scopeKeys[scope]&&tape.rangeKey===history.range&&this.tapeCovers(tape,range),error:this.projectionErrors[scope]};}
   /** Native quota readiness cannot confirm a still-pending selected work answer. */
-  activityProjectionState(history:History|null){
+  activityProjectionState(history:ActivityFrame|null){
     const native=history?this.projectionState(history,'quota'):{ready:false,error:undefined};
     const error=this.workLimit?'filters_limit' as const:this.work.error==='history_limit'?'history_limit' as const:this.work.error?'history_failed' as const:native.error;
     return {ready:native.ready&&!this.work.loading&&!error&&!!this.work.value&&!!this.activity&&this.workRangeKey===history?.range,error,retired:!this.work.basis};
@@ -286,7 +325,7 @@ class BoardPeriod {
     const generation=this.calendar.generation;this.calendar.tick(now,checkZone);
     if(generation!==this.calendar.generation&&this.calendar.needed){this.revision++;this.transport.change();}
   }
-  refreshWorkClock=()=>{if(this.evaluatedAt!==hubNow())this.tick();else{this.retireExpired(hubNow());this.scheduleClock();}};
+  refreshWorkClock=()=>{const now=hubNow();if(this.evaluatedAt!==now)this.tick();else{this.retireExpired(now);this.scheduleClock();}};
   subscribeSource=(id:string,listener:()=>void)=>{let set=this.sourceListeners.get(id);if(!set)this.sourceListeners.set(id,set=new Set());set.add(listener);return()=>{set!.delete(listener);};};
   subscribeValue=(id:string,listener:()=>void)=>{let set=this.valueListeners.get(id);if(!set)this.valueListeners.set(id,set=new Set());set.add(listener);return()=>{set!.delete(listener);};};
   private queryKey(query:HistoryQuery,scope?:PeriodScope){const board=page.get().board;return JSON.stringify([query.meters,query.unit,query.currency,query.work,scope==='quota'?query.sources??board?.lineup:scope&&board?.lineup.map(id=>[id,board.cards[id]?.budget])]);}
@@ -324,8 +363,8 @@ class BoardPeriod {
       ...(filters&&this.selection.mode==='live'&&(queries.quota||queries.budget?.work==='1')?{sourceWork:{...(this.sourceCursor?{cursor:this.sourceCursor}:{})}}:{})};
     return {board:board.id,generation:this.generation,resourceGeneration:this.resourceGeneration,facetGeneration:this.facetGeneration,calendarGeneration:this.calendar.generation,revision:this.revision,proofEpoch:this.proofEpoch,request};
   }
-  private setValue(id:string,value:Reading<PeriodValues>){if(value.value&&value.basis&&value.basis.range.to>value.basis.evaluatedAt)value={...value,value:periodValueNow(value.value,Math.min(value.basis.range.to,hubNow()))};this.values.set(id,value);for(const listener of this.valueListeners.get(id)??[])listener();}
-  private publishWork() {this.workState={...this.work,rows:this.workRows,evidence:this.workEvidence,...(this.workLimit?{loading:false,error:'filters_limit'}:{})};for(const listener of this.listeners)listener();}
+  private setValue(id:string,value:Reading<PeriodValues>){if(value.value&&value.basis&&value.basis.range.to>value.basis.evaluatedAt)value={...value,value:periodValueNow(value.value,Math.min(value.basis.range.to,hubNow()))};this.forgetProjection();this.values.set(id,value);for(const listener of this.valueListeners.get(id)??[])listener();}
+  private publishWork() {this.forgetProjection(['quota']);this.workState={...this.work,rows:this.workRows,evidence:this.workEvidence,...(this.workLimit?{loading:false,error:'filters_limit'}:{})};for(const listener of this.listeners)listener();}
   private retireWork() {
     this.calendar.clear(true);this.calendar.dirty();
     this.resetFacets();
@@ -374,6 +413,8 @@ class BoardPeriod {
     const board=state.board;
     if(!board||event?.type==='board-close'){this.identity='';this.generation++;this.clear();return;}
     if(!this.active)return;
+    // Contacts update the device view, not the board's analytical demand.
+    if(event?.type==='hub'&&event.event.type==='deviceContacts')return;
     const snapshot=event?.type==='hub'&&event.event.type==='snapshot';
     const changedWork=this.workAuthority!==undefined&&board.workAuthority!==this.workAuthority;
     if(snapshot||!this.identity||event?.type==='hub'&&event.event.type==='history'&&event.event.data.workAuthority)this.workAuthority=board.workAuthority;
@@ -668,9 +709,10 @@ class BoardPeriod {
     this.retiring=true;
     const generation=this.generation,revision=this.revision,from=evaluatedRange(this.selection,now).from,period=this.selection.periodMs;
     const valid=()=>this.active&&generation===this.generation&&revision===this.revision&&!pan.get();
+    let committed=false;
     const run=async()=>{
       if(!valid())return;
-      const sourceCurves=this.sourceCurves;
+      const sourceCurves=effectiveFilters()?this.sourceCurves??{groups:{source:new Map()},knownFrom:Infinity,available:false}:undefined;
       const previousWork=this.work.value,previousIndex=this.index,previousTapes=new Map(this.tapes),staging={role:'visible' as const};
       const limited=new Error('history_limit'),sizes=new Map<string,number>();
       const charge=(key:string,bytes:number)=>{sizes.set(key,bytes);if(!historyPool.reserve(staging,[...sizes.values()].reduce((a,b)=>a+b,0)))throw limited;};
@@ -689,13 +731,25 @@ class BoardPeriod {
         const changedWork=new Set<string>(),tapes=new Map(previousTapes);let changedBytes=0;
         if(work!==previousWork)for(const refs of [work?.refs??[],previousWork?.refs??[]])for(const ref of refs){if(ref.source&&!changedWork.has(ref.source)&&previousIndex?.curves.groups.source.get(ref.source)!==index?.curves.groups.source.get(ref.source)){changedBytes+=64+ref.source.length*2;charge('changedWork',changedBytes);changedWork.add(ref.source);}yield;}
         for(const [scope,entry] of previousTapes){
-          let scratch=0;const tape=yield*retention.retainTape(entry.tape,from,bytes=>{scratch+=bytes;charge(scope,scratch);},bytes=>{scratch-=bytes;charge(scope,scratch);});
-          if(tape!==entry.tape||(scope==='quota'||entry.tape.money.some(g=>g.workCounter))&&work!==previousWork){
-            // Retention copies suffix containers; their immutable observations
-            // still belong to the previous ledger. Its reservations own the new storage.
-            const base=scratch;
-            charge(scope,base);const accounting=yield*PeriodAccounting.prepare(tape,work,index?.curves,entry.accounting,changedWork,bytes=>charge(scope,base+bytes),sourceCurves);tapes.set(scope,{...entry,tape,accounting});
-          }else sizes.delete(scope);
+          if(scope==='quota'){
+            let scratch=0,proofBytes=128;charge(scope,proofBytes);
+            const tails=new Map<PeriodTape['quota'][number],retention.QuotaTail>();
+            try{
+              const tape=yield*retention.retainTapeWithTails(entry.tape,from,bytes=>{scratch+=bytes;charge(scope,scratch+proofBytes);},(before,after)=>{proofBytes+=192;charge(scope,scratch+proofBytes);tails.set(after,{before,after,removed:1});},bytes=>{scratch-=bytes;charge(scope,scratch+proofBytes);});
+              if(tape!==entry.tape||work!==previousWork){
+                const base=scratch;
+                const progress=(bytes:number)=>charge(scope,base+proofBytes+bytes);charge(scope,base+proofBytes);
+                const accounting=yield*(tails.size?PeriodAccounting.prepareRetirement(tape,work,index?.curves,entry.accounting,changedWork,progress,tails,sourceCurves):PeriodAccounting.prepare(tape,work,index?.curves,entry.accounting,changedWork,progress,sourceCurves));
+                tapes.set(scope,{...entry,tape,accounting});
+              }else charge(scope,proofBytes);
+            }finally{tails.clear();}
+          }else{
+            let scratch=0;const tape=yield*retention.retainTape(entry.tape,from,bytes=>{scratch+=bytes;charge(scope,scratch);},bytes=>{scratch-=bytes;charge(scope,scratch);});
+            if(tape!==entry.tape||entry.tape.money.some(g=>g.workCounter)&&work!==previousWork){
+              const base=scratch;
+              charge(scope,base);const accounting=yield*PeriodAccounting.prepare(tape,work,index?.curves,entry.accounting,changedWork,bytes=>charge(scope,base+bytes),sourceCurves);tapes.set(scope,{...entry,tape,accounting});
+            }else sizes.delete(scope);
+          }
           yield;
         }
         const edge=yield*retention.retirementEdge(work,[...tapes.values()].map(entry=>entry.tape),from);
@@ -708,11 +762,16 @@ class BoardPeriod {
         this.tapes.clear();for(const [scope,entry] of result.tapes)this.tapes.set(scope,entry);
         // Compaction changes storage, not evidence or a chart's drawing revision.
         this.retirementAt=result.edge+period;
-        this.workState={...this.workState,value:result.work};this.tick();this.measureBytes();
+        this.workState={...this.workState,value:result.work};this.tick();this.measureBytes();committed=true;
       }catch(error){if(error!==limited)throw error;historyPool.release(staging);await this.planRetirement();}
       finally{this.retirementPreparing=false;historyPool.release(staging);}
     };
-    const next=this.receiving.then(run).finally(()=>{this.retiring=false;this.scheduleClock();});this.receiving=next.catch(()=>{});
+    const next=this.receiving.then(run).finally(()=>{
+      this.retiring=false;
+      // A completed job can expose an edge that passed while it was preparing.
+      if(committed&&valid())this.retireExpired(hubNow());
+      this.scheduleClock();
+    });this.receiving=next.catch(()=>{});
   }
   private measureBytes(){
     // Decoding scratch has gone; retain the tape and the actual shared typed
@@ -765,6 +824,7 @@ class BoardPeriod {
     const changed=projected.changed||this.workState.value!==this.work.value||rows.length!==this.workRows.length||rows.some((row,i)=>row.ref!==this.workRows[i]?.ref||row.working!==this.workRows[i]?.working||!sameJson(row.currentPresence,this.workRows[i]?.currentPresence));
     if(changed) {
       this.workRows=rows;
+      this.forgetProjection(['quota']);
       this.activity?.update(this.workRows);
       const next=new Map<string,WorkedSession[]>();
       for(const row of this.workRows){if(row.source===null)continue;let list=next.get(row.source);if(!list)next.set(row.source,list=[]);list.push(row);}
@@ -788,7 +848,8 @@ class BoardPeriod {
     const activityDue=this.workAdvances(now)?this.activity?.orderChangesAt(now,this.workSelection.mode==='live'?this.workSelection.periodMs:0,demands.flatMap(order=>order.activity?[order.activity]:[])):null;
     this.nativeDue=this.selection.mode==='range'&&this.selection.to>now?Math.min(this.selection.to,...[...this.values.values()].flatMap(reading=>reading.value?[periodValueChangesAt(reading.value,now)??Infinity]:[]),...PERIOD_SCOPES.map(scope=>this.projectionChangesAt(scope,now)??Infinity)):Infinity;
     const next=Math.min(this.nativeDue,this.calendar.nextAt(now),due??Infinity,activityDue??Infinity,this.retiring||pan.get()?Infinity:this.retirementAt);
-    clock.due(this.watch,Number.isFinite(next)?next:null,now);
+    // A deadline after the last evaluation stays owed even if time passed meanwhile.
+    clock.due(this.watch,Number.isFinite(next)?next:null,Math.min(now,this.evaluatedAt));
   }
   retryHistory(scope:PeriodScope){
     if(!this.projectionErrors[scope])return;
