@@ -102,6 +102,12 @@ or unconfirmed cleanup. These partial diagnostic results never satisfy `bench`.
 The job still has twenty minutes; fresh processes do not imply a cold OS page cache.
 Chrome readiness has one twenty-second window starting immediately before the launcher
 is spawned, including its work and endpoint validation.
+After a failed owned Linux launch, the existing isolated kernel probe brackets its
+identity and wait reads with exact monotonic timestamps. `readBeforeTermination`
+compares the complete sample with the first TERM attempt; overlapping or unqualified
+samples remain unknown. The older `beforeTermination` flag still records whether the
+result had been accepted before that attempt. Neither flag proves signal delivery,
+continuous waiting or the startup cause, and collection adds no pre-TERM wait.
 DevTools commands keep their thirty-second response deadline. An explicit renderer
 crash or target-detach event fails pending commands immediately, even if the socket
 stays open, and retains the original failure before cleanup. It does not retry work.
@@ -828,7 +834,9 @@ fault, blocking, its duration, the file behind an earlier wait or the absence of
 operations. Scheduler switch-out/in pairs measure off-CPU time in reported D state,
 including runnable queue time after wakeup. They do not isolate blocked or disk I/O
 latency. Only the longest completed browser interval and its stack are retained;
-a pending interval is censored. Empty, unresolved or depth-limited stacks fail
+a retained unpaired browser switch-out has a separate stack, censored at the earliest
+observed termination, exit or capture cutoff. It proves neither a completed duration nor
+continuous D state. A missing eligible stack remains inconclusive. Empty, unresolved or depth-limited stacks fail
 qualification. The vfork fixture validates this observation path before Chrome starts;
 it does not reproduce a Chrome stall. No dynamic function probe is collected.
 Post-readiness inputs are not automatically startup cost. The original benchmark
@@ -836,6 +844,8 @@ verdict and console output survive collection and cleanup, and this optional job
 cannot satisfy the required benchmark gate. Select it without other diagnostic modes.
 It prepares GDB and matching Chrome unwind tables so the existing postfailure
 capture can inspect a bound renderer if the original command deadline fails.
+Unwind-table preparation is optional: its visible failure does not skip the independent
+startup observer or benchmark. Missing tables leave native unwinding unqualified.
 Preparation can affect the runner's caches; this is not a cold-start comparison.
 Its isolated tracer retains at most eight 256-character tool-error lines from a 16 KiB
 prefix and eight from a 4 KiB tail, with paths and memory addresses removed. Other launch diagnostics retain
