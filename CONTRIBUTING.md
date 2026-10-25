@@ -759,7 +759,10 @@ history attempt gets its
 fixture identity before HTTP starts, so aborts before response headers cannot borrow
 another attempt's byte proof. Separate real HTTP and native Shift-wheel cohorts
 exercise cancellation before headers, after delivery and reversal with a repeated
-query. Controlled production staging also verifies a delivered answer discarded
+query. Before-header cancellation waits for the existing observer to record chart
+movement within the same first-request deadline, then checks that headers remained
+unsent through cancellation. Final numeric movement and geometry are saved even
+when their assertions fail. Controlled production staging also verifies a delivered answer discarded
 before publication; native transport observations do not infer staging disposition.
 Reports retain attempted/completed/failed/aborted counts and uncertain body bounds.
 Proxy sockets and traffic tabs
@@ -804,16 +807,16 @@ seconds for its captured work-prefix boundary before the cached return. The cont
 requires committed prefix retirement and zero additional reads; a missing eligible
 boundary or unconfirmed retirement is inconclusive.
 
-The manual `startup_io_control` input observes file identities and page ranges from
-a Linux browser's filemap read and fault tracepoints on an isolated GitHub runner.
+The manual `startup_io_control` input observes file identities, page ranges and
+reported-D scheduler intervals of a Linux browser on an isolated GitHub runner.
 A fixed owned-file batch must first produce matching read and fault observations,
-identity and SIGTERM generation before the
-unchanged full history benchmark starts. Missing BTF, an unavailable probe or an
+identity, a resolved kernel stack from a separate gated vfork wait, and SIGTERM
+generation before the unchanged full history benchmark starts. Missing BTF, an unavailable probe or an
 unconfirmed fixture stops this diagnostic; no retry substitutes for qualification.
 The observer admits only the known fixture and the benchmark's detached browser main
 thread, checking parent, birth and UID. It keeps numeric device/inode/page identifiers
-from the events, never kernel addresses, paths or stack data. A prepared read range's
-last index is inclusive. It is reported after successful page acquisition, whereas a
+from the events and bounded resolved kernel symbols, never kernel addresses or paths.
+A prepared read range's last index is inclusive. It is reported after successful page acquisition, whereas a
 fault entry is reported before the page-cache lookup. A fault entry is one page.
 A 21-second observation window does not delay browser termination;
 the original twenty-second launch and twenty-minute job limits remain unchanged.
@@ -822,7 +825,12 @@ an observer error preserves an inconclusive diagnostic result while the original
 benchmark finishes, provided the observer's release is confirmed.
 These events identify filemap inputs. They do not prove a physical read, a completed
 fault, blocking, its duration, the file behind an earlier wait or the absence of other
-operations. No dynamic function probe or duration certificate is collected.
+operations. Scheduler switch-out/in pairs measure off-CPU time in reported D state,
+including runnable queue time after wakeup. They do not isolate blocked or disk I/O
+latency. Only the longest completed browser interval and its stack are retained;
+a pending interval is censored. Empty, unresolved or depth-limited stacks fail
+qualification. The vfork fixture validates this observation path before Chrome starts;
+it does not reproduce a Chrome stall. No dynamic function probe is collected.
 Post-readiness inputs are not automatically startup cost. The original benchmark
 verdict and console output survive collection and cleanup, and this optional job
 cannot satisfy the required benchmark gate. Select it without other diagnostic modes.
@@ -830,8 +838,14 @@ It prepares GDB and matching Chrome unwind tables so the existing postfailure
 capture can inspect a bound renderer if the original command deadline fails.
 Preparation can affect the runner's caches; this is not a cold-start comparison.
 Its isolated tracer retains at most eight 256-character tool-error lines from a 16 KiB
-prefix, with paths and memory addresses removed. Other launch diagnostics retain
+prefix and eight from a 4 KiB tail, with paths and memory addresses removed. Other launch diagnostics retain
 their fixed categories and coordinates.
+
+Unattributed idle DOM mutations retain up to eight bounded context records, including
+node type, connection state and same-batch removal-owner categories at delivery. They contain no
+text, HTML, class names, card IDs or attribute values. Record and removal scans are
+capped and report truncation. These records preserve the original page-level failure;
+they do not permit extra idle work or infer a time-only exemption.
 
 The manual `compositor_guard_control` input compares the pending-tree compositor
 guard in pinned Google Chrome Beta 157.0.8103.15. Three independent runners execute
