@@ -836,7 +836,10 @@ them), kept for 90 days.
   first known to this reader. Plan names count towards the existing byte budgets.
   The page keeps packed buffers within an
   estimated 15 MiB, protecting the frame on screen and removing dictionaries no retained
-  cell uses after replacement. Session references are opaque and
+  cell uses after replacement. A fixed frame proven reusable for an incoming selection
+  becomes recently used before calendar preparation; it remains evictable under the
+  same bound. An exact, valid live cache entry receives the same priority.
+  Session references are opaque and
   change with the hub's run, so answers cannot mix runs. A machine's list credits work
   with its next list or after five minutes of silence (`KEEP_MS`, up to 200 seconds of
   work); each credit tells history its actual start. The chart begins where the history
@@ -1976,6 +1979,9 @@ abandoned request can release its reservation while the hub serves other routes.
 The same protected work capture supplies its authority key to nested readers. Retained
 project names and device labels enter that key one row at a time; temporary hashing
 buffers share the request reservation, including detail and access revalidation reads.
+Asynchronous reads reserve the initial access capture's peak again before preparing
+dependent sections, keeping that capacity for later authority checks under the same
+ceiling. A larger current capture admits its extra bytes before allocating them.
 An authority buffer that cannot fit returns the existing history-limit error while
 independent financial sections can still complete.
 Before resuming or publishing a response, the reader checks access, currency context
@@ -2301,6 +2307,9 @@ that cannot fit fails losslessly without evicting the other reader's visible fra
 discard. Projections pin the current tile entry and its write sequence. Eviction outside
 the complete target preserves its pending composition; its board, epoch, metadata,
 selected series, target bounds and pinned entries still decide whether that work is current.
+Clock-driven storage compaction uses only free headroom. If its copies cannot fit,
+it keeps the committed indexes and waits for the next retention boundary without
+evicting reusable history. New evidence keeps ordinary admission and eviction.
 Financial and work ledgers share their immutable native observations only when every
 reading agrees. Retention preserves that shared suffix, and the pool charges its storage
 once; differing observations and each ledger's spans retain their own charges.
@@ -2366,6 +2375,9 @@ remain visible to their own chart while its last complete frame is retained.
 Financial consumers observe resource readiness and errors alongside native accounting
 authority. A successful retry clears the error even when financial values are
 unchanged; ordinary work-only publications keep financial snapshots stable.
+Confirmed work-only history news also preserves historical card measurements and
+their cache. Supplier measurements remain separate when notifications coalesce;
+missing confirmation retains conservative invalidation for older replies.
 Replacing native quota windows or monetary meter choices retires their own projection;
 it does not retire an authorized Activity frame with the same selected work scope.
 A stored work predicate that exceeds the executable limit makes selected activity

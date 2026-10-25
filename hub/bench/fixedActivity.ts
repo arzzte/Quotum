@@ -22,6 +22,7 @@ const pause=(ms:number)=>new Promise(resolve=>setTimeout(resolve,ms));
 type Numbers={agentMs:number;activeMs:number;agents:number};
 type Body={id:string;requestBytes:number;decoded:number;encoded:number;cancelled:boolean;body:PeriodRequest};
 type Sample={numbers:Numbers;activity:History['activity'];tiles:[number,number,number][];bytes:number;flights:number;advances:number;jobsStarted:number;fetches:number;preparationMs:number;failedReservations:number;preferenceWrites:number};
+type PoolReceipt={status:string;members:{kind:string}[];[key:string]:unknown};
 
 /** Each update owns one shared work attempt; only a cells-only drawing follow-up may overlap it. */
 export function assertActivityOverlap(requests:readonly PeriodRequest[],updates:number) {
@@ -237,6 +238,19 @@ function traffic(cdp:Cdp){
   return {bodies,active,pending,errors};
 }
 
+/** Save pending metadata before the existing process signal handler aborts its owner. */
+export function retainInterruptedActivity(cdp:Pick<Cdp,'snapshot'>,days:number,evidence?:{save(name:string,value:unknown):void}){
+  const signals=['SIGINT','SIGTERM','SIGHUP'] as const;
+  let captured=false;
+  const capture=()=>{
+    if(captured)return;captured=true;
+    try{evidence?.save('fixed-activity-command',{days,capturedAtMs:performance.now(),wallAt:Date.now(),...cdp.snapshot()});}
+    catch{/* Preserve the existing cancellation handler. */}
+  };
+  if(evidence)for(const signal of signals)process.prependListener(signal,capture);
+  return()=>{for(const signal of signals)process.off(signal,capture);};
+}
+
 /** Actual mounted widget and shared work filters, including late work and retired responses. */
 export async function fixedActivity(browser:Browser,stand:Stand,evidence?:Pick<Evidence,'save'>){
   const owner=stand.people.get(people(stand.set)[0].id)!,card=cards(stand.set).find(card=>card.id==='antigravity')!,reports:Record<string,unknown>[]=[];
@@ -246,6 +260,9 @@ export async function fixedActivity(browser:Browser,stand:Stand,evidence?:Pick<E
   for(const days of [1,30]){
     const actor=await ObservedWork.open(owner,card),tab=await openTab(browser),{cdp}=tab;
     const bodies=traffic(cdp),selection={mode:'range' as const,from:actor.floorAt+1000-days*DAY+123,to:actor.floorAt+1000};
+    const releaseInterrupted=retainInterruptedActivity(cdp,days,browser.owner?.evidence);
+    let poolSaved=false,lastPool:{phase:string;receipt:PoolReceipt}|undefined;
+    cdp.at(`fixed-activity/${days}d/setup`);
     try{
       await pause(Math.max(0,selection.to+10-Date.now()));
       await cdp.send('Network.enable');await cdp.send('Page.enable');await cdp.send('Performance.enable');
@@ -295,7 +312,8 @@ export async function fixedActivity(browser:Browser,stand:Stand,evidence?:Pick<E
       assert.notEqual((await shownRange()).to,gestureStart.to,'the native historical gesture must commit a changed range');
       assert.ok(gesturePoint);
       console.error('bench: fixed Activity settled '+JSON.stringify(await cdp.evaluate('window.__quotumFixedActivity.status()')));
-      const sample=()=>cdp.evaluate<Sample>('window.__quotumFixedActivity.sample()');
+      const sample=(capturePool=false)=>cdp.evaluate<Sample&{poolReceipt?:PoolReceipt}>(capturePool?
+        '(()=>{const sample=window.__quotumFixedActivity.sample();return {...sample,poolReceipt:window.__quotumHistoryPoolReceipt.read()};})()':'window.__quotumFixedActivity.sample()');
       const selectedFilter=[...bodies.bodies].reverse().find(row=>row.body.workFilter)!.body.workFilter;assert.ok(selectedFilter);
       assert.equal(await cdp.evaluate('window.__quotumFixedActivity.status().members'),4,'emphasis adds no history reader');
       // SVG viewport bounds lose float precision after native focus scrolls the page.
@@ -411,6 +429,7 @@ export async function fixedActivity(browser:Browser,stand:Stand,evidence?:Pick<E
         return current;
       };
       const phase=async(name:string,run:()=>Promise<void>,expected:number|null)=>{
+        cdp.at(`fixed-activity/${days}d/${name}`);
         const start=bodies.bodies.length;await cdp.evaluate('window.__quotumFixedActivity.reset()');const at=Date.now();
         const deadline=at+30_000;
         referenceReceipt={requests:0,requestBytes:0,decodedBytes:0,encodedBytes:0};
@@ -424,7 +443,8 @@ export async function fixedActivity(browser:Browser,stand:Stand,evidence?:Pick<E
         // Verification can overlap a calendar response. Account its complete body
         // and preparation before taking the phase's final traffic and CPU snapshot.
         await settled(deadline);while(bodies.active.size||bodies.pending.size){await Promise.allSettled([...bodies.pending]);await pause(20);}
-        const current=await sample(),reads=bodies.bodies.slice(start);
+        const {poolReceipt,...current}=await sample(!!evidence),reads=bodies.bodies.slice(start);
+        if(poolReceipt)lastPool={phase:name,receipt:poolReceipt};
         assert.deepEqual(current.numbers,verified.numbers,'verification cannot outlive the cohort it checked');
         const after=await metrics();assert.deepEqual(bodies.errors,[],'every completed response must remain accounted');
         assert.ok(Number.isFinite(after.ScriptDuration-before.ScriptDuration)&&Number.isFinite(after.TaskDuration-before.TaskDuration));
@@ -509,10 +529,15 @@ export async function fixedActivity(browser:Browser,stand:Stand,evidence?:Pick<E
       }),null);
       await phase('through upper bound',async()=>{await actor.through(selection.to);},1);
       await phase('outside range',async()=>{await actor.through(selection.to+100);await waitFor(`window.__quotumFixedActivity.heardSince(${selection.to})`);},0);
-      const receipt=await cdp.evaluate<{status:string;members:{kind:string}[];[key:string]:unknown}>(`(()=>{__quotumHistoryPoolReceipt.mark(2,3);return __quotumHistoryPoolReceipt.read();})()`);
+      const receipt=await cdp.evaluate<PoolReceipt>(`(()=>{__quotumHistoryPoolReceipt.mark(2,3);return __quotumHistoryPoolReceipt.read();})()`);
       evidence?.save(`fixed-activity-pool-${days===1?'24h':'30d'}`,{days,receipt});
+      poolSaved=true;
       assert.equal(receipt.status,'complete',JSON.stringify(Object.fromEntries(['status','attached','registrationOrderQualified','omitted','errors','snapshotOmitted','summaryOmitted','nearOmitted','sendingUnknown','lastCheckpoint'].map(key=>[key,receipt[key]]))));assert.equal(receipt.members.length,4);assert.ok(!receipt.members.some(member=>member.kind==='activity'));
-    }finally{await tab.close();await actor.close();}
+    }finally{
+      // Keep the last measured phase before closing a failed page; add no recovery read.
+      if(!poolSaved&&lastPool)try{evidence?.save(`fixed-activity-pool-${days===1?'24h':'30d'}`,{days,...lastPool,partial:true});}catch{/* Preserve the original scenario failure. */}
+      releaseInterrupted();await tab.close();await actor.close();
+    }
   }
   return {reports,problems:[] as string[]};
 }

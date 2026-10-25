@@ -2,6 +2,11 @@ import {test} from 'node:test';
 import assert from 'node:assert/strict';
 import vm from 'node:vm';
 import {HistoryPool} from '../../ui/lib/historyPool';
+import {HistoryStore} from '../../ui/lib/history';
+import {HistoryTile} from '../../ui/lib/historyTiles';
+import {Preparations} from '../../ui/lib/prepare';
+import {PageClock} from '../../ui/lib/clock';
+import {tileOf,type Chunk,type HistoryAnswer} from '../../server/domain/history';
 import {PeriodTransport} from '../../ui/lib/periodTransport';
 import {safeEvidence} from '../evidence';
 import {historyPoolReceiptScript} from '../historyPoolReceipt';
@@ -41,6 +46,18 @@ function fixture(realTransport:boolean|((pool:HistoryPool)=>PeriodTransport)=fal
   `);
   return {context,pool,run,read:()=>context.__quotumHistoryPoolReceipt.read()};
 }
+
+test('staging operations survive evidence filtering without admitting arbitrary operation text',()=>{
+  for(const operation of ['calendar-projection','values','restore','adoption','retirement']){
+    const h=fixture();h.context.operation=operation;
+    h.run(`pool.reserve({role:'visible',historyMember:period,operation},pool.budget+1);`);
+    const receipt=h.read(),saved=safeEvidence(receipt) as typeof receipt;
+    assert.equal(receipt.ordinaryByFlight[0].peak.owner.kind,'period-staging');
+    assert.equal(receipt.ordinaryByFlight[0].peak.owner.operation,operation);
+    assert.equal(saved.ordinaryByFlight[0].peak.owner.operation,operation);
+  }
+  assert.deepEqual(safeEvidence({operation:'canary-private-operation'}),{operation:'[text omitted]'});
+});
 
 test('the fixed Activity wrapper retains dense complete evidence while both journal capacities stay bounded',()=>{
   const ordinary=fixture(),fixed=fixture(false,fixedActivityScript('30d'));
@@ -88,6 +105,8 @@ test('late cache failures survive a full seed without changing pool or read resu
   h.run("for(const value of [quota,budget,funds])value.env.read('synthetic',60,0,60);flight.demands=[];flight.extras=true;pool.request(period.transport,flight,()=>{sameFetch=fetch('/api/boards/synthetic/period',{headers:{'x-quotum-bench-attempt':'b1:34'}})===reply;},()=>{});");
   await Promise.resolve();
   h.run(`
+    period.retiring=true;period.retirementPreparing=true;period.retirementAt=Infinity;period.selection={mode:'live'};
+    period.work={value:{refs:[{},{}],spans:[],packed:{blocks:[]}}};
     for(let i=0;i<9608;i++)if(pool.reserve(flight,i%8)!==true)throw Error('reserve result');
     refused=pool.reserve(flight,pool.budget+1);
     budget.grids.set(60,new Map([[0,{from:0,to:60,readFrom:0,readTo:60,validTo:60,bytes:100,shownAt:0}]]));
@@ -107,6 +126,7 @@ test('late cache failures survive a full seed without changing pool or read resu
   assert.equal(h.context.budget.badCalls,1);assert.equal(h.context.budget.readCalls,2);
   const refused=receipt.entries.find((entry:{kind:string;accepted?:boolean})=>entry.kind==='reserve-critical'&&entry.accepted===false);
   assert.equal(refused.owner.kind,'transport');
+  assert.deepEqual(JSON.parse(JSON.stringify(refused.period)),{memberId:1,mode:'live',currentBytes:0,retiring:true,retirementPreparing:true,retirementAt:null,retirementFinite:false,work:{fixed:false,packed:true,refs:2,spans:0}});
   const dropped=receipt.entries.find((entry:{kind:string})=>entry.kind==='drop-after');
   assert.equal(dropped.complete,true);assert.equal(dropped.removed.length,1);
   assert.equal(dropped.removed[0][9],100);assert.equal(dropped.removed[0][11],false);
@@ -116,6 +136,7 @@ test('late cache failures survive a full seed without changing pool or read resu
   const saved=safeEvidence(receipt) as typeof receipt;
   assert.equal(saved.status,'complete');
   assert.equal(saved.entries.find((entry:{kind:string})=>entry.kind==='http').attemptId,'b1:34');
+  assert.deepEqual(JSON.parse(JSON.stringify(saved.entries.find((entry:any)=>entry.kind==='reserve-critical').period)),JSON.parse(JSON.stringify(refused.period)));
   assert.ok(Buffer.byteLength(JSON.stringify(saved))<1024*1024);
 });
 
@@ -187,6 +208,8 @@ test('a retired period coordinator cannot qualify a later transport admission',a
   assert.match(http.attemptId,/^b\d+:\d+$/);assert.ok(http.flightId>0);
   assert.equal(receipt.status,'insufficient-evidence');assert.ok(receipt.sendingUnknown>0);
   assert.equal(http.sender,null);assert.equal(http.demands,null);assert.equal(receipt.members.length,4);
+  h.pool.reserve(h.context.flight,h.pool.budget+1);
+  assert.equal(h.read().entries.find((entry:any)=>entry.kind==='reserve-critical').period,null,'an unregistered period supplies no current preparation state');
   h.pool.release(h.context.flight);assert.equal(h.pool.activeFlights,0);
 });
 
@@ -397,4 +420,87 @@ test('exact checkpoints retain pending preparation and native tile generations',
   assert.equal(member.pending.preparationSize,2);assert.equal(member.pending.epoch,5);assert.equal(member.pending.newsSeq,7);
   assert.deepEqual(Array.from(member.retained[0].slice(12)),[0,60,30,11,9]);
   assert.equal(checkpoint.errors,0);assert.equal(checkpoint.omitted,0);assert.equal(checkpoint.ownershipOmitted,0);
+});
+
+
+/** The real COW generator is held between slices; HTTP and chart composition are outside this observer control. */
+function publicationFixture(plane:'all'|'native'|'activity') {
+  const pool=new HistoryPool(),jobs:(()=>void)[]=[];let now=0;
+  const preparer=new Preparations({now:()=>++now,post:run=>jobs.push(run)},-1);
+  const context=vm.createContext({Map,Set,WeakMap,WeakRef,Headers,Request,URL,location:{href:'http://fixture.invalid/'},performance:{now:()=>++now},fetch:()=>Promise.reject(Error('no HTTP in observer control'))});
+  vm.runInContext('window=globalThis;',context);vm.runInContext(historyPoolReceiptScript(),context);context.__quotumInspectHistoryPool(pool);
+  const clock=new PageClock({now:()=>1000,setTimeout:()=>0,clearTimeout:()=>{},visible:()=>false});
+  const reader=new HistoryStore({clock,preparations:preparer,now:()=>1000,schedule:()=>{},read:async()=>{throw Error('no read in observer control');},setTimeout:()=>0,clearTimeout:()=>{},dropTimeRange:()=>{throw Error('unexpected range loss');}},pool.budget,'quota',pool);
+  // Feed an already accepted response into the actual private merge/prepare/commit path.
+  const store=reader as any;store.run='run';store.board='synthetic';store.epoch=7;store.active=false;store.activityActive=plane!=='native';
+  const base=new HistoryTile(0,60);base.readTo=base.validTo=60;base.nativeTo=base.nativeValidTo=plane==='activity'?120:60;base.writeSeq=base.nativeSeq=1;
+  store.grids.set(60,new Map([[tileOf(0,60),base]]));
+  const flight={submitted:true,started:true,seq:2,epoch:7,target:'fixed',newsSeq:0,cell:60,from:0,to:120,touched:Infinity,startedAt:0,controller:new AbortController(),role:'visible',activityOnly:plane==='activity'};
+  const chunk:Chunk={from:0,to:120,series:Array.from({length:24},(_,i)=>({source:'synthetic-'+i,window:'w',hold:60,open:80,cells:[[0,80,0,60],[1,79,0,60]]})),activity:{sessions:[],devices:{},cells:[]},resets:[],grants:[]};
+  const answer:HistoryAnswer={run:'run',now:1000,historyStart:0,known:{work:0,sources:Object.fromEntries(chunk.series.map(s=>[s.source,0]))},chunks:[chunk]};
+  store.flights.add(flight);store.merge(flight,answer);
+  const events=()=>context.__quotumHistoryPoolReceipt.read().entries.filter((entry:any)=>entry.kind==='response-release');
+  const finish=()=>{for(let i=0;i<4096&&preparer.size;i++){const run=jobs.shift();assert.ok(run,'pending actual work has a slice');run();}assert.equal(preparer.size,0);};
+  const close=()=>{reader.close();preparer.dispose();assert.equal(pool.activeFlights,0);assert.equal(pool.estimatedBytes,0);};
+  return {reader,store,base,flight,jobs,preparer,events,finish,close};
+}
+
+test('release entry observes an unpublished actual COW cancellation without inventing publication',()=>{
+  const h=publicationFixture('all');try{
+    assert.equal(h.store.responses.has(h.flight),true);assert.equal(h.events().length,0);
+    h.jobs.shift()!();assert.ok(h.preparer.size>0,'actual COW remains unfinished after one 16-step slice');
+    assert.equal(h.store.grids.get(60).get(0),h.base,'private staging has not replaced the published tile');
+    h.store.abort(h.flight);
+    const released=h.events().find((entry:any)=>entry.responsePresent);assert.ok(released);
+    assert.equal(released.seq,2);assert.equal(released.epoch,7);assert.equal(released.memberEpoch,7);assert.equal(released.activityOnly,false);
+    assert.equal(released.retained.length,1);assert.deepEqual(Array.from(released.retained[0].slice(12)),[0,60,60,1,1]);
+    assert.notEqual(released.retained[0][15],released.seq);assert.equal(h.flight.controller.signal.aborted,true);
+  }finally{h.close();}
+});
+
+for(const plane of ['all','native','activity'] as const)test(`release entry records atomic actual ${plane} publication with separate planes`,()=>{
+  const h=publicationFixture(plane);try{
+    assert.equal(h.store.grids.get(60).get(0),h.base);assert.equal(h.events().length,0);h.finish();
+    const events=h.events();assert.equal(events.length,1);const released=events[0],row=released.retained[0];
+    assert.equal(released.responsePresent,true);assert.equal(released.activityOnly,plane==='activity');assert.equal(released.seq,2);
+    assert.equal(released.retained.length,1);assert.equal(released.retainedOmitted,0);assert.equal(row.length,17);
+    assert.deepEqual(Array.from(row.slice(6,9)),plane==='native'?[0,60,60]:[0,120,120]);
+    assert.deepEqual(Array.from(row.slice(12)),plane==='activity'?[0,120,120,2,1]:[0,120,120,2,2]);
+    assert.notEqual(h.store.grids.get(60).get(0),h.base,'the real atomic callback has published a replacement');
+    assert.equal(h.store.grids.get(60).get(0).writeSeq,released.seq);
+    const saved=safeEvidence(released) as typeof released;assert.deepEqual(JSON.parse(JSON.stringify(saved)),JSON.parse(JSON.stringify(released)));
+    assert.ok(!JSON.stringify(released).includes('synthetic-'),'source identities and payload stay private');
+  }finally{h.close();}
+});
+
+
+test('retirement boundary comes from actual packed work endpoints and remains numeric and readonly',async()=>{
+  const {packWork}=await import('../../server/domain/periodWork');
+  const {retirementBoundary}=await import('../historyPoolReceipt');
+  const work=packWork({anchor:0,knownFrom:0,cut:7_200_000,refs:[{ref:'private-ref',source:'private-source',device:{id:'private-device',name:'Private'},origin:'terminal',project:'Private',folder:null,startedAt:0}],spans:[[0,0,80],[0,3_600_100,3_600_150],[0,7_199_000,7_200_000]]});
+  const before=JSON.stringify(work),value={selection:{mode:'live',periodMs:2_592_000_000},evaluatedAt:2_592_000_080,work:{value:work}};
+  const state=retirementBoundary(value)!;assert.equal(state.edge,7_200_000,'a packed hour expires after its final interval');assert.equal(state.anchor,0);assert.equal(state.blocks,6);assert.equal(state.blocks,work.packed!.blocks.length);
+  assert.equal(JSON.stringify(work),before);assert.doesNotMatch(JSON.stringify(state),/private-|Private|source|device|refs|folder/);
+  const {retainWork}=await import('../../server/domain/periodRetention'),{drain}=await import('../../server/domain/prepare');
+  const retained=drain(retainWork(work,state.edge!)),returned=retirementBoundary({...value,evaluatedAt:value.selection.periodMs+state.edge!,work:{value:retained}})!;
+  assert.equal(returned.anchor,state.edge);assert.ok(returned.anchor>state.anchor&&returned.blocks<state.blocks);assert.equal(JSON.stringify(work),before);
+  assert.equal(retirementBoundary({...value,selection:{mode:'range'}}),null);
+  assert.equal(retirementBoundary({...value,work:{value:{...work,fixed:{} as any}}}),null);
+  assert.equal(retirementBoundary({...value,evaluatedAt:2_592_000_000+7_200_000})!.edge,null);
+});
+
+test('one eligible natural hold is claimed globally, with no retry or relaxed time cap',async()=>{
+  const {claimRetirementAlignment,retirementBoundary}=await import('../historyPoolReceipt');
+  const state:import('../historyPoolReceipt').RetirementAlignment={used:false,status:'inconclusive',reason:'no-eligible-page'};
+  const seed={periodMs:1000,at:1000,anchor:0,blocks:6,patterns:1,edge:150};
+  for(const now of [0,1150,1200,1400,NaN]){const candidate=now===0?{...seed,edge:60_000}:seed;assert.equal(claimRetirementAlignment(state,candidate,now,1),null);assert.equal(state.used,false);}
+  assert.equal(claimRetirementAlignment(state,seed,1000,3),400);assert.equal(state.used,true);assert.equal(state.pair,3);assert.equal(state.status,'inconclusive','waiting does not prove algorithm exposure');
+  assert.equal(claimRetirementAlignment(state,seed,1000,4),null);assert.equal(state.pair,3);
+  const missing={used:false,status:'inconclusive' as const,reason:'no-eligible-page'};assert.equal(claimRetirementAlignment(missing,null,1000,1),null);assert.equal(missing.reason,'no-eligible-page');
+  assert.equal(retirementBoundary(undefined),null);
+});
+
+test('the existing pool observer exposes only numeric live retirement boundary without mutating its owner',()=>{
+  const h=fixture();h.run("period.selection={mode:'live',periodMs:1000};period.evaluatedAt=1100;period.work={value:{anchor:0,refs:[{ref:'secret-ref'}],spans:[],packed:{blocks:[0,0,0],patterns:[[0,150]]}}};before=JSON.stringify(period.work.value);boundary=__quotumHistoryPoolReceipt.retirementBoundary();after=JSON.stringify(period.work.value);");
+  assert.equal(h.context.before,h.context.after);assert.equal(h.context.boundary.edge,150);assert.equal(h.context.boundary.blocks,3);assert.doesNotMatch(JSON.stringify(h.context.boundary),/secret-ref|refs/);
 });

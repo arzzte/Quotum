@@ -9,11 +9,14 @@ import {openTab, type Browser, type Cdp} from './cdp';
 import {HISTORY_COHORT_TAKES, historyCutInvalidation, historyIdentity, bodyTotals, readUnion, stableHistory, trafficProblems, transferFor} from './historyTrafficBudget';
 import {HISTORY_ATTEMPT_HEADER, historyBody, historyProxy, type BodyCount, type Transfer} from './historyProxy';
 import {observeReversal} from './reversalDiagnostic';
-import {historyPoolReceiptScript} from './historyPoolReceipt';
+import {rendererIdentity,rendererDocument,type RendererIdentity} from './rendererIdentity';
+import {historyPoolReceiptScript,claimRetirementAlignment,type RetirementAlignment,type retirementBoundary} from './historyPoolReceipt';
+import {setTimeout as delay} from 'node:timers/promises';
 import {ScriptBinding} from './scriptBinding';
 import {clientIdentity} from './evidence';
 import {deadline} from './deadline';
 import {periodBodyDiagnostic} from './requests';
+import {historyPressureScript,saveHistoryPressure} from './historyPressure';
 
 const DAY = 86_400_000;
 type ResourceRead={scope?:PeriodScope;selection:string;from:number;to:number;cell:number;answer?:Pick<HistoryAnswer,'run'|'now'|'known'>;chunks?:[number,number][]};
@@ -42,12 +45,12 @@ export function stableHistoryReads(reads: readonly Pick<Read, 'selection' | 'ans
 }
 
 /** Identity is attached before fetch; cancellation need not receive response headers. */
-export function historyPageScript(period: string) {
-  return `localStorage.setItem('quotum.locale','en');localStorage.setItem('quotum.prefs',JSON.stringify({range:${JSON.stringify(period)},horizon:'1d',filtersVisible:true}));`+historyIdentityScript();
+export function historyPageScript(period: string,pressure=false) {
+  return (pressure?historyPressureScript()+';':'')+`localStorage.setItem('quotum.locale','en');localStorage.setItem('quotum.prefs',JSON.stringify({range:${JSON.stringify(period)},horizon:'1d',filtersVisible:true}));`+historyIdentityScript(pressure);
 }
 
 /** Tag existing fetches before their observers see them, without changing page preferences. */
-export function historyIdentityScript() {
+export function historyIdentityScript(pressure=false) {
   const prefix = `b${++pageSerial}`;
   return `(() => {
     const original=window.fetch.bind(window),attempts=window.__quotumHistoryAttempts={};let serial=0;
@@ -56,7 +59,7 @@ export function historyIdentityScript() {
       const path=new URL(uri,location.href).pathname;if(path!='/api/history'&&!/^\\/api\\/boards\\/[^/]+\\/period(?:\\/sessions)?$/.test(path))return original(resource,init);
       const id=${JSON.stringify(prefix)}+':'+(++serial),headers=new Headers(init.headers||(resource instanceof Request?resource.headers:undefined)),signal=init.signal||(resource instanceof Request?resource.signal:undefined);
       headers.set(${JSON.stringify(HISTORY_ATTEMPT_HEADER)},id);
-      const started=performance.now(),attempt=attempts[id]={aborted:!!signal?.aborted};signal?.addEventListener('abort',()=>{attempt.aborted=true;attempt.abortedAt=performance.now()-started;attempt.reason=signal.reason?.name;},{once:true});
+      const started=performance.now(),attempt=attempts[id]={aborted:!!signal?.aborted};signal?.addEventListener('abort',()=>{attempt.aborted=true;attempt.abortedAt=performance.now()-started;attempt.reason=signal.reason?.name;},{once:true});${pressure?"try{window.__quotumHistoryPressure?.request(id,init.body);}catch{}":''}
       return original(resource,{...init,headers}).then(response=>{attempt.headersAt=performance.now()-started;return response;},error=>{attempt.failedAt=performance.now()-started;attempt.error=error.name;throw error;});
     };
   })()`;
@@ -184,7 +187,7 @@ export function historyScroll(geometry: {x: number; y: number; width: number}, f
 }
 
 /** Diagnostic boundaries keep exact selections beside the readers that still own work. */
-export function historyCheckpointScript(length:number,label:string) {
+export function historyCheckpointScript(length:number,label:string,retirement=false) {
   return `(() => {
     const params=new URLSearchParams(location.search),traffic=window.__historyTraffic;
     const selection=params.has('from')&&params.has('to')?{mode:'range',from:Number(params.get('from')),to:Number(params.get('to'))}:{mode:'live',periodMs:${length}};
@@ -192,7 +195,7 @@ export function historyCheckpointScript(length:number,label:string) {
       const svg=panel.querySelector('.chart>svg'),fields=['panEnd','panOrigin','panToken','panScale','panBase','drawFrom','drawTo','drawReady'];
       return {index,family:['history','activity','budget-history','subscription-funds'].find(name=>panel.classList.contains(name)),range:panel.dataset.historyRange??null,loading:panel.classList.contains('is-loading'),svg:!!svg,...Object.fromEntries(fields.map(key=>[key,svg?.dataset[key]??null]))};
     });
-    return {label:${JSON.stringify(label)},at:performance.now(),wallAt:Date.now(),selection,drawings,movement:traffic?{tokens:[...traffic.tokens],poses:traffic.poses.map(pose=>({...pose})),pushes:traffic.pushes}:null,pool:window.__quotumHistoryPoolReceipt?.checkpoint?.(${JSON.stringify(label)})??{status:'unavailable'}};
+    return {${retirement?'retirement:window.__quotumHistoryPoolReceipt?.retirementBoundary()??null,':''}label:${JSON.stringify(label)},at:performance.now(),wallAt:Date.now(),selection,drawings,movement:traffic?{tokens:[...traffic.tokens],poses:traffic.poses.map(pose=>({...pose})),pushes:traffic.pushes}:null,pool:window.__quotumHistoryPoolReceipt?.checkpoint?.(${JSON.stringify(label)})??{status:'unavailable'}};
   })()`;
 }
 
@@ -209,7 +212,11 @@ export async function prepareHistoryTarget(cdp: Pick<Cdp, 'send' | 'evaluate'>, 
 
 type TrafficProxy = {url: string; transfers: Transfer[]; phase(value: string, latency?: number): void; settled(value: string): Promise<void>};
 
-async function historyPage(browser: Browser, proxy: TrafficProxy, cookie: string, name: string, length: number, future: number, poolEvidence?:Pick<Evidence, 'save'>,evidence?:Pick<Evidence,'save'>,receiptScenario?:{latency:number;fraction:number}) {
+function passiveHistoryBinding(browser:Browser){
+  return browser.owned===true&&!!browser.owner&&typeof browser.observeProcesses==='function'&&typeof browser.launchReport==='function'&&!['QUOTUM_BENCH_HISTORY_SCROLL_CONTROL','QUOTUM_BENCH_DIAGNOSE_NATIVE','QUOTUM_BENCH_REVERSAL_PROBE','QUOTUM_BENCH_DIAGNOSE_IDLE_CPU'].some(key=>process.env[key]);
+}
+
+async function historyPage(browser: Browser, proxy: TrafficProxy, cookie: string, name: string, length: number, future: number, poolEvidence?:Pick<Evidence, 'save'>,evidence?:Pick<Evidence,'save'>,receiptScenario?:{latency:number;fraction:number},alignment?:RetirementAlignment,postfailureBinding=false,pressure=false) {
   const tab = await openTab(browser), cdp = tab.cdp, bodies = new HistoryBodies(cdp);
   const checkpoints:unknown[]=[];
   const poolScenario:{length:number;future:number;latency?:number;fraction?:number;cell:number|null;geometry:unknown}={length,future,...receiptScenario,cell:null,geometry:null};
@@ -218,12 +225,18 @@ async function historyPage(browser: Browser, proxy: TrafficProxy, cookie: string
     const boundary={label,phase:bodies.phase,stage:bodies.stage,at:Date.now(),http:{active:bodies.activeCount,pending:bodies.pending.size,attempts:bodies.reads.length}};
     const command=cdp.snapshot();
     if(command.socketState!==1||command.terminal||command.failure||command.pending.length){checkpoints.push({...boundary,status:'insufficient-evidence',reason:'original renderer unavailable'});return;}
-    try{checkpoints.push({...boundary,page:await deadline(2000,signal=>cdp.evaluate(historyCheckpointScript(length,label),signal))});}
+    try{checkpoints.push({...boundary,page:await deadline(2000,signal=>cdp.evaluate(historyCheckpointScript(length,label,!!alignment&&(!alignment.used&&name.includes('/activity/')&&label==='seed/settled/seed'||alignment.used&&name.startsWith('suffix/'+alignment.pair+'/activity/')&&label==='cached return/settled')),signal))});}
     catch{checkpoints.push({...boundary,status:'insufficient-evidence',reason:'checkpoint unavailable'});}
   };
   const poolName=name.replace(/[^a-zA-Z0-9_-]/g,'-');
   const poolBinding=poolEvidence?new ScriptBinding(cdp,clientIdentity(),(file,value)=>poolEvidence.save('pool-'+poolName+'-'+file,value)):null;
   let poolCaptured=false;
+  let renderer:RendererIdentity|undefined,binding:Promise<RendererIdentity>|undefined;
+  const strictDocument=process.env.QUOTUM_BENCH_HISTORY_SCROLL_SUFFIX==='1';
+  const pressureJournal=pressure&&postfailureBinding&&!poolEvidence&&!strictDocument&&!process.env.QUOTUM_BENCH_DIAGNOSE_HISTORY_POOL;
+  const document=strictDocument||postfailureBinding?rendererDocument(cdp):undefined;
+  if(document)browser.owner?.resource(async()=>document.dispose());
+  const lateRenderer=document?{requireBeforeInput:strictDocument,validDocument:()=>document.valid(),resolve:(signal:AbortSignal)=>binding??=rendererIdentity(cdp,browser,signal,document).then(value=>(renderer=value))}:undefined;
   cdp.at(`${name}/seed`);
   const capturePool = async () => {
     if(!poolEvidence||poolCaptured)return;
@@ -256,7 +269,7 @@ async function historyPage(browser: Browser, proxy: TrafficProxy, cookie: string
   };
   // Closing this owned target discards its observers and overrides. A stalled
   // renderer cannot acknowledge a cleanup evaluation before its target closes.
-  const close = async () => {cdp.at(`${name}/cleanup`); await tab.close();};
+  const close = async () => {cdp.at(`${name}/cleanup`); try{if(binding)await binding;if(renderer)await renderer.dispose();}finally{try{document?.dispose();}finally{await tab.close();}}};
   try {
     const seedPhase = `${name}/seed`; bodies.phase = seedPhase; proxy.phase(seedPhase);
     await cdp.send('Network.enable'); await cdp.send('Page.enable'); await cdp.send('Performance.enable');
@@ -264,8 +277,8 @@ async function historyPage(browser: Browser, proxy: TrafficProxy, cookie: string
     await cdp.send('Emulation.setDeviceMetricsOverride', {width: 1280, height: 900, deviceScaleFactor: 1, mobile: false});
     const split = cookie.indexOf('='); await cdp.send('Network.setCookie', {name: cookie.slice(0, split), value: cookie.slice(split + 1), url: proxy.url, httpOnly: true, sameSite: 'Lax'});
     if(poolEvidence)await cdp.send('Page.addScriptToEvaluateOnNewDocument',{source:historyPoolReceiptScript()});
-    await cdp.send('Page.addScriptToEvaluateOnNewDocument', {source: historyPageScript(length === DAY ? '24h' : '30d')});
-    await cdp.send('Page.navigate', {url: proxy.url});
+    await cdp.send('Page.addScriptToEvaluateOnNewDocument', {source: historyPageScript(length === DAY ? '24h' : '30d',pressureJournal)});
+    const navigation=await cdp.send<{frameId:string;loaderId?:string;errorText?:string}>('Page.navigate', {url: proxy.url});
     const settled = async (seed = false) => {
       const deadline = Date.now() + 20_000;
       for (;;) {
@@ -301,7 +314,19 @@ async function historyPage(browser: Browser, proxy: TrafficProxy, cookie: string
       history.pushState=function(...args){p.pushes++;return originalPush.apply(this,args);};
       const frame=()=>{if(!p.running)return;if(root.dataset.panEnd){const token=root.dataset.panToken;if(p.tokens.at(-1)!==token)p.tokens.push(token);const end=Number(root.dataset.panEnd),origin=Number(root.dataset.panOrigin);if(p.poses.at(-1)?.end!==end)p.poses.push({end,origin});}p.raf=requestAnimationFrame(frame);};p.raf=requestAnimationFrame(frame);
     })()`);
-    return {cdp, bodies, settled, geometry, cell, seeds, close,capturePool,checkpoint};
+    if(document){
+      document.pin(navigation);
+      if(strictDocument){
+        assert.ok(document.valid(),`${name}: document identity unavailable`);
+        evidence?.save('traffic-document-'+poolName,{status:'document-ready',frame:1,pid:null,birth:null});
+      }
+    }else if(process.env.QUOTUM_BENCH_HISTORY_SCROLL_CONTROL==='1'){
+      renderer=await rendererIdentity(cdp,browser);
+      evidence?.save('traffic-renderer-'+poolName,renderer.evidence());
+      assert.ok(renderer.valid(),`${name}: renderer identity unavailable`);
+    }
+    const retirementAt=(label:string)=>(checkpoints.find((value:any)=>value.label===label) as {page?:{retirement?:ReturnType<typeof retirementBoundary>}}|undefined)?.page?.retirement??null;
+    return {cdp, bodies, settled, geometry, cell, seeds, close,capturePool,renderer,lateRenderer,checkpoint,capturePressure:()=>pressureJournal?saveHistoryPressure(cdp,evidence,poolName,browser.owner?.signal):Promise.resolve(),retirementSeed:()=>retirementAt('seed/settled/seed'),retirementReturn:()=>retirementAt('cached return/settled')};
   } catch (error) {
     try{evidence?.save('traffic-seed-failure-'+poolName,{name,stage:bodies.stage,...bodies.diagnostic(`${name}/seed`)});}
     catch{browser.owner?.failures.push('history seed evidence failed');}
@@ -312,19 +337,22 @@ async function historyPage(browser: Browser, proxy: TrafficProxy, cookie: string
 }
 
 /** Separate tabs use the fixed-codec proxy; this never changes the native perf route. */
-export async function browserHistoryTraffic(browser: Browser, proxy: TrafficProxy, cookie: string, board: string, evidence?: Pick<Evidence, 'save'>) {
+export async function browserHistoryTraffic(browser: Browser, proxy: TrafficProxy, cookie: string, board: string, evidence?: Pick<Evidence, 'save'>, suffix?:{pair:number;cohort:'history'|'activity'},alignment?:RetirementAlignment) {
+  if(suffix&&(!Number.isInteger(suffix.pair)||suffix.pair<1||suffix.pair>12||!['history','activity'].includes(suffix.cohort)))throw new Error('Unknown history suffix cohort');
   const reports = [], invalidated = [], problems: string[] = [];
   for (const length of [DAY, 30 * DAY]) for (const future of [DAY, 0]) for (const latency of [0, 100, 400]) for (const fraction of [.5, .04]) {
-    for (let take = 1; take <= HISTORY_COHORT_TAKES; take++) {
-      const name = `browser/${length / DAY}d/${future ? 'history' : 'activity'}/${latency}ms/${fraction}/take${take}`;
-      evidence?.save('traffic-stage', {name, stage: 'seed'});
-      // Include the month-long returns observed before the original Activity diagnostic.
+    if(suffix&&!(fraction===.5&&(suffix.cohort==='history'?length===DAY&&future===DAY&&latency===0:length===30*DAY&&future===0&&latency===100)))continue;
+    for (let take = 1; take <= (suffix?1:HISTORY_COHORT_TAKES); take++) {
+      const name = (suffix?`suffix/${suffix.pair}/${suffix.cohort}/`:'')+`browser/${length / DAY}d/${future ? 'history' : 'activity'}/${latency}ms/${fraction}/take${take}`;
+      evidence?.save(suffix?`suffix-stage-${suffix.pair}-${suffix.cohort}`:'traffic-stage', {name, stage: 'seed'});
       const poolTarget=length===DAY&&!future&&[100,400].includes(latency)&&fraction===.5&&take===1||length===30*DAY&&future===DAY||name==='browser/30d/activity/0ms/0.5/take1';
-      const poolEvidence=process.env.QUOTUM_BENCH_DIAGNOSE_HISTORY_POOL==='1'&&poolTarget?evidence:undefined;
-      const {cdp, bodies, settled, geometry, cell, seeds, close,capturePool,checkpoint} = await historyPage(browser, proxy, cookie, name, length, future,poolEvidence,evidence,{latency,fraction});
+      const suffixPool=process.env.QUOTUM_BENCH_HISTORY_SCROLL_SUFFIX==='1'&&suffix?.cohort==='activity'&&length===30*DAY&&!future&&latency===100&&fraction===.5&&take===1;
+      const poolEvidence=(process.env.QUOTUM_BENCH_DIAGNOSE_HISTORY_POOL==='1'&&poolTarget||suffixPool)?evidence:undefined;
+      const {cdp, bodies, settled, geometry, cell, seeds, close,capturePool,renderer,lateRenderer,checkpoint,capturePressure,retirementSeed,retirementReturn} = await historyPage(browser, proxy, cookie, name, length, future,poolEvidence,evidence,{latency,fraction},alignment,passiveHistoryBinding(browser),true);
       let observer:Awaited<ReturnType<typeof observeReversal>>|null=null, status='failed';
+      let movement:unknown;
       try {
-        observer=await observeReversal(cdp,browser,{postmortem:true,closeTarget:close});
+        observer=await observeReversal(cdp,browser,{postmortem:true,closeTarget:close,renderer,lateRenderer});
         const phase = `${name}/cold`; bodies.phase = phase; proxy.phase(phase, latency);
         const scroll = (distance: number,stage:string) => {
           bodies.stage=stage;
@@ -335,6 +363,7 @@ export async function browserHistoryTraffic(browser: Browser, proxy: TrafficProx
         };
         await scroll(geometry.width * fraction,'cold scroll'); await settled();
         const pose = await cdp.evaluate<{tokens: string[]; poses: {end: number; origin: number}[]; pushes: number; from: number; to: number}>('({tokens:__historyTraffic.tokens,poses:__historyTraffic.poses,pushes:__historyTraffic.pushes,from:Number(new URLSearchParams(location.search).get("from")),to:Number(new URLSearchParams(location.search).get("to"))})');
+        movement={...pose,tokens:pose.tokens.length};
         assert.equal(pose.tokens.length, 1); assert.equal(pose.pushes, 1); assert.ok(pose.poses.length > 1 && pose.from > 0);
         assert.ok(Math.abs(pose.to - pose.poses[0].origin + (length + future) * fraction) <= 3 * (length + future) / geometry.width, 'native gesture did not move by its named fraction');
         const physical=bodies.reads.filter(read=>read.phase===phase),cold = bodies.resources.filter(read => read.phase === phase);
@@ -378,14 +407,22 @@ export async function browserHistoryTraffic(browser: Browser, proxy: TrafficProx
         const aggregate={name:name+'/all-accounting',attempts:physical.length,...physicalTotals,referenceDecoded:families.reduce((n,f)=>n+f.referenceDecoded,0),referenceEncoded:families.reduce((n,f)=>n+f.referenceEncoded,0),ratios:fraction===.5};
         problems.push(...trafficProblems(aggregate));reports.push(aggregate);
         console.error(`bench: ${aggregate.name}: ${JSON.stringify(aggregate)}`);
+        const seed=alignment&&!alignment.used&&suffix?.cohort==='activity'?retirementSeed():null;
+        const wait=alignment&&suffix?.cohort==='activity'?claimRetirementAlignment(alignment,seed,Date.now(),suffix.pair):null;
+        if(wait!==null){
+          const before=bodies.reads.length;bodies.phase=`${name}/alignment`;proxy.phase(bodies.phase);cdp.at(bodies.phase);
+          await delay(wait,undefined,{signal:browser.owner?.signal});alignment!.reads=bodies.reads.length-before;
+        }
         const warmPhase = `${name}/warm`; bodies.phase = warmPhase; proxy.phase(warmPhase);
         // A selected chart has no future, so its return uses the captured time delta.
         await scroll(-(pose.poses[0].origin - pose.to) / length * geometry.width,'cached return'); await settled();
         assert.equal(await cdp.evaluate<boolean>('new URLSearchParams(location.search).has("from")'), false, 'cached return did not reach live');
         await scroll(geometry.width * fraction,'cached repeat'); await settled();
         const warm = bodies.reads.filter(read => read.phase === warmPhase);
-        if(warm.length)console.error('bench: warm history diagnostic '+JSON.stringify({name,...bodies.diagnostic(warmPhase)}));
+        if(warm.length){console.error('bench: warm history diagnostic '+JSON.stringify({name,...bodies.diagnostic(warmPhase)}));await capturePressure();}
         assert.equal(warm.length, 0, 'browser cached return/repeat started history');
+        if(wait!==null){assert.equal(alignment!.reads,0,'retirement alignment started history');const returned=retirementReturn();alignment!.returned=returned;
+          if(returned&&seed&&seed.edge!==null&&returned.periodMs===seed.periodMs&&returned.at>=seed.edge+seed.periodMs&&returned.anchor>=seed.edge&&returned.anchor>seed.anchor&&returned.blocks<seed.blocks)Object.assign(alignment!,{status:'exposed',reason:'packed-prefix-retired'});}
         const metrics = await cdp.send<{metrics: {name: string; value: number}[]}>('Performance.getMetrics');
         for (const family of families) {
           const report = {...family, ratios:false, warmAttempts: warm.length, series: geometry.series, movement: {tokens: pose.tokens.length, samples: pose.poses.length, pushes: pose.pushes, from: pose.from, to: pose.to}, heapBytes: metrics.metrics.find(m => m.name === 'JSHeapUsedSize')?.value};
@@ -393,13 +430,15 @@ export async function browserHistoryTraffic(browser: Browser, proxy: TrafficProx
           console.error(`bench: ${report.name}: ${report.attempts} requests, ${warm.length} warm requests, decoded ratio ${report.decoded === null ? 'unknown' : report.decoded / report.referenceDecoded}, encoded ratio ${report.encodedUpper === null ? 'unknown' : report.encodedUpper / report.referenceEncoded}`);
         }
         status=reports.filter(report=>report.name.startsWith(name+'/')).some(report=>trafficProblems(report).length)?'over-budget':'passed';
+        if(suffix&&problems.length)throw new Error('History suffix exceeded its original traffic budget');
         break;
       } catch (error) {
+        if(suffix){status='failed';throw error;}
         const cut=historyCutInvalidation(error,name,take);
         status='invalidated';
         invalidated.push({...cut,reads:bodies.reads.map(read=>({phase:read.phase,from:read.from,to:read.to,count:read.count}))});
       } finally {
-        evidence?.save('traffic-'+name.replace(/[^a-zA-Z0-9_-]/g,'-'), {name,status,geometry,cell,
+        evidence?.save('traffic-'+name.replace(/[^a-zA-Z0-9_-]/g,'-'), {name,status,geometry,cell,movement,
           reads:trafficReadEvidence(bodies.reads),cold:bodies.diagnostic(`${name}/cold`),reports:reports.filter(report=>report.name.startsWith(name+'/')),
           transfers:proxy.transfers.filter(transfer=>transfer.phase.startsWith(name+'/')),command:cdp.snapshot()});
         const cleanupErrors:unknown[]=[];
@@ -422,7 +461,7 @@ export async function browserCancellationTraffic(browser: Browser, proxy: Traffi
       const name = `browser/${length / DAY}d/${mode}/take${take}`;
       evidence?.save('traffic-stage', {name,stage:'seed'});
       console.error(`bench: ${name}: opening seed page`);
-      const {cdp, bodies, settled, geometry, cell, seeds, close} = await historyPage(browser, proxy, cookie, name, length, DAY,undefined,evidence);
+      const {cdp, bodies, settled, geometry, cell, seeds, close,renderer,lateRenderer} = await historyPage(browser, proxy, cookie, name, length, DAY,undefined,evidence,undefined,undefined,!diagnostic&&!profileBeforeInput&&passiveHistoryBinding(browser));
       let observer:Awaited<ReturnType<typeof observeReversal>>|null=null,status='failed';
       console.error(`bench: ${name}: seed page ready`);
       const phase = `${name}/gesture`, reads = () => bodies.reads.filter(r => r.phase === phase);
@@ -437,7 +476,7 @@ export async function browserCancellationTraffic(browser: Browser, proxy: Traffi
       const wheel = (pixels: number) => cdp.send('Input.dispatchMouseEvent', {type: 'mouseWheel', x: geometry.x, y: geometry.y, deltaX: pixels, deltaY: 0, modifiers: 8});
       try {
         // The canonical failing page is observed without changing V8 before input.
-        observer=await observeReversal(cdp,browser,{mode:diagnostic?'diagnostic':'canonical',profileBeforeInput,postmortem:true,closeTarget:close});
+        observer=await observeReversal(cdp,browser,{mode:diagnostic?'diagnostic':'canonical',profileBeforeInput,postmortem:true,closeTarget:close,renderer,lateRenderer});
         bodies.phase = phase; proxy.phase(phase, mode === 'after-delivery' ? 0 : 400);
         await step('shift down', () => key('keyDown', 'Shift', 16, 8));
         await step('first wheel', () => wheel(-geometry.width * .1));

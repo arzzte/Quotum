@@ -9,12 +9,12 @@ on:
   workflow_dispatch:
     inputs:
       diagnostic_ref:
-        description: Full public commit SHA for the independent benchmark control
-        required: true
+        description: Full public commit SHA for diagnostic controls; leave empty for ordinary CI
+        required: false
         type: string
       expected_client_sha256:
-        description: SHA256 of the previously received compiled client
-        required: true
+        description: Previously received compiled-client SHA256, required for diagnostic controls
+        required: false
         type: string
       trace_only:
         description: Observe the original idle window without CPU sampling or alignment
@@ -47,13 +47,40 @@ on:
         required: false
         type: boolean
         default: false
+      native_postmortem_control:
+        description: Qualify native capture after an injected owned-Chrome timeout
+        required: false
+        type: boolean
+        default: false
+      history_scroll_control:
+        description: Observe the original full history matrix with postfailure diagnostics
+        required: false
+        type: boolean
+        default: false
+      history_pool_control:
+        description: Observe cache ownership in the unchanged full history matrix
+        required: false
+        type: boolean
+        default: false
+
+      startup_io_control:
+        description: Observe a fixed same-host startup ABA with targeted ELF cache advice
+        required: false
+        type: boolean
+        default: false
+
+      compositor_guard_control:
+        description: Compare one pinned compositor guard on independent OLD1/NEW/OLD2 runners
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
 
 jobs:
   dev-tooling:
-    if: ${{ !inputs.diagnostic_ref }}
+    if: ${{ !inputs.compositor_guard_control && !inputs.startup_io_control && !inputs.diagnostic_ref }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -61,6 +88,11 @@ jobs:
       - uses: actions/setup-node@v7
         with:
           node-version: 24
+      - name: Require a pinned source for diagnostic modes
+        if: ${{ github.event_name == 'workflow_dispatch' }}
+        env:
+          HAS_DIAGNOSTIC_MODE: ${{ inputs.trace_only || inputs.original_timing || inputs.native_trace || inputs.native_profile || inputs.caption_control || inputs.native_postmortem_control || inputs.history_scroll_control || inputs.history_pool_control || inputs.compositor_guard_control }}
+        run: node -e 'if(process.env.HAS_DIAGNOSTIC_MODE==="true")throw Error("Diagnostic modes require diagnostic_ref")'
       - run: make dev-test
         env:
           QUOTUM_TEST_DIAGNOSTICS_DIR: ${{ runner.temp }}/quotum-dev-diagnostics
@@ -73,7 +105,7 @@ jobs:
           if-no-files-found: warn
 
   hub:
-    if: ${{ !inputs.diagnostic_ref }}
+    if: ${{ !inputs.compositor_guard_control && !inputs.startup_io_control && !inputs.diagnostic_ref }}
     runs-on: ubuntu-latest
     # It takes about a minute; a test that hangs fails it instead of holding the runner.
     timeout-minutes: 15
@@ -97,7 +129,7 @@ jobs:
   # What an open dashboard costs, measured in Chrome on the built hub and page (hub/bench).
   # A release does not wait for it: the commit it tags already passed it.
   bench:
-    if: ${{ always() && !inputs.diagnostic_ref && !startsWith(github.ref, 'refs/tags/') }}
+    if: ${{ !inputs.compositor_guard_control && !inputs.startup_io_control && always() && !inputs.diagnostic_ref && !startsWith(github.ref, 'refs/tags/') }}
     needs: [bench-history, bench-dashboard]
     runs-on: ubuntu-latest
     timeout-minutes: 1
@@ -113,7 +145,12 @@ jobs:
           fi
 
   bench-history:
-    if: ${{ !inputs.diagnostic_ref && !startsWith(github.ref, 'refs/tags/') }}
+    name: ${{ inputs.compositor_guard_control && format('bench-history ({0})', matrix.arm) || 'bench-history' }}
+    if: ${{ (github.event_name == 'workflow_dispatch' && (inputs.compositor_guard_control || inputs.history_pool_control)) || (!startsWith(github.ref, 'refs/tags/') && !inputs.startup_io_control && (!inputs.diagnostic_ref || (github.event_name == 'workflow_dispatch' && inputs.history_scroll_control))) }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(inputs.compositor_guard_control && '[{"arm":"OLD1","feature":"disable"},{"arm":"NEW","feature":"enable"},{"arm":"OLD2","feature":"disable"}]' || '[{"arm":"ordinary","feature":""}]') }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     defaults:
@@ -121,6 +158,8 @@ jobs:
         working-directory: hub
     steps:
       - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.diagnostic_ref || github.sha }}
       - uses: actions/setup-node@v7
         with:
           node-version: 24
@@ -128,19 +167,102 @@ jobs:
           cache-dependency-path: hub/package-lock.json
       - run: npm ci
       - run: npm run build
-      - run: QUOTUM_CHROME="$(command -v google-chrome)" npm run bench -- --ci --scope history
+      - name: Require the isolated pinned compositor guard control
+        if: ${{ inputs.compositor_guard_control }}
         env:
-          QUOTUM_BENCH_DIAGNOSTICS_DIR: ${{ runner.temp }}/quotum-bench-history
+          QUOTUM_BENCH_SOURCE_SHA: ${{ inputs.diagnostic_ref }}
+          EXPECTED_CLIENT: ${{ inputs.expected_client_sha256 }}
+          CONTROL_EVENT: ${{ github.event_name }}
+          CONTROL_ARM: ${{ matrix.arm }}
+          FEATURE_STATE: ${{ matrix.feature }}
+          CONFLICT: ${{ inputs.startup_io_control || inputs.history_scroll_control || inputs.history_pool_control || inputs.trace_only || inputs.original_timing || inputs.native_trace || inputs.native_profile || inputs.caption_control || inputs.native_postmortem_control }}
+        run: |
+          node --import tsx --input-type=module <<'JS'
+          import assert from 'node:assert/strict';import {execFileSync} from 'node:child_process';
+          import {sourceIdentity} from './bench/idleCpuDiagnostic.ts';import {clientIdentity} from './bench/evidence.ts';
+          assert.equal(process.env.CONTROL_EVENT,'workflow_dispatch');assert.notEqual(process.env.CONFLICT,'true');
+          assert.match(process.env.QUOTUM_BENCH_SOURCE_SHA??'',/^[a-f0-9]{40}$/);assert.match(process.env.EXPECTED_CLIENT??'',/^[a-f0-9]{64}$/);
+          assert.match(process.env.CONTROL_ARM??'',/^(OLD1|NEW|OLD2)$/);
+          assert.equal(({OLD1:'disable',NEW:'enable',OLD2:'disable'})[process.env.CONTROL_ARM],process.env.FEATURE_STATE);
+          const source=sourceIdentity(),client=clientIdentity();
+          assert.equal(source.sourceHead,process.env.QUOTUM_BENCH_SOURCE_SHA);assert.equal(source.checkoutSha,source.sourceHead);
+          assert.equal(execFileSync('git',['status','--porcelain'],{encoding:'utf8',timeout:1000}).trim(),'');
+          assert.equal(client.status,'available');assert.equal(client.sha256,process.env.EXPECTED_CLIENT);
+          JS
+      - name: Install the identical pinned Google Chrome Beta package
+        if: ${{ inputs.compositor_guard_control }}
+        run: |
+          package="$RUNNER_TEMP/quotum-c3-google-chrome-beta.deb"
+          [[ ! -e "$package" && ! -L "$package" ]]
+          trap 'rm -f -- "$package"' EXIT
+          curl --fail --location --max-time 120 --max-filesize 536870912 --output "$package" https://dl.google.com/linux/chrome/deb/pool/main/g/google-chrome-beta/google-chrome-beta_157.0.8103.15-1_amd64.deb
+          printf '%s  %s\n' b78ca10a22599e2a1024a39edd5a3235a06c26e2afad606c6c9ec123378c55cf "$package" | sha256sum --check --status
+          [[ "$(dpkg-deb -f "$package" Package)" == google-chrome-beta ]]
+          [[ "$(dpkg-deb -f "$package" Version)" == 157.0.8103.15-1 ]]
+          [[ "$(dpkg-deb -f "$package" Architecture)" == amd64 ]]
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends "$package"
+          [[ "$(dpkg-query -W -f='${Version}' google-chrome-beta)" == 157.0.8103.15-1 ]]
+      - name: Require the isolated history scroll control
+        if: ${{ inputs.history_scroll_control }}
+        env:
+          CONFLICTING_MODE: ${{ inputs.trace_only || inputs.original_timing || inputs.native_trace || inputs.native_profile || inputs.caption_control || inputs.native_postmortem_control || inputs.history_pool_control }}
+        run: node -e 'if(process.env.CONFLICTING_MODE==="true")throw Error("Choose only the history scroll control")'
+      - name: Require the isolated history pool control
+        if: ${{ inputs.history_pool_control }}
+        env:
+          CONFLICTING_MODE: ${{ inputs.trace_only || inputs.original_timing || inputs.native_trace || inputs.native_profile || inputs.caption_control || inputs.native_postmortem_control || inputs.history_scroll_control || inputs.compositor_guard_control || inputs.startup_io_control }}
+        run: node -e 'if(process.env.CONFLICTING_MODE==="true")throw Error("Choose only the history pool control")'
+      - name: Prepare the diagnostic native debugger
+        if: ${{ inputs.history_scroll_control || inputs.compositor_guard_control || inputs.history_pool_control }}
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends gdb
+      - name: Prepare matching renderer unwind tables
+        if: ${{ inputs.history_scroll_control || inputs.compositor_guard_control || inputs.history_pool_control }}
+        env:
+          COMPOSITOR_GUARD: ${{ inputs.compositor_guard_control }}
+        run: |
+          if [[ "$COMPOSITOR_GUARD" == true ]]; then
+            bash bench/prepareNativeUnwind.sh google-chrome-beta google-chrome-beta
+          else
+            bash bench/prepareNativeUnwind.sh
+          fi
+      - name: Prepare the single-feature vendor launcher
+        if: ${{ inputs.compositor_guard_control }}
+        env:
+          CONTROL_ARM: ${{ matrix.arm }}
+          FEATURE_STATE: ${{ matrix.feature }}
+        run: |
+          case "$CONTROL_ARM:$FEATURE_STATE" in OLD1:disable|NEW:enable|OLD2:disable) ;; *) exit 1 ;; esac
+          control_dir="$RUNNER_TEMP/quotum-c3-guard-$CONTROL_ARM"
+          mkdir "$control_dir"
+          vendor="$(command -v google-chrome-beta)"
+          beta_image="$(dirname "$(readlink -f "$vendor")")/chrome"
+          [[ -x "$vendor" && -f "$beta_image" ]]
+          printf '#!/usr/bin/env bash\nexec %q --%s-features=DeferMainFrameBeforeCommitWithPendingTree "$@"\n' "$vendor" "$FEATURE_STATE" > "$control_dir/chrome"
+          chmod 700 "$control_dir/chrome"
+          sha256sum "$vendor" "$beta_image" "$control_dir/chrome" > "$control_dir/pins-first.txt"
+          cat "$control_dir/pins-first.txt"
+      - run: QUOTUM_CHROME="${QUOTUM_C3_CHROME:-$(command -v google-chrome)}" npm run bench -- --ci --scope history
+        env:
+          QUOTUM_C3_CHROME: ${{ inputs.compositor_guard_control && format('{0}/quotum-c3-guard-{1}/chrome', runner.temp, matrix.arm) || '' }}
+          QUOTUM_BENCH_HISTORY_SCROLL_CONTROL: ${{ (inputs.history_scroll_control || inputs.compositor_guard_control) && '1' || '' }}
+          QUOTUM_BENCH_HISTORY_SCROLL_SUFFIX: ${{ inputs.history_scroll_control && !inputs.compositor_guard_control && '1' || '' }}
+          QUOTUM_BENCH_DIAGNOSE_HISTORY_POOL: ${{ inputs.history_pool_control && '1' || '' }}
+          QUOTUM_BENCH_SOURCE_SHA: ${{ (inputs.history_scroll_control || inputs.compositor_guard_control || inputs.history_pool_control) && inputs.diagnostic_ref || '' }}
+          QUOTUM_BENCH_EXPECTED_CLIENT_SHA256: ${{ (inputs.history_scroll_control || inputs.compositor_guard_control || inputs.history_pool_control) && inputs.expected_client_sha256 || '' }}
+          QUOTUM_BENCH_DIAGNOSTICS_DIR: ${{ inputs.compositor_guard_control && format('{0}/quotum-bench-history-{1}', runner.temp, matrix.arm) || format('{0}/quotum-bench-history', runner.temp) }}
       - name: History benchmark evidence
         if: always()
         uses: actions/upload-artifact@v7
         with:
-          name: bench-history-${{ github.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/quotum-bench-history
+          name: ${{ inputs.compositor_guard_control && format('bench-history-guard-{0}-{1}-{2}', matrix.arm, github.run_id, github.run_attempt) || format('bench-history-{0}-{1}-{2}', github.sha, github.run_id, github.run_attempt) }}
+          path: |
+            ${{ inputs.compositor_guard_control && format('{0}/quotum-bench-history-{1}', runner.temp, matrix.arm) || format('{0}/quotum-bench-history', runner.temp) }}
+            ${{ inputs.compositor_guard_control && format('{0}/quotum-c3-guard-{1}/pins-first.txt', runner.temp, matrix.arm) || '' }}
           if-no-files-found: warn
 
   bench-dashboard:
-    if: ${{ !startsWith(github.ref, 'refs/tags/') && (!inputs.diagnostic_ref || (github.event_name == 'workflow_dispatch' && (inputs.native_trace || inputs.native_profile || inputs.caption_control))) }}
+    if: ${{ !inputs.compositor_guard_control && !inputs.startup_io_control && !inputs.history_pool_control && !startsWith(github.ref, 'refs/tags/') && !inputs.native_postmortem_control && !inputs.history_scroll_control && (!inputs.diagnostic_ref || (github.event_name == 'workflow_dispatch' && (inputs.native_trace || inputs.native_profile || inputs.caption_control))) }}
     runs-on: ubuntu-latest
     # Independent traffic checks run on another runner; every dashboard phase stays here.
     timeout-minutes: 20
@@ -205,7 +327,7 @@ jobs:
           if-no-files-found: warn
 
   idle-cpu-control:
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.diagnostic_ref != '' && !inputs.native_trace && !inputs.native_profile && !inputs.caption_control }}
+    if: ${{ !inputs.compositor_guard_control && !inputs.startup_io_control && !inputs.history_pool_control && github.event_name == 'workflow_dispatch' && inputs.diagnostic_ref != '' && !inputs.native_trace && !inputs.native_profile && !inputs.caption_control && !inputs.native_postmortem_control && !inputs.history_scroll_control }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     defaults:
@@ -254,8 +376,428 @@ jobs:
             hub/dist/client/assets/index-*.js
           if-no-files-found: warn
 
+  native-postmortem-control:
+    if: ${{ !inputs.compositor_guard_control && !inputs.startup_io_control && github.event_name == 'workflow_dispatch' && inputs.diagnostic_ref != '' && inputs.native_postmortem_control }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    defaults:
+      run:
+        working-directory: hub
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.diagnostic_ref }}
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: hub/package-lock.json
+      - name: Require the isolated native control
+        env:
+          TRACE: ${{ inputs.trace_only }}
+          PROFILE: ${{ inputs.original_timing }}
+          NATIVE_TRACE: ${{ inputs.native_trace }}
+          NATIVE_PROFILE: ${{ inputs.native_profile }}
+          CAPTION: ${{ inputs.caption_control }}
+          HISTORY_SCROLL: ${{ inputs.history_scroll_control }}
+          HISTORY_POOL: ${{ inputs.history_pool_control }}
+        run: node -e 'if(["TRACE","PROFILE","NATIVE_TRACE","NATIVE_PROFILE","CAPTION","HISTORY_SCROLL","HISTORY_POOL"].some(k=>process.env[k]==="true"))throw Error("Choose only the native postmortem control")'
+      - run: npm ci
+      - run: npm run build
+      - name: Prepare the diagnostic native debugger
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends gdb
+      - name: Prepare matching renderer unwind tables
+        run: bash bench/prepareNativeUnwind.sh
+      - name: Run the owned native control under a separate UID
+        env:
+          SOURCE_SHA: ${{ inputs.diagnostic_ref }}
+          CLIENT_SHA256: ${{ inputs.expected_client_sha256 }}
+        run: |
+          node_binary="$(command -v node)"
+          chrome_binary="$(command -v google-chrome)"
+          receipt="$RUNNER_TEMP/quotum-native-postmortem-control"
+          mkdir -p "$receipt"
+          sudo test ! -e /etc/sudoers.d/quotum-native-control
+          runtime_home="$(mktemp -d /tmp/quotum-native-control-home-XXXXXX)"
+          trap 'sudo rm -f /etc/sudoers.d/quotum-native-control; sudo rm -rf "$runtime_home"' EXIT
+          sudo chown nobody:"$(id -gn)" "$runtime_home"
+          printf 'nobody ALL=(root) NOPASSWD: /bin/sh, %s\n' "$node_binary" | sudo tee /etc/sudoers.d/quotum-native-control >/dev/null
+          sudo chmod 0440 /etc/sudoers.d/quotum-native-control
+          set -o pipefail
+          sudo -n -- /usr/bin/sudo -n -u nobody -g "$(id -gn)" -- /usr/bin/env HOME="$runtime_home" XDG_CONFIG_HOME="$runtime_home/config" XDG_CACHE_HOME="$runtime_home/cache" "$node_binary" --import tsx bench/nativePostmortemControl.ts "$SOURCE_SHA" "$CLIENT_SHA256" "$chrome_binary" 2>&1 | tee "$receipt/control-first.jsonl"
+      - name: Native debugger identity
+        if: always()
+        run: |
+          receipt="$RUNNER_TEMP/quotum-native-postmortem-control"
+          mkdir -p "$receipt"
+          printf 'unavailable\n' > "$receipt/debugger-first.txt"
+          node --import tsx --input-type=module <<'JS' > "$receipt/debugger-first.txt" 2>&1
+          import {nativeDebugger} from './bench/nativePostmortem.ts';
+          import {execFileSync,spawnSync} from 'node:child_process';
+          import {createHash} from 'node:crypto';
+          import {readFileSync} from 'node:fs';
+          const file=await nativeDebugger();
+          if(!file){console.log('unavailable');process.exit(0);}
+          console.log(createHash('sha256').update(readFileSync(file)).digest('hex')+'  '+file);
+          console.log(execFileSync(file,['--version'],{encoding:'utf8',timeout:2000}));
+          const started=performance.now();
+          const probe=spawnSync('/usr/bin/sudo',['-n','--','/usr/bin/timeout','--signal=TERM','--kill-after=0.2s','2s',file,'-nx','-batch','-ex','quit'],{encoding:'utf8',timeout:2500,maxBuffer:65536});
+          console.log(JSON.stringify({kind:'debugger-startup-after-capture',cold:false,elapsedMs:performance.now()-started,exit:probe.status,signal:probe.signal,
+            outputBytes:Buffer.byteLength(probe.stdout??''),diagnosticBytes:Buffer.byteLength(probe.stderr??'')}));
+          JS
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: native-postmortem-control
+          path: ${{ runner.temp }}/quotum-native-postmortem-control/
+          if-no-files-found: warn
+
+  startup-io-control:
+    if: ${{ !inputs.compositor_guard_control && github.event_name == 'workflow_dispatch' && inputs.startup_io_control }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: hub
+    env:
+      QUOTUM_BENCH_SOURCE_SHA: ${{ inputs.diagnostic_ref }}
+      QUOTUM_BENCH_EXPECTED_CLIENT_SHA256: ${{ inputs.expected_client_sha256 }}
+    steps:
+      - name: Require the isolated pinned startup control
+        working-directory: ${{ runner.temp }}
+        env:
+          CONFLICT: ${{ inputs.trace_only || inputs.original_timing || inputs.native_trace || inputs.native_profile || inputs.caption_control || inputs.native_postmortem_control || inputs.history_scroll_control || inputs.history_pool_control }}
+        run: |
+          [[ "$QUOTUM_BENCH_SOURCE_SHA" =~ ^[a-f0-9]{40}$ && "$QUOTUM_BENCH_EXPECTED_CLIENT_SHA256" =~ ^[a-f0-9]{64}$ && "$CONFLICT" != true ]]
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.diagnostic_ref }}
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: hub/package-lock.json
+      - run: npm ci
+      - run: npm run build
+      - name: Check the common source and compiled-client pins
+        run: |
+          node --import tsx --input-type=module <<'JS'
+          import assert from 'node:assert/strict';import {execFileSync} from 'node:child_process';
+          import {sourceIdentity} from './bench/idleCpuDiagnostic.ts';import {clientIdentity} from './bench/evidence.ts';
+          const source=sourceIdentity(),client=clientIdentity();
+          assert.equal(source.checkoutSha,source.sourceHead);assert.equal(client.status,'available');assert.equal(client.sha256,process.env.QUOTUM_BENCH_EXPECTED_CLIENT_SHA256);
+          assert.equal(execFileSync('git',['status','--porcelain'],{encoding:'utf8'}).trim(),'');
+          JS
+      - name: Prepare the owned ABA controller and ELF advice shim
+        run: |
+          startup_dir="$RUNNER_TEMP/quotum-startup-io-ABA"
+          mkdir -p "$startup_dir"
+          printf 'QUOTUM_BENCH_DIAGNOSTICS_DIR=%s\nQUOTUM_C1_REAL_CHROME=%s\n' "$startup_dir" "$(command -v google-chrome)" >> "$GITHUB_ENV"
+          cat > "$RUNNER_TEMP/quotum-c1-advice.py" <<'PY'
+          #!/usr/bin/env python3
+          import json, os, stat, sys, time
+
+          trial = os.environ['QUOTUM_C1_TRIAL']
+          if trial not in ('A1', 'B', 'A2'):
+              raise RuntimeError('Unexpected trial')
+          command = os.environ['QUOTUM_C1_REAL_CHROME']
+          image = os.path.join(os.path.dirname(os.path.realpath(command)), 'chrome')
+          receipt = {'trial': trial, 'phase': 'conditioning', 'advice': 'DONTNEED',
+                     'adviceCompleted': False, 'readClosed': False, 'bytes': 0,
+                     'pid': os.getpid(), 'group': os.getpgrp(), 'session': os.getsid(0)}
+          fields = lambda value: {key: str(getattr(value, key)) for key in ['st_dev', 'st_ino', 'st_size', 'st_mtime_ns', 'st_ctime_ns']}
+          started = time.monotonic_ns()
+          failure = None
+          try:
+              flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+              with os.fdopen(os.open(image, flags), 'rb', buffering=0) as source:
+                  if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+                      raise RuntimeError('Expected regular image')
+                  receipt['before'] = fields(os.fstat(source.fileno()))
+                  os.posix_fadvise(source.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+                  receipt['adviceCompleted'] = True
+                  receipt['adviceMs'] = (time.monotonic_ns() - started) / 1_000_000
+                  receipt['phase'] = 'preread' if trial == 'B' else 'conditioned'
+                  read_started = time.monotonic_ns()
+                  if trial == 'B':
+                      while chunk := source.read(64 * 1024):
+                          receipt['bytes'] += len(chunk)
+                  receipt['readMs'] = (time.monotonic_ns() - read_started) / 1_000_000
+                  receipt['after'] = fields(os.fstat(source.fileno()))
+              receipt['readClosed'] = True
+              receipt['pathAfter'] = fields(os.stat(image))
+              if receipt['before'] != receipt['after'] or receipt['after'] != receipt['pathAfter']:
+                  raise RuntimeError('Image changed')
+              receipt['phase'] = 'exec-ready'
+          except Exception as error:
+              receipt['phase'] = 'conditioning-failed'
+              receipt['failure'] = type(error).__name__
+              failure = error
+          flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+          with os.fdopen(os.open(os.environ['QUOTUM_C1_RECEIPT'], flags, 0o600), 'w') as target:
+              json.dump(receipt, target)
+          if failure is not None:
+              raise SystemExit(1)
+          os.execv(command, [command, *sys.argv[1:]])
+          PY
+          cat > "$RUNNER_TEMP/quotum-c1-aba.mjs" <<'JS'
+          import assert from 'node:assert/strict';
+          import {mkdirSync,readFileSync,writeFileSync,writeSync} from 'node:fs';
+          import {execFileSync} from 'node:child_process';
+          import {createServer} from 'node:net';
+          import path from 'node:path';
+          import {pathToFileURL} from 'node:url';
+
+
+          const write=(file,value)=>{const text=JSON.stringify(value,null,2)+'\n';if(Buffer.byteLength(text)>1024*1024)throw Error('Diagnostic file cap');writeFileSync(file,text,{flag:'wx'});};
+
+          /** Exactly one trial per CLI process; prefix and browser lifetimes belong to it. */
+          export async function runTrial({trial,chrome,shim,directory},{launch,Owner,pins,preparePrefix,save=write}){
+            assert.ok(['A1','B','A2'].includes(trial));mkdirSync(directory,{recursive:true});
+            const before=pins(),owner=new Owner(),keys=['QUOTUM_C1_REAL_CHROME','QUOTUM_C1_TRIAL','QUOTUM_C1_RECEIPT'];
+            const previous=Object.fromEntries(keys.map(key=>[key,process.env[key]]));
+            let prefix,browser,report,first,prefixFailure,ownerFailure,prefixStopFailure,cancelled=false;
+            const cancel=()=>{cancelled=true;void owner.close().catch(()=>{});};
+            const signals=['SIGINT','SIGTERM','SIGHUP'];for(const signal of signals)process.once(signal,cancel);
+            try{
+              save(path.join(directory,'source-before.json'),before);
+              process.env.QUOTUM_C1_REAL_CHROME=chrome;process.env.QUOTUM_C1_TRIAL=trial;process.env.QUOTUM_C1_RECEIPT=path.join(directory,'shim-first.json');
+              try{
+                prefix=await preparePrefix({signal:owner.signal,onExit:cancel});owner.signal.throwIfAborted();
+                save(path.join(directory,'prefix-first.json'),prefix.evidence);
+                try{
+                  browser=await owner.start(signal=>launch(shim,false,signal));report=browser.launchReport?.();
+                  first={status:report?.stage==='ready'?'ready':'unknown',report};
+                }catch(error){report=error.report;first={status:'failed',failure:error.name,report};}
+                save(path.join(directory,'startup-first.json'),first);
+              }catch(error){prefixFailure=error.name;}
+              finally{
+                // The backend must remain alive until the browser and its owned helpers close.
+                try{await owner.close();}catch(error){ownerFailure=error.name;}
+                try{await prefix?.stop();}catch(error){prefixStopFailure=error.name;}
+              }
+              const after=pins();save(path.join(directory,'source-after.json'),after);assert.deepEqual(after,before,'Source/client changed');
+              const last=browser?.launchReport?.()??report,cleanup=last?.cleanup;
+              const clean=!!prefix&&!prefixFailure&&!prefixStopFailure&&!ownerFailure&&!cancelled&&owner.failures.length===0&&cleanup?.status==='closed'&&cleanup.reaped===true&&cleanup.pipesClosed===true;
+              let shimReceipt=null;try{shimReceipt=JSON.parse(readFileSync(path.join(directory,'shim-first.json'),'utf8'));}catch{}
+              const result={kind:'startup-io-prefix-trial',trial,workerPid:process.pid,mode:'diagnostic',canonicalPass:false,C1RepairProven:false,
+                canonicalFixturePreparation:!!prefix,exactHistoricalStartReproduction:false,originalStartupDeadlineMs:20000,
+                source:before,sourceAfter:after,first,last,clean,cancelled,prefixFailure,prefixStopFailure,prefixStopOutcome:prefix?(prefixStopFailure?'failed':'completed'):'unknown',ownerFailure,ownerFailures:owner.failures,shimReceipt};
+              save(path.join(directory,'result-first.json'),result);return result;
+            }finally{
+              try{await owner.close();}catch{}
+              try{await prefix?.stop();}catch{}
+              for(const signal of signals)process.removeListener(signal,cancel);
+              for(const key of keys)if(previous[key]===undefined)delete process.env[key];else process.env[key]=previous[key];
+            }
+          }
+
+          /** The ordinary benchmark's current preparation, before it starts its browser. */
+          export async function preparePrefix(repository,{signal,onExit},dependencies){
+            const url=file=>pathToFileURL(path.join(repository,'hub',file)).href;
+            const [{addressOf,Demo,prepare},{SETS},{people},{fixtureTiming},{panningSet,seedPanningBudgets},{hear}]=dependencies??await Promise.all([
+              import(url('demo/index.ts')),import(url('demo/catalogue.ts')),import(url('demo/model.ts')),import(url('bench/still.ts')),import(url('bench/fixture.ts')),import(url('bench/stream.ts'))]);
+            signal.throwIfAborted();
+            const bind=process.env.QUOTUM_BIND||'127.0.0.1';
+            const port=await new Promise((resolve,reject)=>{const server=createServer();server.once('error',reject);server.listen({host:bind,port:0},()=>{const {port}=server.address();server.close(()=>resolve(port));});});
+            const address=addressOf({...process.env,QUOTUM_PORT:String(port)});await prepare(address);signal.throwIfAborted();
+            const set=panningSet(SETS[0]),timing=fixtureTiming(Date.now()),started=performance.now();
+            const demo=new Demo({set,scene:set.scene,still:true,idleAgents:true,money:false,start:timing.start,address,onExit});
+            let heard,stopping;
+            const stop=()=>stopping??=(async()=>{heard?.close();await demo.stop();})();
+            try{
+              const stand=await demo.run(signal);signal.throwIfAborted();
+              const aborted=()=>{void stop().catch(()=>{});};
+              signal.addEventListener('abort',aborted,{once:true});
+              try{
+                signal.throwIfAborted();
+                seedPanningBudgets(path.join(demo.dir,'quotum.sqlite'),stand);signal.throwIfAborted();
+                const ana=stand.people.get(people(set)[0].id),board=ana.personalBoard;
+                heard=await hear(address.base,ana.cookie,board);signal.throwIfAborted();
+                return{stop,evidence:{kind:'canonical-startup-prefix',prepared:true,fixtureTiming:timing,elapsedMs:performance.now()-started,hubPid:demo.pid,streamClosure:'worker-exit-required'}};
+              }finally{signal.removeEventListener('abort',aborted);}
+            }catch(error){try{await stop();}catch{/* Preserve the primary rejection; no prefix lease was confirmed. */}throw error;}
+          }
+
+
+
+          /** Pin only source and built client; no Chrome image content is read here. */
+          export function sourcePins(repository,clientIdentity,git=args=>execFileSync('git',['-C',repository,...args],{encoding:'utf8',timeout:1000}).trim()){
+            return()=>{
+              assert.match(process.env.QUOTUM_BENCH_SOURCE_SHA??'',/^[a-f0-9]{40}$/);
+              assert.match(process.env.QUOTUM_BENCH_EXPECTED_CLIENT_SHA256??'',/^[a-f0-9]{64}$/);
+              const sha=git(['rev-parse','HEAD']),tree=git(['rev-parse','HEAD^{tree}']),client=clientIdentity();
+              assert.equal(sha,process.env.QUOTUM_BENCH_SOURCE_SHA);assert.match(tree,/^[a-f0-9]{40}$/);
+              assert.equal(git(['status','--porcelain']),'');assert.equal(client.status,'available');
+              assert.equal(client.sha256,process.env.QUOTUM_BENCH_EXPECTED_CLIENT_SHA256);
+              return{sha,tree,client,dirty:false,run:process.env.GITHUB_RUN_ID??null,attempt:process.env.GITHUB_RUN_ATTEMPT??null};
+            };
+          }
+
+          export async function realDependencies({repository}){
+            const url=file=>pathToFileURL(path.join(repository,'hub/bench',file)).href;
+            const [{launchChrome},{RunOwner},{clientIdentity}]=await Promise.all([import(url('cdp.ts')),import(url('runOwner.ts')),import(url('evidence.ts'))]);
+            return{launch:launchChrome,Owner:RunOwner,pins:sourcePins(repository,clientIdentity),preparePrefix:args=>preparePrefix(repository,args)};
+          }
+
+          /** One fixed trial per process. A cleaned original startup failure is still retained. */
+          export async function workerMain(args,deps){
+            let options,result,errorKind,code=2;
+            try{
+              assert.equal(args.length,5);
+              const [repository,trial,chrome,shim,directory]=args;
+              assert.ok(['A1','B','A2'].includes(trial));
+              for(const value of [repository,chrome,shim,directory])assert.ok(typeof value==='string'&&path.isAbsolute(value));
+              options={repository,trial,chrome,shim,directory};
+              result=await runTrial(options,deps??await realDependencies(options));
+              code=result.clean===true&&result.shimReceipt?.phase==='exec-ready'?0:2;
+            }catch(error){errorKind=['AssertionError','TypeError','RangeError','AbortError','Error'].includes(error?.name)?error.name:'other';}
+            const summary={kind:'startup-io-prefix-worker',workerPid:process.pid,trial:options?.trial??null,code,canonicalPass:false,C1RepairProven:false,
+              clean:result?.clean===true,firstStatus:result?.first?.status??null,shimPhase:result?.shimReceipt?.phase??null,errorKind};
+            if(options)try{
+              mkdirSync(options.directory,{recursive:true});
+              writeFileSync(path.join(options.directory,'worker-first.json'),JSON.stringify(summary)+'\n',{flag:'wx',mode:0o600});
+            }catch{code=summary.code=2;summary.errorKind??='evidence';}
+            return{code,result,summary};
+          }
+
+          /** Exit after cleanup even if a closed event reader still owns a process handle. */
+          export async function workerEntry(args,deps){
+            const value=await workerMain(args,deps);
+            try{writeSync(1,JSON.stringify(value.summary)+'\n');}catch{value.code=2;}
+            process.exit(value.code);
+          }
+
+
+
+          export function rollup(directory){
+            assert.match(process.env.QUOTUM_BENCH_SOURCE_SHA??'',/^[a-f0-9]{40}$/);assert.match(process.env.QUOTUM_BENCH_EXPECTED_CLIENT_SHA256??'',/^[a-f0-9]{64}$/);
+            const trials=[],failures=[];
+            for(const trial of ['A1','B','A2']){
+              try{
+                const value=JSON.parse(readFileSync(path.join(directory,trial,'result-first.json'),'utf8'));
+                const exited=JSON.parse(readFileSync(path.join(directory,trial,'worker-exit-first.json'),'utf8'));
+                if(value.trial!==trial||!value.clean||value.cancelled||!value.canonicalFixturePreparation||value.exactHistoricalStartReproduction!==false||value.originalStartupDeadlineMs!==20000||value.shimReceipt?.phase!=='exec-ready'||!Number.isSafeInteger(value.workerPid)||value.workerPid<=0||exited.pid!==value.workerPid||exited.status!=='reaped'||exited.exit!==0)throw Error('Trial admission');
+                assert.deepEqual(value.sourceAfter,value.source);trials.push(value);
+              }catch{failures.push(trial);}
+            }
+            let bound=trials.length===3;
+            if(bound){
+              const first=trials[0].source;
+              bound=trials.every(value=>JSON.stringify(value.source)===JSON.stringify(first));
+              bound&&=new Set(trials.map(value=>value.workerPid)).size===3;
+              bound&&=first?.sha===process.env.QUOTUM_BENCH_SOURCE_SHA&&first?.client?.sha256===process.env.QUOTUM_BENCH_EXPECTED_CLIENT_SHA256&&first.dirty===false;
+            }
+            const historyReady=bound&&!failures.length;
+            const result={kind:'startup-io-prefix-aba',mode:'diagnostic',canonicalPass:false,C1RepairProven:false,
+              canonicalFixturePreparation:'fresh-process-per-arm',exactHistoricalStartReproduction:false,originalStartupDeadlineMs:20000,
+              conditioning:'readonly ELF DONTNEED advice, not guaranteed eviction',source:trials[0]?.source,sourceAfter:trials.at(-1)?.sourceAfter,trials,failures,historyReady};
+            const text=JSON.stringify(result,null,2)+'\n';if(Buffer.byteLength(text)>1024*1024)throw Error('Diagnostic file cap');
+            writeFileSync(path.join(directory,'result-first.json'),text,{flag:'wx'});return result;
+          }
+
+          if(process.argv[1]&&import.meta.url===pathToFileURL(path.resolve(process.argv[1])).href){
+           const args=process.argv.slice(2);
+           if(args.length===5)await workerEntry(args);
+           else{
+            assert.equal(args.length,1);let result;
+            try{result=rollup(args[0]);}
+            finally{if(process.env.GITHUB_OUTPUT)writeFileSync(process.env.GITHUB_OUTPUT,'history_ready='+String(result?.historyReady===true)+'\n',{flag:'a'});}
+            if(!result.historyReady||result.trials.some(value=>value.first?.status!=='ready'))process.exitCode=1;
+           }
+          }
+          JS
+          chmod 0700 "$RUNNER_TEMP/quotum-c1-advice.py"
+      - name: Observe the fixed ABA sequence with fresh benchmark preparation
+        id: probe
+        run: |
+          set -euo pipefail
+          c1_repository="$GITHUB_WORKSPACE"
+          c1_node="$(command -v node)"
+          c1_chrome="$QUOTUM_C1_REAL_CHROME"
+          c1_shim="$RUNNER_TEMP/quotum-c1-advice.py"
+          c1_directory="$QUOTUM_BENCH_DIAGNOSTICS_DIR/probe"
+          c1_worker="$RUNNER_TEMP/quotum-c1-aba.mjs"
+          c1_rollup="$c1_worker"
+          c1_child=
+          c1_cancel() {
+            trap - INT TERM HUP
+            if [[ -n "$c1_child" ]]; then
+              kill -TERM "$c1_child" 2>/dev/null || true
+              wait "$c1_child" || true
+            fi
+            exit 130
+          }
+          trap c1_cancel INT TERM HUP
+          cd "$c1_repository/hub"
+          for c1_trial in A1 B A2; do
+            "$c1_node" --import tsx "$c1_worker" "$c1_repository" "$c1_trial" "$c1_chrome" "$c1_shim" "$c1_directory/$c1_trial" &
+            c1_child=$!
+            if wait "$c1_child"; then
+              (set -o noclobber; printf '{"status":"reaped","exit":0,"pid":%s}\n' "$c1_child" > "$c1_directory/$c1_trial/worker-exit-first.json")
+              c1_child=
+            else
+              c1_status=$?
+              c1_child=
+              exit "$c1_status"
+            fi
+          done
+          trap - INT TERM HUP
+          "$c1_node" "$c1_rollup" "$c1_directory"
+      - name: Run the unchanged complete history scroll control once
+        if: ${{ always() && !cancelled() && steps.probe.outputs.history_ready == 'true' }}
+        id: startup
+        env:
+          QUOTUM_BENCH_HISTORY_SCROLL_CONTROL: '1'
+        run: QUOTUM_CHROME="$QUOTUM_C1_REAL_CHROME" npm run bench -- --ci --scope history
+      - name: Record metadata after the probe outcomes
+        if: ${{ always() && steps.probe.outcome != 'skipped' && steps.probe.outcome != '' }}
+        env:
+          BENCH_OUTCOME: ${{ steps.startup.outcome }}
+          CONTROL_WORKFLOW_REF: ${{ github.workflow_ref }}
+          CONTROL_WORKFLOW_SHA: ${{ github.workflow_sha }}
+        run: |
+          python3 - <<'PY'
+          import hashlib,json,os,pathlib,re,subprocess,time
+          root=pathlib.Path(os.environ['QUOTUM_BENCH_DIAGNOSTICS_DIR']);root.mkdir(parents=True,exist_ok=True)
+          out={'kind':'startup-io-aba-control','canonicalPass':False,'C1RepairProven':False,'exactDemoPrefixReproduction':False,'canonicalFixturePreparation':'fresh-process-per-arm','fullHistoryStep':os.environ['BENCH_OUTCOME'],'postStepStartedWallMs':int(time.time()*1000)}
+          out['checkoutWorkflowHash']=hashlib.sha256(pathlib.Path('../.github/workflows/ci.yml').read_bytes()).hexdigest()
+          out['workflowRef']=os.environ['CONTROL_WORKFLOW_REF'];out['workflowSha']=os.environ['CONTROL_WORKFLOW_SHA']
+          def save():
+              out['postStepFinishedWallMs']=int(time.time()*1000)
+              with (root/'startup-io-sidecar.json').open('x') as target:json.dump(out,target)
+          report=root/'probe/result-first.json'
+          if not report.exists():
+              out['status']='probe-outcomes-unknown';save();raise SystemExit(0)
+          probe=json.loads(report.read_text());out['probe']=probe
+          if probe.get('historyReady') is not True:
+              out['status']='probe-sequence-or-cleanup-unknown';save();raise SystemExit(0)
+          def pin(file):
+              before=file.stat();digest=hashlib.sha256()
+              with file.open('rb') as source:
+                  for chunk in iter(lambda:source.read(1024*1024),b''):digest.update(chunk)
+              after=file.stat();fields=lambda s:{k:str(getattr(s,k)) for k in ['st_dev','st_ino','st_size','st_mtime_ns','st_ctime_ns']}
+              return {'sha256':digest.hexdigest(),'before':fields(before),'after':fields(after),'unchanged':fields(before)==fields(after)}
+          def command(args):return subprocess.check_output(args,text=True,timeout=5,stderr=subprocess.DEVNULL)
+          try:
+              launcher=pathlib.Path(os.environ['QUOTUM_C1_REAL_CHROME']).resolve();image=launcher.parent/'chrome'
+              out['launcher']=pin(launcher);out['image']=pin(image)
+              out['packageVersion']=command(['dpkg-query','-W','-f=${Version}','google-chrome-stable']).strip()
+              ids=re.findall(r'Build ID: ([a-f0-9]{8,128})',command(['readelf','-n',str(image)]));out['buildId']=ids[0] if len(ids)==1 else None
+              out['imageStableAcrossTrials']=all((value.get('shimReceipt') or {}).get('before')==out['image']['after'] and value['shimReceipt'].get('after')==out['image']['after'] and value['shimReceipt'].get('pathAfter')==out['image']['after'] for value in probe['trials'])
+              out['status']='post-outcome-metadata';out['causalConclusion']='unknown'
+          except Exception as error:out.update(status='metadata-unknown',failure=type(error).__name__)
+          save()
+          PY
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: startup-io-ABA-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/quotum-startup-io-ABA/
+          if-no-files-found: warn
+
   managed-keys:
-    if: ${{ !inputs.diagnostic_ref }}
+    if: ${{ !inputs.compositor_guard_control && !inputs.startup_io_control && !inputs.diagnostic_ref }}
     strategy:
       fail-fast: false
       matrix:
@@ -279,7 +821,7 @@ jobs:
 
   # On every system the agent ships for: its process handling differs between them.
   agent:
-    if: ${{ !inputs.diagnostic_ref }}
+    if: ${{ !inputs.compositor_guard_control && !inputs.startup_io_control && !inputs.diagnostic_ref }}
     strategy:
       fail-fast: false
       matrix:
@@ -306,7 +848,7 @@ jobs:
   # The installers run on people's machines straight from a download: they must at least
   # be sound as scripts (shellcheck is on the runner; pwsh parses without running).
   installers:
-    if: ${{ !inputs.diagnostic_ref }}
+    if: ${{ !inputs.compositor_guard_control && !inputs.startup_io_control && !inputs.diagnostic_ref }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7

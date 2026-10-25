@@ -1,7 +1,7 @@
 import {test} from 'node:test';
 import assert from 'node:assert/strict';
-import {runInNewContext} from 'node:vm';
-import {activityOracle,assertActivityOverlap,assertActivityOutside,assertActivityCancellation,assertActivityGestureRange,FIXED_ACTIVITY_BUDGET,fixedActivityScript,fixedActivityGestureScript,fixedActivityGestureReceipt,fixedActivityPointerParkScript,fixedActivityPointerPark} from '../fixedActivity';
+import vm,{runInNewContext} from 'node:vm';
+import {activityOracle,assertActivityOverlap,assertActivityOutside,assertActivityCancellation,assertActivityGestureRange,FIXED_ACTIVITY_BUDGET,fixedActivityScript,fixedActivityGestureScript,fixedActivityGestureReceipt,fixedActivityPointerParkScript,fixedActivityPointerPark,retainInterruptedActivity} from '../fixedActivity';
 import {packWork,type WorkTrace} from '../../server/domain/periodWork';
 import type {PeriodRequest} from '../../server/domain/periodRead';
 import {fixture,drawings,flush,NOW} from '../../ui/test/periodRuntimeFixture';
@@ -11,7 +11,35 @@ import {HistoryPool} from '../../ui/lib/historyPool';
 import {TILE_CELLS,MAX_READ_TILES} from '../../server/domain/history';
 import {Preparations} from '../../ui/lib/prepare';
 import {plotGroups} from '../../ui/lib/historyPlot';
-import vm from 'node:vm';
+
+for(const mode of ['live','disposed','save-failed','no-evidence'])test('fixed Activity interrupt snapshot: '+mode,t=>{
+  const order:string[]=[],receipts:{name:string;value:unknown}[]=[];
+  const started=performance.now(),state={context:'fixed-activity/30d/cancelled A to B to A',socketState:1,
+    lastReply:{id:7,method:'Runtime.evaluate',at:started-1},lastEvent:null,terminal:null,failure:null,
+    pending:[{id:8,method:'Runtime.evaluate',started,deadline:started+30_000}]};
+  let snapshots=0;
+  const cdp={snapshot:()=>{snapshots++;return structuredClone(state);}};
+  const original=()=>{order.push('owner-abort');state.pending=[];};
+  process.on('SIGTERM',original);t.after(()=>process.off('SIGTERM',original));
+  const signals=['SIGINT','SIGTERM','SIGHUP'] as const,baseline=signals.map(signal=>process.listenerCount(signal));
+  const save=(name:string,value:unknown)=>{order.push('save');if(mode==='save-failed')throw Error('stand-in write failure');receipts.push({name,value});};
+  const dispose=retainInterruptedActivity(cdp,30,mode==='no-evidence'?undefined:{save});t.after(dispose);
+  if(mode==='disposed')dispose();
+  for(const [i,signal] of signals.entries())assert.equal(process.listenerCount(signal),baseline[i]+(mode==='disposed'||mode==='no-evidence'?0:1));
+  process.emit('SIGTERM');
+  assert.deepEqual(state.pending,[]);
+  assert.deepEqual(order,mode==='disposed'||mode==='no-evidence'?['owner-abort']:['save','owner-abort']);
+  assert.equal(snapshots,mode==='disposed'||mode==='no-evidence'?0:1);
+  if(mode==='live'){
+    assert.equal(receipts[0].name,'fixed-activity-command');
+    const saved=receipts[0].value as ReturnType<typeof cdp.snapshot>&{days:number;capturedAtMs:number;wallAt:number};
+    assert.equal(saved.days,30);assert.equal(saved.context,state.context);assert.equal(saved.pending[0].id,8);assert.equal(saved.lastReply.id,7);
+    assert.equal(saved.pending[0].deadline-saved.pending[0].started,30_000);
+    assert.ok(saved.capturedAtMs>=started&&saved.wallAt>0);
+    process.emit('SIGTERM');assert.equal(receipts.length,1);assert.equal(snapshots,1);
+  }else assert.equal(receipts.length,0);
+  dispose();for(const [i,signal] of signals.entries())assert.equal(process.listenerCount(signal),baseline[i]);
+});
 
 for(const period of ['24h','30d'])test(`the complete fixed Activity script installs before the page loads: ${period}`,async()=>{
   class Storage {values=new Map<string,string>();setItem(key:string,value:string){this.values.set(key,value);}getItem(key:string){return this.values.get(key)??null;}}
@@ -164,7 +192,7 @@ test('pointer setup sends native released mouse input and waits for cleanup befo
 
 test('pointer setup preserves the native failure and avoids probing a failed or pending renderer',async()=>{
   type ParkCdp=Parameters<typeof fixedActivityPointerPark>[0];type Command=ReturnType<ParkCdp['snapshot']>;
-  const clean:Command={context:'fixed-activity/pointer-setup',socketState:1,lastAck:null,lastEvent:null,terminal:null,failure:null,pending:[]};
+  const clean:Command={context:'fixed-activity/pointer-setup',socketState:1,lastReply:null,lastEvent:null,terminal:null,failure:null,pending:[]};
   const failed={id:1,method:'Input.dispatchMouseEvent',context:clean.context,started:10,deadline:30010,elapsedMs:30000};
   for(const command of [clean,{...clean,failure:failed},{...clean,pending:[failed]},{...clean,socketState:3},{...clean,terminal:{method:'Inspector.targetCrashed' as const,at:10}}]){
     const h=pointerParkFixture(),error=Error('original native failure');let evaluations=0,settlements=0;
@@ -337,7 +365,9 @@ for(const periodName of ['24h','30d'])for(const change of ['inside work','native
     assert.ok(notices.some(data=>data.changes?.some((row:any)=>row.source===h.source&&row.scope==='quota'&&row.since===to-1)), 'the real producer changed evidence inside the fixed interval');
     if(change==='inside work')assert.ok(notices.some(data=>data.workSince===to-1));
     else if(change==='native measurement')assert.ok(notices.every(data=>data.workSince===undefined),'the native control adds no credited work');
-    else assert.ok(notices.some(data=>data.workSince===to&&data.changes.some((row:any)=>row.since<row.workSince)), 'combined news preserves the earlier native measurement');
+    else assert.ok(notices.some(data=>data.workSince===to
+      &&data.changes.some((row:any)=>row.source===h.source&&row.scope==='quota'&&row.since===to-1&&row.workSince===undefined)
+      &&data.changes.some((row:any)=>row.source===h.source&&row.scope==='quota'&&row.workSince===to&&row.workOnly===true)), 'combined news preserves both independent native and work changes');
     assert.ok(h.requests.some(body=>body.quota),'an inside update must still reach the existing drawing reader');
     assert.equal(total(),change==='inside work'?299_901:299_900,'only the one millisecond before the exclusive endpoint changes selected work');
     assert.equal(native().remainingAtEnd,change==='inside work'?83:82,'the native change must reach the published quota history');
@@ -435,7 +465,7 @@ test('work at the fixed exclusive endpoint leaves calendar and Activity evidence
 test('native Activity failure cleanup never probes a failed or pending renderer',async()=>{
   type GestureCdp=Parameters<typeof fixedActivityGestureReceipt>[0];
   type Command=ReturnType<GestureCdp['snapshot']>;
-  const clean:Command={context:'fixed-activity/gesture',socketState:1,lastAck:null,lastEvent:null,terminal:null,failure:null,pending:[]};
+  const clean:Command={context:'fixed-activity/gesture',socketState:1,lastReply:null,lastEvent:null,terminal:null,failure:null,pending:[]};
   const unavailable:Command[]=[
     {...clean,failure:{id:1,method:'Input.dispatchMouseEvent',context:clean.context,started:10,deadline:30010,elapsedMs:30000}},
     {...clean,pending:[{id:1,method:'Input.dispatchMouseEvent',started:10,deadline:30010}]},

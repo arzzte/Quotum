@@ -16,7 +16,7 @@ test('history cleanup releases its owned target when the renderer cannot answer'
   assert.ok(start >= 0 && end > start);
   let closed = 0, evaluations = 0;
   const contexts: string[] = [];
-  const fixture = {name: 'fixture', cdp: {at: (value: string) => contexts.push(value),
+  const fixture = {name: 'fixture', renderer:undefined, binding:undefined,document:undefined, cdp: {at: (value: string) => contexts.push(value),
     evaluate() {evaluations++; return new Promise(() => {});}},
   tab: {async close() {closed++;}}, close: null as unknown as () => Promise<void>};
   runInNewContext(ts.transpileModule(`${source.slice(start, end)}\nglobalThis.close=close;`, {
@@ -89,6 +89,18 @@ test('pool capture retains exact checkpoints and stops debugger collection after
     if(!fail){assert.equal(raw[0].checkpoints[0].label,'cohort/before-cleanup');assert.equal(raw[0].checkpoints[0].page.pending.preparationSize,1);}
     assert.equal(saved.get('pool-original-fixture').command,command);
   }
+});
+
+test('retirement metadata reuses the existing checkpoint and leaves ordinary snapshots unchanged',()=>{
+  const boundary={periodMs:30*86400000,at:1000,anchor:1,blocks:6,patterns:1,edge:150};let marks=0,samples=0;
+  const context={URLSearchParams,location:{search:'?board=private-board'},performance:{now:()=>1},Date:{now:()=>2},document:{querySelectorAll:()=>[]},
+    window:{__quotumHistoryPoolReceipt:{checkpoint:()=>{marks++;return{status:'complete'};},retirementBoundary:()=>{samples++;return boundary;}}}};
+  const ordinary=runInNewContext(historyCheckpointScript(boundary.periodMs,'seed/settled/seed'),context);
+  assert.equal(ordinary.retirement,undefined);assert.equal(samples,0);
+  const selected=runInNewContext(historyCheckpointScript(boundary.periodMs,'seed/settled/seed',true),context);
+  assert.equal(selected.retirement,boundary);assert.equal(samples,1);assert.equal(marks,2);
+  assert.equal(selected.selection.mode,'live');assert.equal(selected.selection.periodMs,boundary.periodMs);
+  assert.doesNotMatch(JSON.stringify(selected),/private-board/);
 });
 
 test('traffic evidence retains attempted ranges and body uncertainty without selection text or payloads', () => {
@@ -578,4 +590,105 @@ test('warm failure diagnostics distinguish exact reads and gesture stages withou
   assert.equal(JSON.stringify(observer.diagnostic('warm')).includes('private'),false);
   for(let n=0;n<70;n++)emit('Network.requestWillBeSent',{requestId:String(n),request:{url:'http://localhost/api/history?board=private-board&scope=budget&cell=1&from=0&to=60'}});
   assert.equal(observer.diagnostic('warm').reads.length,64);assert.equal(observer.diagnostic('warm').omitted,8);
+});
+
+test('legacy pre-input renderer binding rejects unknown mapping before the first gesture',async()=>{
+  const source=readFileSync(new URL('../historyTrafficBrowser.ts',import.meta.url),'utf8');
+  const start=source.indexOf("    if(document){");
+  const end=source.indexOf('\n    return {cdp, bodies',start);assert.ok(start>0&&end>start);
+  for(const enabled of [false,true])for(const known of [false,true]){
+    let calls=0;const saved:unknown[]=[];
+    const renderer={valid:()=>known,evidence:()=>({status:known?'known':'unknown'})};
+    const fixture={process:{env:enabled?{QUOTUM_BENCH_HISTORY_SCROLL_CONTROL:'1'}:{}},document:undefined,navigation:{frameId:'frame',loaderId:'loader'},renderer:undefined as unknown,
+      rendererIdentity:async()=>{calls++;return renderer;},cdp:{},browser:{},poolName:'fixture',name:'fixture',assert,
+      evidence:{save:(_name:string,value:unknown)=>saved.push(value)},run:null as unknown as ()=>Promise<void>};
+    runInNewContext(ts.transpileModule(`globalThis.run=async()=>{${source.slice(start,end)}}`,{compilerOptions:{target:ts.ScriptTarget.ES2022}}).outputText,fixture);
+    if(enabled&&!known)await assert.rejects(fixture.run(),/renderer identity unavailable/);else await fixture.run();
+    assert.equal(calls,enabled?1:0);assert.equal(saved.length,enabled?1:0);assert.equal(fixture.renderer,enabled?renderer:undefined);
+  }
+});
+
+test('history closes its owned target even when renderer binding disposal fails',async()=>{
+  const source=readFileSync(new URL('../historyTrafficBrowser.ts',import.meta.url),'utf8');
+  const start=source.indexOf('  const close = async () =>'),end=source.indexOf('\n  try {',start);
+  const error=new Error('dispose failure'),order:string[]=[];
+  const fixture={name:'fixture',cdp:{at(){}},binding:undefined,document:undefined,renderer:{dispose:async()=>{order.push('dispose');throw error;}},tab:{close:async()=>{order.push('target');}},close:null as unknown as ()=>Promise<void>};
+  runInNewContext(ts.transpileModule(`${source.slice(start,end)}\nglobalThis.close=close;`,{compilerOptions:{target:ts.ScriptTarget.ES2022}}).outputText,fixture);
+  await assert.rejects(fixture.close(),e=>e===error);assert.deepEqual(order,['dispose','target']);
+});
+
+test('direct history requires its document before input and never reports a pre-input PID binding',async()=>{
+  const source=readFileSync(new URL('../historyTrafficBrowser.ts',import.meta.url),'utf8');
+  const start=source.indexOf('    if(document){'),end=source.indexOf('\n    return {cdp, bodies',start);assert.ok(start>=0&&end>start);
+  for(const ready of [false,true]){
+    let pinned=0,calls=0;const saved:unknown[]=[],navigation={frameId:'frame',loaderId:'loader'};
+    const fixture={strictDocument:true,document:{pin(value:unknown){assert.equal(value,navigation);pinned++;},valid:()=>ready},navigation,
+      renderer:undefined,rendererIdentity:async()=>{calls++;throw Error('must not bind before input');},process:{env:{QUOTUM_BENCH_HISTORY_SCROLL_CONTROL:'1',QUOTUM_BENCH_HISTORY_SCROLL_SUFFIX:'1'}},
+      evidence:{save:(_name:string,value:unknown)=>saved.push(value)},name:'fixture',poolName:'fixture',assert,cdp:{},browser:{},run:null as unknown as ()=>Promise<void>};
+    runInNewContext(ts.transpileModule(`globalThis.run=async()=>{${source.slice(start,end)}}`,{compilerOptions:{target:ts.ScriptTarget.ES2022}}).outputText,fixture);
+    if(ready)await fixture.run();else await assert.rejects(fixture.run(),/document identity unavailable/);
+    assert.equal(pinned,1);assert.equal(calls,0);assert.equal(fixture.renderer,undefined);
+    assert.deepEqual(JSON.parse(JSON.stringify(saved)),ready?[{status:'document-ready',frame:1,pid:null,birth:null}]:[]);
+  }
+});
+test('direct history cleanup drains its pending binding and closes the document and target on binding failure',async()=>{
+  const source=readFileSync(new URL('../historyTrafficBrowser.ts',import.meta.url),'utf8');
+  const start=source.indexOf('  const close = async () =>'),end=source.indexOf('\n  try {',start);assert.ok(start>=0&&end>start);
+  for(const rejected of [false,true]){
+    const order:string[]=[],error=new Error('binding failed');let resolve!:()=>void,reject!:(error:Error)=>void;
+    const binding=new Promise<void>((done,failed)=>{resolve=done;reject=failed;});
+    const fixture={name:'fixture',binding,renderer:rejected?undefined:{dispose:async()=>{order.push('renderer');}},document:{dispose(){order.push('document');}},
+      cdp:{at(){},evaluate(){throw Error('renderer cleanup must not evaluate');}},tab:{close:async()=>{order.push('target');}},close:null as unknown as ()=>Promise<void>};
+    runInNewContext(ts.transpileModule(`${source.slice(start,end)}\nglobalThis.close=close;`,{compilerOptions:{target:ts.ScriptTarget.ES2022}}).outputText,fixture);
+    const closed=fixture.close();assert.deepEqual(order,[],'close must await the owned binding');
+    if(rejected){const failure=assert.rejects(closed,value=>value===error);reject(error);await failure;}else{resolve();await closed;}
+    assert.deepEqual(order,rejected?['document','target']:['renderer','document','target']);
+  }
+});
+test('direct history releases its owned target even when document disposal throws',async()=>{
+  const source=readFileSync(new URL('../historyTrafficBrowser.ts',import.meta.url),'utf8');
+  const start=source.indexOf('  const close = async () =>'),end=source.indexOf('\n  try {',start);assert.ok(start>=0&&end>start);
+  const order:string[]=[],error=new Error('document dispose failed');
+  const fixture={name:'fixture',binding:undefined,renderer:undefined,document:{dispose(){order.push('document');throw error;}},cdp:{at(){}},tab:{close:async()=>{order.push('target');}},close:null as unknown as ()=>Promise<void>};
+  runInNewContext(ts.transpileModule(`${source.slice(start,end)}\nglobalThis.close=close;`,{compilerOptions:{target:ts.ScriptTarget.ES2022}}).outputText,fixture);
+  await assert.rejects(fixture.close(),value=>value===error);assert.deepEqual(order,['document','target']);
+});
+
+const nativeFile=ts.createSourceFile('traffic.ts',readFileSync(new URL('../historyTrafficBrowser.ts',import.meta.url),'utf8'),ts.ScriptTarget.Latest,true);
+const nativeFunction=nativeFile.statements.find(node=>ts.isFunctionDeclaration(node)&&node.name?.text==='browserHistoryTraffic') as ts.FunctionDeclaration;
+const nativeBinding=nativeFile.statements.find(node=>ts.isFunctionDeclaration(node)&&node.name?.text==='passiveHistoryBinding') as ts.FunctionDeclaration;
+const nativeCode=ts.transpileModule(nativeBinding.getText(nativeFile)+'\n'+nativeFunction.getText(nativeFile).replace('export async function','async function')+'\nglobalThis.run=browserHistoryTraffic;', {compilerOptions:{target:ts.ScriptTarget.ES2022}}).outputText;
+
+test('pool observation routes only the direct suffix Activity pages before any input',async()=>{
+  for(const enabled of [false,true])for(const suffix of [undefined,...Array.from({length:12},(_,i)=>({pair:i+1,cohort:'history'})),...Array.from({length:12},(_,i)=>({pair:i+1,cohort:'activity'}))]){
+    const primary=new Error('original seed failure'),evidence={save(){}},seen:unknown[][]=[];let tuple=0;
+    const context={DAY:86_400_000,process:{env:enabled?{QUOTUM_BENCH_HISTORY_SCROLL_SUFFIX:'1'}:{}},
+      // Skip unrelated baseline bodies; its 21st original tuple is 30d/activity/100ms/.5.
+      get HISTORY_COHORT_TAKES(){return ++tuple===21?1:0;},
+      historyPage:async(...args:unknown[])=>{seen.push(args);throw primary;},run:null as unknown as (...args:unknown[])=>Promise<unknown>};
+    runInNewContext(nativeCode,context);
+    await assert.rejects(context.run({}, {}, '', 'b',evidence,suffix),error=>error===primary);
+    assert.equal(seen.length,1);assert.equal(seen[0][6],enabled&&suffix?.cohort==='activity'?evidence:undefined);
+    assert.equal(seen[0][7],evidence);assert.equal(seen[0][4],suffix?.cohort==='history'?86_400_000:30*86_400_000);
+    assert.match(String(seen[0][3]),suffix?.cohort==='history'?/1d\/history\/0ms\/0.5\/take1$/:/30d\/activity\/100ms\/0.5\/take1$/);
+  }
+});
+
+test('an actual warm assertion retains cold movement and its first error when pool cleanup fails',async()=>{
+  const nodes:ts.Node[]=[];const visit=(node:ts.Node)=>{nodes.push(node);ts.forEachChild(node,visit);};visit(nativeFunction);
+  const attempt=nodes.find(node=>ts.isTryStatement(node)&&node.finallyBlock?.getText(nativeFile).includes('await capturePool()')) as ts.TryStatement;
+  const movement=attempt.tryBlock.statements.find(node=>node.getText(nativeFile).startsWith('movement='))!.getText(nativeFile);
+  const warm=attempt.tryBlock.statements.find(node=>node.getText(nativeFile).includes("'browser cached return/repeat started history'"))!.getText(nativeFile);
+  const capture=attempt.tryBlock.statements.find(node=>node.getText(nativeFile).startsWith('if(warm.length)'))!.getText(nativeFile);
+  const pose={tokens:['one'],poses:[{end:90,origin:100},{end:80,origin:100}],pushes:1,from:50,to:80},saved=new Map<string,unknown>(),order:string[]=[];
+  const fixture={assert,pose,warm:[1,2,3],movement:undefined,primary:undefined as unknown,suffix:{pair:6,cohort:'activity'},status:'passed',name:'fixture',geometry:{width:1000},cell:1,
+    bodies:{reads:[],diagnostic:()=>({})},reports:[],proxy:{transfers:[]},cdp:{snapshot:()=>({})},trafficReadEvidence,browser:{owner:{failures:[] as string[]}},
+    evidence:{save:(name:string,value:unknown)=>saved.set(name,value)},capturePool:async()=>{order.push('pool');throw Error('secondary cleanup');},
+    console:{error(){}},capturePressure:async()=>{order.push('pressure');},warmPhase:'warm',
+    observer:{close:async()=>{order.push('observer');}},close:async()=>{order.push('target');},run:null as unknown as ()=>Promise<void>};
+  const code=`globalThis.run=async()=>{${movement}try{${capture}${warm}}catch(error)${attempt.catchClause!.block.getText(nativeFile).replace('{','{primary=error;')}finally${attempt.finallyBlock!.getText(nativeFile)}};`;
+  runInNewContext(ts.transpileModule(code,{compilerOptions:{target:ts.ScriptTarget.ES2022}}).outputText,fixture);
+  await assert.rejects(fixture.run(),error=>error===fixture.primary&&(error as Error).message.includes('browser cached return/repeat started history'));
+  assert.deepEqual(JSON.parse(JSON.stringify((saved.get('traffic-fixture') as {movement:unknown}).movement)),{...pose,tokens:1});
+  assert.deepEqual(order,['pressure','pool','observer','target']);assert.equal(fixture.status,'failed');assert.deepEqual(fixture.browser.owner.failures,['history pool cleanup failed']);
 });

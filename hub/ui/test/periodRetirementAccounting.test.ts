@@ -221,6 +221,48 @@ test('canceling a real quota retirement between posted slices clears proof owner
   }finally{c.stopReads();await h.close();c.preparer.dispose();}
 });
 
+test('optional retirement preserves cached data when copying cannot fit and resumes after headroom returns',async t=>{
+  const c=await retirementControl(t),{h}=c;
+  let pinned=new Uint8Array(0),cold:Uint8Array|null=new Uint8Array(64*1024),drops=0;
+  const other={get estimatedBytes(){return pinned.byteLength+(cold?.byteLength??0);},evictionCandidates:()=>cold?[{bytes:cold.byteLength,shownAt:0,drop:()=>{drops++;cold=null;}}]:[]};
+  try{
+    await c.startRetirement();await c.insideCopy();
+    // A second owner fills the pool while a real prefix copy is between slices.
+    // Its cached allocation must survive a housekeeping reservation that cannot fit.
+    pinned=new Uint8Array(h.pool.budget-h.pool.estimatedBytes-cold!.byteLength-128);h.pool.register(other);
+    assert.equal(h.pool.estimatedBytes,h.pool.budget-128);
+    await c.drain();
+    assert.equal(drops,0,'optional compaction must refuse growth before evicting reusable data');
+    assert.ok(cold);assert.equal(h.period.tapes.get('quota'),c.before);assert.equal(h.period.get().value,c.work);
+    assert.equal(c.tails?.size,0);assert.equal(c.active.size,0);assert.equal(c.preparer.size,0);
+    assert.equal(h.period.get().error,null);assert.equal(h.requests.length,c.requests);c.unchanged();
+    assert.equal(h.pool.estimatedBytes,h.period.estimatedBytes+other.estimatedBytes,'all refused staging is released');
+    const next=h.period.retirementAt,attempts=c.preparations;assert.ok(Number.isFinite(next)&&next>c.clock.now);
+    h.jump(c.clock.now+1);await flush();await c.drain();assert.equal(c.preparations,attempts,'a refusal cannot retry the consumed edge');
+
+    pinned=new Uint8Array(0);c.clock.now=next+1;h.jump(c.clock.now);await flush();await c.drain();c.stopReads();
+    const after=h.period.tapes.get('quota');assert.notEqual(after,c.before,'later free headroom admits actual retirement');
+    assert.equal(drops,0);assert.ok(cold);
+    const range={from:c.clock.now-24*H,to:c.clock.now},queries=h.period.queries(h.page.get().board,range);
+    const reply=expandPeriod(JSON.parse(h.reader.read(h.board,h.alice.id,{version:1,selection:{mode:'live',periodMs:24*H},evaluatedAt:c.clock.now,...queries,sessions:{}})));
+    assert.ok(reply.sessions&&reply.sessions.state!=='error'&&reply.quota?.state==='complete'&&reply.quota.value.tape);
+    const tape=reply.quota.value.tape;for(const series of tape.quota)if(series.samplesEncoding==='delta'){series.samples=decodeSamples(series.samples);delete series.samplesEncoding;}
+    const fresh=new PeriodAccounting(tape,reply.sessions.value,new PeriodIndex(reply.sessions.value).curves);
+    for(const source of c.sources){
+      const index=after.accounting.quota.get(source+'\nw'),expected=(fresh as any).quota.get(source+'\nw');
+      for(const field of quotaColumns)assert.deepEqual(columnValues(index[field]),columnValues(expected[field]),field+' stays exact after deferred retirement');
+      assert.ok(sampleCount(index.series.samples)<256);
+    }
+    assert.equal(h.requests.length,c.requests);assert.equal(h.pool.estimatedBytes,h.period.estimatedBytes+other.estimatedBytes);
+    assert.equal(c.preparer.size,0);assert.equal(h.period.get().error,null);c.unchanged();
+
+    pinned=new Uint8Array(h.pool.budget-h.pool.estimatedBytes-128);
+    const foreground={role:'visible' as const};
+    try{assert.equal(h.pool.reserve(foreground,1024),true);assert.equal(drops,1,'new foreground data keeps ordinary eviction admission');}
+    finally{h.pool.release(foreground);}
+  }finally{h.pool.unregister(other);c.stopReads();await h.close();c.preparer.dispose();}
+});
+
 test('a real pool refusal after spent copy preserves committed quota evidence and advances the retirement deadline',async t=>{
   const c=await retirementControl(t),{h}=c,reserve=h.pool.reserve.bind(h.pool);
   let refused:any,refusals=0;
@@ -242,4 +284,80 @@ test('a real pool refusal after spent copy preserves committed quota evidence an
     assert.equal(h.period.retirementAt,next);assert.equal(refusals,1);assert.equal(h.requests.length,c.requests);
     assert.equal(h.pool.estimatedBytes,h.period.estimatedBytes);
   }finally{h.pool.reserve=reserve;c.stopReads();await h.close();c.preparer.dispose();}
+});
+
+for(const packed of [false,true])test(`work-only quota preparation charges new prefixes and retains native ownership (${packed?'packed':'flat'})`,async()=>{
+  const {packSamples,retainSamplesPrepared,numberBytes}=await import('../../server/domain/periodTape');
+  const {drain}=await import('../../server/domain/prepare');
+  const count=4096,cut=count*1000,fields=['times','deadlines','spent','covered','worked','during'];
+  const flat=packSamples(Array.from({length:count},(_,i)=>({at:i*1000,used:i*.005,resetAt:1e9,staleAfterMs:2000})));
+  const series={source:'s',window:'w',samples:packed?drain(retainSamplesPrepared(flat)):flat};
+  const tape:import('../../server/domain/periodTape').PeriodTape={from:0,cut,replaceFrom:0,cursor:'fixture',quota:[series],money:[]};
+  const work:import('../../server/domain/periodWork').WorkTrace={anchor:0,cut,knownFrom:0,refs:[{ref:'r',source:'s',device:{id:'d',name:'fixture'},origin:'terminal',project:null,folder:null,startedAt:0}],spans:[[0,0,cut]]};
+  const prior=new PeriodAccounting(tape,work,new PeriodIndex(work).curves),old=(prior as any).quota.get('s\nw');
+  assert.ok(old.spent.values instanceof Float64Array);assert.ok(old.covered.runs);
+  const before=fields.map(field=>Array.from({length:count},(_,i)=>numberAt(old[field],i)));
+  for(const mode of ['removed','trimmed','unavailable','unchanged','new-series']){
+    const nextWork:typeof work=mode==='removed'?{...work,refs:[],spans:[]}:mode==='trimmed'?{...work,spans:[[0,cut/2,cut]]}:mode==='unavailable'?{...work,available:false}:work;
+    const nextTape=mode==='new-series'?{...tape,quota:[{...series}]}:tape,curves=new PeriodIndex(nextWork).curves,charges:number[]=[];
+    const next=drain(PeriodAccounting.prepare(nextTape,nextWork,curves,prior,mode==='unchanged'?new Set():new Set(['s']),bytes=>charges.push(bytes)));
+    const index=(next as any).quota.get('s\nw'),fresh=new PeriodAccounting(nextTape,nextWork,curves),oracle=(fresh as any).quota.get('s\nw');
+    for(const [j,field] of fields.entries()){
+      assert.deepEqual(Array.from({length:count},(_,i)=>numberAt(index[field],i)),Array.from({length:count},(_,i)=>numberAt(oracle[field],i)),mode+' '+field);
+      assert.deepEqual(Array.from({length:count},(_,i)=>numberAt(old[field],i)),before[j],'old prefix remains immutable');
+    }
+    for(const range of [{from:0,to:cut},{from:1,to:cut-1},{from:cut/2,to:cut}])assert.deepEqual(next.quotaSummary('s','w',range),fresh.quotaSummary('s','w',range));
+    if(mode==='unchanged'){assert.equal(index,old);assert.deepEqual(charges,[]);continue;}
+    const owned=fields.reduce((bytes,field)=>bytes+(index[field]===old[field]||field==='times'&&!(index.times instanceof Float64Array)?0:numberBytes(index[field])),0);
+    assert.equal(charges.at(-1),owned,'borrowed buffers stay charged to their prior owner');
+    if(mode==='new-series'){assert.equal(charges[0],count*88+1024);assert.equal(owned,index.bytes);continue;}
+    for(const field of fields.slice(0,4))assert.equal(index[field],old[field]);
+    assert.equal(charges[0],mode==='trimmed'?count*32+1024:1024);assert.ok(owned<=charges[0]);
+    if(mode!=='trimmed')assert.equal(owned,64,'no available work needs only two constant columns');
+  }
+});
+
+
+test('clock retirement reserves new packed blocks without charging borrowed raw patterns twice',async t=>{
+  const {readFileSync}=await import('node:fs'),{runInNewContext}=await import('node:vm'),{default:ts}=await import('typescript');
+  const {PeriodActivity}=await import('../../server/domain/periodActivity');
+  let now=NOW;t.mock.method(Date,'now',()=>now);const start=NOW-24*H;
+  const h=await fixture({personal:true,periodName:'24h',clocked:true,creditFrom:start+2*M,creditTo:start+5*M});
+  const reserve=h.pool.reserve.bind(h.pool),calls:{owner:object;bytes:number}[]=[];
+  let base:{owner:object;bytes:number}|undefined,final:typeof base,retained:any,nextCurves:any,afterActivity=false;
+  try{
+    h.store.creditWork(h.device,start+H+10*M,start+H+30*M,[{source:h.source,client:'codex',origin:'terminal',startedAt:start-H,project:'Work project',folder:'Private folder',identity:{kind:'stable',sessionId:'d'.repeat(32)}}]);
+    h.events.flush();await flush();
+    const previous=h.period.get().value,priorIndex=h.period.index,oldTape=h.period.tapes.get('quota'),oldJson=JSON.stringify(previous),requests=h.requests.length;
+    assert.ok(previous.packed);assert.equal(previous.refs.length,2);
+    h.pool.reserve=(owner,bytes)=>{if(h.period.retirementPreparing){const call={owner,bytes};calls.push(call);if(afterActivity&&!final)final=call;}return reserve(owner,bytes);};
+    const retain=priorIndex.retain.bind(priorIndex),prepare=PeriodActivity.prepare;
+    t.mock.method(priorIndex,'retain',function*(work:any,grow:any):Generator<void|16,any,void>{
+      retained=work;base=calls.at(-1);return yield*retain(work,grow);
+    });
+    t.mock.method(PeriodActivity,'prepare',function*(...args:Parameters<typeof prepare>):Generator<void|16,any,void>{
+      const value=yield*Reflect.apply(prepare,PeriodActivity,args);nextCurves=args[1];afterActivity=true;return value;
+    });
+    now=NOW+5*M+1;h.jump(now);await flush();
+    assert.ok(base&&final&&retained?.packed&&nextCurves);assert.equal(base.owner,final.owner);
+    assert.notEqual(retained,previous);assert.notEqual(retained.packed.blocks,previous.packed.blocks);assert.notEqual(retained.packed.patterns,previous.packed.patterns);
+    for(const pattern of retained.packed.patterns)assert.ok(previous.packed.patterns.includes(pattern),'every surviving raw pattern remains owned by the prior trace');
+    for(const ref of retained.refs)assert.ok(previous.refs.includes(ref));
+    const borrowed=retained.packed.patterns.reduce((bytes:number,pattern:number[])=>bytes+pattern.length*8+32,0);assert.ok(borrowed>0);
+    // Use the unchanged production retained-size model; exercise the actual coordinator reserve chain.
+    const source=readFileSync(new URL('../lib/period.ts',import.meta.url),'utf8');
+    const model=runInNewContext(ts.transpileModule(source.slice(source.indexOf('const workBytes='),source.indexOf('const quotaTapeBytes='))+'workBytes;',{compilerOptions:{target:ts.ScriptTarget.ES2022}}).outputText);
+    assert.equal(base.bytes,model(retained,0)+retained.refs.length*512-borrowed);
+    assert.equal(final.bytes,model(retained,nextCurves.bytes)-nextCurves.borrowedBytes-borrowed);
+    assert.equal(JSON.stringify(previous),oldJson,'retirement cannot mutate the prior owner');
+    assert.equal(h.period.get().value,retained);assert.equal(h.requests.length,requests);assert.equal(h.pool.estimatedBytes,h.period.estimatedBytes,'all staging is released after commit');
+    assert.notEqual(h.period.tapes.get('quota').accounting,oldTape.accounting);
+    const range={from:now-24*H,to:now},queries=h.period.queries(h.page.get().board,range);
+    const fresh=expandPeriod(JSON.parse(h.reader.read(h.board,h.alice.id,{version:1,selection:{mode:'live',periodMs:24*H},evaluatedAt:now,...queries,sessions:{}})));
+    assert.ok(fresh.sessions&&fresh.sessions.state!=='error'&&fresh.quota?.state==='complete'&&fresh.quota.value.tape);
+    const tape=fresh.quota.value.tape;for(const series of tape.quota)if(series.samplesEncoding==='delta'){series.samples=decodeSamples(series.samples);delete series.samplesEncoding;}
+    const index=new PeriodIndex(fresh.sessions.value),oracle=new PeriodAccounting(tape,fresh.sessions.value,index.curves),actual=h.period.tapes.get('quota').accounting;
+    for(const selected of [range,{from:range.from+1,to:range.to-1},{from:start+H,to:start+2*H}])assert.deepEqual(actual.quotaSummary(h.source,'w',selected),oracle.quotaSummary(h.source,'w',selected));
+    assert.deepEqual(actual.fixed(range,10*M),oracle.fixed(range,10*M));
+  }finally{h.pool.reserve=reserve;await h.close();}
 });

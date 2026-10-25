@@ -974,32 +974,72 @@ test('a reader too far behind is let go', () => {
 });
 
 test('long polls carry the same events: a lease starts with hello and snapshot, waits for news, and one unknown starts over', async t => {
-  const h = await hub({pollMs: 400, leaseMs: 1000});
+  const clock = new ManualClock(Date.now());
+  const h = await hub({pollMs: 400, leaseMs: 1000}, clock);
   t.after(() => (letGo(), h.app.close()));
   await h.person('alice');
   const secret = await h.token('alice');
-  await h.measure(secret, Date.now() - 2 * MIN);
-  const poll = async (lease?: string, as = 'alice') => (await h.call('GET', `/api/events?mode=poll${lease ? `&lease=${lease}` : ''}`, {as, headers: STREAM})).body;
+  assert.equal((await h.measure(secret, clock.now() - 2 * MIN)).status, 200);
+  const poll = async (lease?: string, as = 'alice') => {
+    const response = await h.call('GET', `/api/events?mode=poll${lease ? `&lease=${lease}` : ''}`, {as, headers: STREAM});
+    assert.equal(response.status, 200);
+    return response.body;
+  };
   const first = await poll();
   assert.deepEqual(
     first.events.map((e: Event) => e.type),
     ['hello', 'snapshot','filters','projectColors'],
   );
-  const started = Date.now();
-  const empty = await poll(first.lease);
+  let entered = () => {};
+  const original = h.events.poll.bind(h.events);
+  t.mock.method(h.events, 'poll', (...args: Parameters<Events['poll']>) => {
+    const answer = original(...args);
+    entered();
+    return answer;
+  });
+  // Register the real HTTP request before advancing its poll timer.
+  const waitingPoll = async () => {
+    let hasEntered = false;
+    const registered = new Promise<void>(resolve => { entered = () => { hasEntered = true; resolve(); }; });
+    let answered = false;
+    const answer = poll(first.lease).then(response => { answered = true; return response; });
+    await Promise.race([registered, answer]);
+    assert.equal(hasEntered, true, 'the request reached the event reader');
+    return {answer, answered: () => answered};
+  };
+  const noNews = await waitingPoll();
+  clock.advance(399);
+  await new Promise<void>(resolve => setImmediate(resolve));
+  assert.equal(noNews.answered(), false, 'held while nothing happened');
+  clock.advance(1);
+  const empty = await noNews.answer;
   assert.deepEqual(empty.events, []);
-  assert.ok(Date.now() - started >= 350, 'held while nothing happened');
+  assert.equal(empty.lease, first.lease);
 
-  const waiting = poll(first.lease);
-  await h.measure(secret, Date.now() - MIN, {used: 60});
-  const news = await waiting;
+  const waiting = await waitingPoll();
+  assert.equal((await h.measure(secret, clock.now() - MIN, {used: 60})).status, 200);
+  clock.advance(config.events.smoothMs);
+  const news = await waiting.answer;
   assert.deepEqual(
     boardTypes(news.events),
     ['card', 'devices', 'history'],
   );
   assert.equal(news.lease, first.lease);
 
-  await new Promise(resolve => setTimeout(resolve, 1200));
+  // A later write can finish smoothing after this poll's deadline; its news stays queued.
+  const late = await waitingPoll();
+  clock.advance(350);
+  assert.equal((await h.measure(secret, clock.now() - MIN, {used: 70})).status, 200);
+  clock.advance(50);
+  const timedOut = await late.answer;
+  assert.deepEqual(timedOut.events, []);
+  assert.equal(timedOut.lease, first.lease);
+  clock.advance(config.events.smoothMs - 50);
+  const queued = await poll(first.lease);
+  assert.deepEqual(boardTypes(queued.events), ['card', 'devices', 'history']);
+  assert.equal(queued.lease, first.lease);
+
+  clock.advance(1000);
   const expired = await poll(first.lease);
   assert.notEqual(expired.lease, first.lease, 'forgotten a while after its last answer');
   assert.deepEqual(
@@ -1320,6 +1360,19 @@ test('refresh deadlines and terminal expiry reach both boards without polling', 
   assert.deepEqual([ended.request.status, ended.unavailable], ['no_result', 'silent']);
   h.clock.advance(start + 7 * MIN + 200 - h.clock.now());
   assert.equal((await states()).request, null);
+});
+
+for(const workFirst of [false,true])for(const nativeFirst of [false,true])test(`coalesced quota measurement remains distinct from work (${workFirst}, ${nativeFirst})`,async t=>{
+  const clock=new ManualClock(Date.now()),h=await hub({},clock);t.after(()=>{letGo();return h.app.close();});
+  const board=await h.person('alice'),secret=await h.token('alice');await h.measure(secret,clock.now()-MIN);
+  const source=h.store.sources(board)[0].id,s=await reading(h,'alice',board);t.after(s.close);
+  const measurement=clock.now()-(nativeFirst?2:1)*MIN,work=clock.now()-(nativeFirst?1:2)*MIN;
+  for(const credited of workFirst?[true,false]:[false,true])h.events.history(source,credited?work:measurement,['quota'],credited);
+  clock.advance(config.events.smoothMs);
+  const packet=(await s.within()).find(event=>event.type==='history')!.data;
+  assert.deepEqual(packet.sources,[source]);assert.equal(packet.since,Math.min(measurement,work));
+  assert.deepEqual(packet.changes.filter((change:{workSince?:number})=>change.workSince===undefined),[{source,scope:'quota',since:measurement}]);
+  assert.deepEqual(packet.changes.filter((change:{workSince?:number})=>change.workSince!==undefined),[{source,scope:'quota',since:work,workSince:work,workOnly:true}]);
 });
 
 test('history coalesces each resource scope independently and keeps monetary news beside a work refresh',async t=>{

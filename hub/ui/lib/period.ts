@@ -134,7 +134,7 @@ class BoardPeriod {
   private readonly retained=new Map<string,{bytes:number;storage:Map<object,number>;metadata:number;activity:PeriodActivity|null;activityBytes:number;copyBytes:number;at:number;invalidate:(data:Extract<import('./board').HubEvent,{type:'history'}>['data'])=>boolean;valid:(selection:PeriodSelection)=>boolean;fits:(selection:PeriodSelection)=>boolean;restore:(selection:PeriodSelection)=>boolean}>();
   readonly transport=new PeriodTransport(historyPool,()=>this.intent(),(reply,intent,reserve)=>this.receive(reply,intent,reserve),fetchPeriod,()=>{page.dispatch({type:'board-close'});if(typeof window!=='undefined')window.dispatchEvent(new Event(UNAUTHORIZED));});
   constructor(){historyPool.register(this);clock.subscribe(this.watch,()=>this.tick());}
-  private staging(operation:'calendar-projection'|'values'|'restore'|'adoption'|'retirement'){return {role:'visible' as const,historyMember:this,operation};}
+  private staging(operation:'calendar-projection'|'values'|'restore'|'adoption'|'retirement'){return {role:'visible' as const,historyMember:this,operation,evict:operation!=='retirement'};}
   private configureCalendar(visible:boolean,context:string,now:number,limited:boolean,selection:PeriodSelection){
     const staging=this.staging('calendar-projection');
     try{return this.calendar.configure(visible,context,now,limited,selection,bytes=>historyPool.reserve(staging,bytes));}
@@ -157,6 +157,11 @@ class BoardPeriod {
     const storage=new Map<object,number>();
     for(const reading of values.values())if(reading.value)storage.set(reading.value,JSON.stringify(reading.value).length*3);
     return storage;
+  }
+  private measurementSince(data:Extract<import('./board').HubEvent,{type:'history'}>['data'],sources:readonly string[]){
+    if(!data.changes)return data.sources.some(id=>sources.includes(id))?data.since:Infinity;
+    const unknown=data.sources.some(id=>sources.includes(id)&&!data.changes!.some(change=>change.source===id));
+    return Math.min(unknown?data.since:Infinity,...data.changes.filter(change=>sources.includes(change.source)&&(change.workOnly!==true||change.workSince===undefined)).map(change=>change.since));
   }
   evictionCandidates(){return [...this.valueCache].map(([key,c])=>({bytes:c.bytes,shownAt:c.at,drop:()=>{this.valueCache.delete(key);}})).concat([...this.retained].map(([key,c])=>({bytes:c.bytes,shownAt:c.at,drop:()=>{this.retained.delete(key);}})),this.calendar.evictionCandidates());}
   private retainCurrent(){
@@ -556,6 +561,12 @@ class BoardPeriod {
     const changedFinancial=!!this.financialIdentity&&financialIdentity!==this.financialIdentity;
     this.financialIdentity=financialIdentity;
     if(changedFinancial)this.retireFinancialValues();
+    const cacheKey=JSON.stringify([identity,scopeKeys,nextFilter,financialIdentity]);
+    // Calendar preparation must see the reusable incoming frame as recently used.
+    if(!event&&periodKey(selection)!==periodKey(this.selection)&&!changedWork&&!changedRun&&!selectedChanged&&!changedScopes.length&&!changedFinancial){
+      const saved=this.retained.get(cacheKey)?.valid(selection)?this.retained.get(cacheKey):[...this.retained.values()].find(entry=>entry.fits(selection));
+      if(saved&&(selection.mode==='live'||saved.fits(selection)))saved.at=hubNow();
+    }
     const calendarChanged=this.configureCalendar(widgetVisible(board.view,AGENT_HOURS_HEATMAP,board.lineup.length),JSON.stringify([board.id,board.workAuthority,nextFilter,this.workLimit]),hubNow(),this.workLimit,selection);
     if(calendarChanged){this.resetFacets();this.revision++;if(this.identity)this.transport.change();}
     const history=event?.type==='hub'&&event.event.type==='history'?event.event.data:null;
@@ -566,13 +577,12 @@ class BoardPeriod {
     if(history){
       for(const [key,entry] of this.retained)if(!entry.invalidate(history))this.retained.delete(key);
       for(const [key,entry] of this.valueCache){
-        const since=history.sources.some(id=>entry.values.has(id))?history.since:Infinity;
+        const since=this.measurementSince(history,[...entry.values.keys()]);
         if(since<entry.to)this.valueCache.delete(key);else entry.validBefore=Math.min(entry.validBefore,since);
       }
       const since=Math.min(history.sources.some(id=>sources.includes(id))?history.since:Infinity,workSince);
       if(selection.mode==='range')this.validBefore=Math.min(this.validBefore,since);
     }
-    const cacheKey=JSON.stringify([identity,scopeKeys,nextFilter,financialIdentity]);
     if(cacheKey!==this.cacheKey){this.retainCurrent();this.cacheKey=cacheKey;}
     if(selectedChanged||periodKey(this.selection)!==periodKey(selection))this.activityLifetime={};
     this.filterKey=nextFilter;
@@ -661,15 +671,19 @@ class BoardPeriod {
         this.tick();
       }else if(hub.type==='history') {
         const included=hub.data.sources.some(id=>sources.includes(id));
+        const measurementSince=this.measurementSince(hub.data,sources);
         const own=hub.data.workSince!==undefined&&(selection.mode==='live'||hub.data.workSince<selection.to);
         const relevant=changedWork||included&&(selection.mode==='live'||hub.data.since<selection.to)||own;
         if(relevant){
-          if(included){this.proofEpoch++;this.validBefore=Infinity;}
+          if(included){
+            const previous=this.proofEpoch++;this.validBefore=Infinity;
+            if(measurementSince===Infinity&&!this.valuesNeeded&&this.valuesProofEpoch===previous)this.valuesProofEpoch=this.proofEpoch;
+          }
           this.resourceGeneration++;
           if(own)this.invalidateFacets();
           const {retired}=workChange(hub.data,sources,selection.mode==='live'?Infinity:selection.to);
           if(retired)this.retireWork();
-          if(included&&selection.mode==='range')this.valuesNeeded=true;
+          if(selection.mode==='range'&&measurementSince!==Infinity)this.valuesNeeded=true;
           for(const scope of PERIOD_SCOPES){
             const visible=(scope==='quota'?[ACTIVITY,...QUOTA_WIDGETS]:scope==='funds'?[SUBSCRIPTION_FUNDS]:BUDGET_WIDGETS).some(id=>widgetVisible(board.view,id,board.lineup.length));
             if(!visible)continue;
@@ -896,11 +910,15 @@ class BoardPeriod {
         if(work){
           work=yield*retention.retainWork(work,from,bytes=>{scratch+=bytes;charge('work',scratch);});
           if(work!==previousWork){
-            const base=workBytes(work,0)+work.refs.length*512;let scratch=0;
+            // The committed trace still owns every surviving raw pattern.
+            const borrowedPatterns=previousIndex&&previousWork?.packed&&work.packed?work.packed.patterns.reduce((bytes,pattern)=>bytes+pattern.length*8+32,0):0;
+            const base=workBytes(work,0)-borrowedPatterns+work.refs.length*512;let scratch=0;
             charge('work',base);
             if(index)index=yield*index.retain(work,bytes=>{scratch+=bytes;charge('work',base+scratch);});
             else {charge('work',workBytes(work,0)+workPreparationBytes(work));index=yield*PeriodIndex.prepare(work);}
-            activity=yield*PeriodActivity.prepare(work,index.curves);charge('work',workBytes(work,index.curves.bytes));
+            activity=yield*PeriodActivity.prepare(work,index.curves);
+            const borrowed=previousIndex&&previousWork?.packed&&work.packed?index.curves.borrowedBytes:0;
+            charge('work',workBytes(work,index.curves.bytes)-borrowed-borrowedPatterns);
           }else sizes.delete('work');
         }
         const changedWork=new Set<string>(),tapes=new Map(previousTapes);let changedBytes=0;

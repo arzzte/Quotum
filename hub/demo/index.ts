@@ -23,6 +23,7 @@ import {seedLinks} from './links.js';
 import {seedMeasurementDevices} from './measurementDevices.js';
 import {seedCurrencies} from './currencies.js';
 import {Directory} from '../server/store/directory.js';
+import {HistoryLimitOutput,type HistoryLimitReport} from './historyLimit.js';
 
 /**
  * `npm run demo -- [set] [--resets <scene>] [--still]`: a hub on throwaway data, filled with
@@ -160,7 +161,7 @@ export class Demo {
   }
 
   constructor(
-    private readonly options: {set: DemoSet; scene: string; still: boolean; idleAgents?: boolean;money?:boolean; address: ReturnType<typeof addressOf>; onExit: (code: number, cause?: 'port_in_use') => void; dataDir?: string; hubRoot?: string; start?: number},
+    private readonly options: {set: DemoSet; scene: string; still: boolean; idleAgents?: boolean;money?:boolean; address: ReturnType<typeof addressOf>; onExit: (code: number, cause?: 'port_in_use') => void; dataDir?: string; hubRoot?: string; start?: number; onHistoryLimit?:(report:HistoryLimitReport)=>void},
   ) {
     this.start = options.start ?? Math.floor(Date.now() / MIN) * MIN;
     this.dir = options.dataDir ?? mkdtempSync(path.join(os.tmpdir(), 'quotum-demo-'));
@@ -171,9 +172,11 @@ export class Demo {
   }
 
   /** Brings the hub up and fills it; the stand it returns is kept alive until `stop`. */
-  async run(): Promise<Stand> {
+  async run(signal?: AbortSignal): Promise<Stand> {
+    signal?.throwIfAborted();
     const {set, scene, still, address} = this.options;
     this.trackers = await Trackers.start(SCENES, this.start);
+    signal?.throwIfAborted();
     const urls = this.trackers.urls(scene);
     const env: NodeJS.ProcessEnv = Object.fromEntries(Object.entries(process.env).filter(([key]) => !key.startsWith('QUOTUM_') || ADDRESS.includes(key)));
     Object.assign(env, {
@@ -186,6 +189,7 @@ export class Demo {
       QUOTUM_RESETS_CLAUDE_URL: urls.claude,
       QUOTUM_ALLOWED_HOSTS: address.hosts,
       QUOTUM_SECRET_KEY:Buffer.alloc(32,31).toString('base64url'),
+      QUOTUM_DEMO_HISTORY_LIMITS:this.options.onHistoryLimit?'1':'',
     });
     if (set.id === 'clients' || set.id === 'links' || set.id === 'calendar') {
       // These sets begin with retained work before any native measurement.
@@ -194,7 +198,8 @@ export class Demo {
     }
     const hub = (this.hub = spawn(process.execPath, ['--import','tsx',path.join(path.dirname(fileURLToPath(import.meta.url)),'hub.ts')], {cwd: this.options.hubRoot ?? HUB, env, stdio: ['ignore', 'pipe', 'pipe']}));
     hub.stdout!.on('data', chunk => this.output.add(chunk));
-    hub.stderr!.on('data', chunk => this.output.add(chunk));
+    const limits=this.options.onHistoryLimit?new HistoryLimitOutput(this.options.onHistoryLimit):undefined;
+    hub.stderr!.on('data', chunk => {this.output.add(chunk);limits?.add(chunk);});
     // close follows the output streams too: the hub's port-error line is complete.
     hub.on('close', (code, signal) => {
       if (this.stopping) return;
@@ -204,53 +209,73 @@ export class Demo {
       this.options.onExit(1, this.output.toString().includes('"code":"port_in_use"') ? 'port_in_use' : undefined);
     });
 
-    await ready(hub, address.base, this.output);
-    const stand = await setUp(address.base, set, this.start, SETUP_CODE, () => Date.now(), still);
-    // How agents worked before the demo started goes straight into the running hub's
-    // database (it waits for nothing meanwhile): its requests cannot tell the past.
-    const store = new Store(path.join(this.dir, 'quotum.sqlite'));
+    let abortStop: Promise<void> | undefined;
+    let stopFailure: unknown;
+    let failed = false;
+    // stop() marks stopping before awaiting exit; retain that first cleanup promise.
+    const aborted = () => {abortStop ??= this.stop().catch(error => {stopFailure = error;});};
+    signal?.addEventListener('abort', aborted, {once: true});
     try {
-      seedWork(store, stand);
-      if(set.id==='calendar')seedCalendar(store,new Directory(store.db),stand);
-      if(set.id==='devices')await seedMeasurementDevices(store,new Directory(store.db),stand);
-      if(set.id==='clients')await seedClients(store,new Directory(store.db),stand);
-      if(set.id==='links')await seedLinks(store,new Directory(store.db),stand);
-      if(set.id==='sessions'||set.id==='filters'||set.id==='project-colors')await seedSessionClients(store,new Directory(store.db),stand);
-      if(set.id==='project-colors')seedProjectColors(store,new Directory(store.db),stand);
-      if(this.options.money!==false&&(set.id==='all'||set.id==='money'||set.id==='analytics'||set.id==='filters')){await seedMoney(store,new Directory(store.db),stand);await seedDeepSeek(store,new Directory(store.db),stand);seedCurrencies(store,stand);seedCodexCredits(store,new Directory(store.db),stand);}
-      if(this.options.money!==false&&(set.id==='all'||set.id==='quotas'||set.id==='analytics'))await seedQuotas(store,new Directory(store.db),stand);
-    } finally {
-      store.close();
-    }
-    await selfCheck(stand, this.trackers);
-
-    const live = new Live(stand, card => liveStep(card), true, (machine, sessions) => {
-      if (!this.options.idleAgents) return sessions;
-      const idle = sessions.map(s => ({...s, working: false, lastWorkedAt: s.lastWorkedAt ?? new Date(this.start).toISOString()}));
-      if (machine.id === 'laptop') {
-        const card = cards(set).find(c => c.id === 'antigravity')!;
-        idle.push({sessionId: 'f'.repeat(32), provider: card.provider, ...accountOf(card), origin: 'terminal', project: 'Benchmark', folder: undefined, startedAt: new Date(this.start).toISOString(), working: this.benchWork, lastWorkedAt: new Date(this.start).toISOString()});
-      }
-      return idle;
-    }, (machine, at) => {for (const heard of this.reports) heard(machine.id, at);});
-    const tick = (manual = false) => this.reporting = this.reporting.then(async () => {
-      const t = Date.now() - this.start;
+      signal?.throwIfAborted();
+      await ready(hub, address.base, this.output);
+      signal?.throwIfAborted();
+      const stand = await setUp(address.base, set, this.start, SETUP_CODE, () => Date.now(), still);
+      signal?.throwIfAborted();
+      // How agents worked before the demo started goes straight into the running hub's
+      // database (it waits for nothing meanwhile): its requests cannot tell the past.
+      const store = new Store(path.join(this.dir, 'quotum.sqlite'));
       try {
-        if (still) await live.report(0, Date.now());
-        else {
-          await live.report(t, Date.now());
-          await live.pace(t, Date.now());
-          await live.measure(t, Date.now());
-        }
-      } catch (error) {
-        await this.settled();
-        if (!this.stopping) console.error(`demo: ${(error as Error).message}`);
+        seedWork(store, stand);
+        if(set.id==='calendar')seedCalendar(store,new Directory(store.db),stand);
+        if(set.id==='devices')await seedMeasurementDevices(store,new Directory(store.db),stand);
+        if(set.id==='clients')await seedClients(store,new Directory(store.db),stand);
+        if(set.id==='links')await seedLinks(store,new Directory(store.db),stand);
+        if(set.id==='sessions'||set.id==='filters'||set.id==='project-colors')await seedSessionClients(store,new Directory(store.db),stand);
+        if(set.id==='project-colors')seedProjectColors(store,new Directory(store.db),stand);
+        if(this.options.money!==false&&(set.id==='all'||set.id==='money'||set.id==='analytics'||set.id==='filters')){await seedMoney(store,new Directory(store.db),stand);await seedDeepSeek(store,new Directory(store.db),stand);seedCurrencies(store,stand);seedCodexCredits(store,new Directory(store.db),stand);}
+        if(this.options.money!==false&&(set.id==='all'||set.id==='quotas'||set.id==='analytics'))await seedQuotas(store,new Directory(store.db),stand);
+      } finally {
+        store.close();
       }
-      if (!this.stopping) this.timer = setTimeout(() => void tick(), manual ? TICK : TICK - ((Date.now() - this.start) % TICK));
-    });
-    this.tick = tick;
-    await tick();
-    return stand;
+      await selfCheck(stand, this.trackers);
+      signal?.throwIfAborted();
+
+      const live = new Live(stand, card => liveStep(card), true, (machine, sessions) => {
+        if (!this.options.idleAgents) return sessions;
+        const idle = sessions.map(s => ({...s, working: false, lastWorkedAt: s.lastWorkedAt ?? new Date(this.start).toISOString()}));
+        if (machine.id === 'laptop') {
+          const card = cards(set).find(c => c.id === 'antigravity')!;
+          idle.push({sessionId: 'f'.repeat(32), provider: card.provider, ...accountOf(card), origin: 'terminal', project: 'Benchmark', folder: undefined, startedAt: new Date(this.start).toISOString(), working: this.benchWork, lastWorkedAt: new Date(this.start).toISOString()});
+        }
+        return idle;
+      }, (machine, at) => {for (const heard of this.reports) heard(machine.id, at);});
+      const tick = (manual = false) => this.reporting = this.reporting.then(async () => {
+        const t = Date.now() - this.start;
+        try {
+          if (still) await live.report(0, Date.now());
+          else {
+            await live.report(t, Date.now());
+            await live.pace(t, Date.now());
+            await live.measure(t, Date.now());
+          }
+        } catch (error) {
+          await this.settled();
+          if (!this.stopping) console.error(`demo: ${(error as Error).message}`);
+        }
+        if (!this.stopping) this.timer = setTimeout(() => void tick(), manual ? TICK : TICK - ((Date.now() - this.start) % TICK));
+      });
+      this.tick = tick;
+      await tick();
+      signal?.throwIfAborted();
+      return stand;
+    } catch (error) {
+      failed = true;
+      throw error;
+    } finally {
+      signal?.removeEventListener('abort', aborted);
+      if (abortStop) await abortStop;
+      if (!failed && stopFailure !== undefined) throw stopFailure;
+    }
   }
 
   /** Stops once; only a directory this Demo created belongs to it. */

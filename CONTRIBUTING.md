@@ -31,6 +31,9 @@ shared-filter totals and bar values, clean-cell reuse, coalesced late work, canc
 responses and all transport/preparation costs under the existing pool limits.
 Emphasis owns no reader and receives no extra-read allowance.
 Each fixed Activity period saves its bounded pool journal before checking completeness.
+With evidence enabled, its existing final phase sample also retains the journal before
+assertions. A failed page saves that partial snapshot and its phase before closing;
+it adds no recovery command, and its sampling cost stays in the reported CPU duration.
 Its larger diagnostic capacity retains the monthly ownership snapshots; omitted entries
 still fail the check, and the product's memory and transport limits stay the same.
 No browser means the check was not run.
@@ -48,11 +51,38 @@ The `bench` check passes only when both jobs succeed; a failed, skipped or cance
 fails this check. The default `--scope all` runs the history matrix first, then every
 dashboard phase in the same order as `--scope dashboard`. CPU diagnostics (`trace`,
 `profile`, `native-trace`, `native-profile`) support `all` or `dashboard`; caption control
-requires `dashboard`. Other optional diagnostics require `all`. Separate jobs retain
+requires `dashboard`. The optional `history_pool_control` manual CI input runs the full
+history matrix in its existing job with the existing bounded cache observer. It requires
+an exact `diagnostic_ref`, compiled-client hash and clean checkout, and rejects other
+diagnostic inputs. CI prepares the existing native debugger and matching unwind tables
+for capture after a failed command. Passive navigation listeners add no commands; late
+renderer binding and native capture keep their existing postfailure deadlines. It adds no retries
+or budget allowance; its artifacts cannot satisfy the required `bench` check. The observer
+can identify cache eviction and reservation pressure in this instrumented attempt. It
+does not preserve fixed-summary shift proofs or every gesture's scale, so a different
+repeat range can remain unexplained. Its pinned history-only mode also retains up to
+four server preparation refusals, each from a validated stderr record of at most 2048 bytes.
+They preserve the original reservation and distinguish input admission, preparation
+and work-access revalidation. Numeric request summaries have no physical attempt binding;
+compare them with recorded traffic before attributing a delivered HTTP failure.
+Missing records remain inconclusive. Locally this mode also accepts `--scope history`
+with the same source and client pins; its default `all` scope remains available.
+Other optional diagnostics require `all`. Separate jobs retain
 normal warmup, chart-grid alignment and budgets.
+Manual CI without diagnostic inputs runs the same ordinary checks. A diagnostic
+mode still requires an immutable source SHA and the expected compiled-client hash;
+missing identity cannot turn a diagnostic request into a successful ordinary run.
+Chrome readiness has one twenty-second window starting immediately before the launcher
+is spawned, including its work and endpoint validation.
 DevTools commands keep their thirty-second response deadline. An explicit renderer
 crash or target-detach event fails pending commands immediately, even if the socket
 stays open, and retains the original failure before cleanup. It does not retry work.
+Ordinary owned Linux history pages keep a pressure journal in their existing bootstrap.
+It snapshots numeric cache identities when the pool trims and records later tagged
+requests. A known warm-read failure exports at most 64 events and 64 KiB within a
+cancellable two-second window, preserving the original assertion. Truncated or unbound
+evidence remains inconclusive. Its transport binding adds observation work whose timing
+effect is unmeasured; the full pool diagnostics and dashboard keep their existing observers.
 The existing five-second pending-command observation also retains at most 32 owned
 Linux process identities and raw proc counters, followed by one read after failure
 before debugger intervention. Each cancellable read is bounded to one second within
@@ -60,8 +90,54 @@ the existing observation/collection windows. Host monotonic timestamps bracket t
 reads; missing processes and capped entries remain unknown. Attached browsers are
 not inspected. Matching process IDs and birth ticks permit counter differences,
 not page attribution, continuous responsiveness or a cause of the timeout.
+After an owned command has failed and its page probe does not respond, Linux may
+capture one native renderer snapshot using an already installed system GDB. The renderer
+with the largest cumulative CPU counter is selected when no target binding was supplied;
+this does not bind it to the failed page. A supplied binding limits capture to its PID
+and pinned process birth. PID, birth, group, session, UID and tracing state are checked before
+attach. Bounded thread identities and fixed wait classes are retained, never
+raw debugger text. Up to sixteen main-thread frames additionally retain a validated
+file-backed module build ID and file offset, or a fixed reason why that position is unknown.
+These offsets are resume addresses relative to the file, not ELF virtual addresses or
+proof of a function name; they do not satisfy the control's named-frame check.
+Anonymous executable positions remain unknown; a file location alone does not identify
+whether code was generated. Map reads are capped at 1 MiB and 8192 entries.
+Capture and helper cleanup use the existing five-second
+collection and two-second release windows. An unconfirmed detach, helper exit or
+pipe closure fails cleanup. Missing GDB falls back to the existing page debugger;
+attached browsers and successful commands receive no native intervention.
+On Linux, ordinary owned history pages retain their original navigation identity passively,
+without extra commands before failure. Missing identity does not gate successful input.
+After an original failure and an unresponsive page probe, the existing two-second
+resolver may bind capture to that document's renderer. Missing optional metadata keeps
+the explicitly unbound capture above; an attempted but incomplete mapping permits no
+native or debugger intervention. Resolution shares the original five-second collection
+window, so insufficient remaining time can still leave capture incomplete.
+The manual CI `native_postmortem_control` qualifies this collector on the requested
+source and built-client hash using a separate runtime UID and matching unwind tables.
+Before the forced command, a completed metadata trace binds the page's primary frame
+to an owned renderer and its process birth. Missing or invalidated identity fails the
+control; capture receives only that pinned process and rechecks its birth before attach.
+This preparation is diagnostic and does not run in ordinary benchmarks.
+After the command fails, the control also resolves identity on the original page
+connection using browser navigation evidence retained before the original navigation.
+It must match the pre-input PID and birth at both ends of native capture, within the
+existing collection limits. This independent pre-input oracle remains part of SDK
+qualification; it does not run in the direct history scroll control.
+It holds one synchronous HTTP request from its own fixture page until the original
+30-second command timeout, then requires native main-thread frames and confirmed
+cleanup, including the fixture's pending connection. This exercises native unwinding;
+JIT frame unwinding is not qualified. It does not execute the app client,
+reproduce the original intermittent hang, qualify forced helper failures or replace
+either required benchmark job. Select it without any other diagnostic mode.
+Diagnostic CI controls install GDB during setup and first start it after the original
+command failure. Package installation can affect the OS file cache; this does not
+qualify an untouched runner's cold debugger startup. Ordinary jobs do not install it.
 Page-evaluation exceptions retain their original command and scenario too, without
 page text or source. Later cleanup timeouts or crashes cannot replace the first failure.
+During fixed Activity, a handled process interrupt retains the pending command and
+last reply before cancellation clears them. This local snapshot sends no browser request;
+hard kills, a blocked Node process and an interrupted write can still leave it unknown.
 Gesture-completion frames follow each data plot's actual HTML or SVG animation,
 including a budget or funds plot that finishes after quota. The last input remains
 uncredited until every data plot has finished and its final geometry has committed.
@@ -115,9 +191,16 @@ confirmed. Attached browsers and their existing tabs remain outside that ownersh
 Launch diagnostics contain version, timing, process identity and classified stream
 counters; arbitrary browser output and command arguments are omitted.
 On Linux, the existing ownership reads also retain bounded root-process fault and CPU
-tick samples during startup, and the first observed port publication time. No extra
+tick samples during startup, and the first observed port-read time. No extra
 process reads or sampling timers are added. These counters are not a scheduler trace;
 missing samples and unsupported counters stay explicit.
+After an uncancelled startup deadline, Linux x64 may collect one root-process wait
+sample in an isolated Node helper. Its parent has a 200 ms budget within the existing
+seven-second cleanup window; it adds no wait before TERM. PID, birth, process group,
+session and UID are checked before and after the reads. Only process states, bounded
+kernel symbols, a syscall number and an FD class are retained. Addresses, paths and
+syscall arguments are omitted. Identity bookends are not an atomic wait snapshot;
+missing access stays unknown, and unconfirmed helper cleanup stays a residual failure.
 `QUOTUM_BENCH_DIAGNOSTICS_DIR` keeps a unique run manifest and completed phase reports
 before cleanup, including when a later phase fails. CI retains these artifacts for
 every attempt. The `make bench` wrapper forwards this setting without loading preview
@@ -585,14 +668,16 @@ focus in the card's menu and fails otherwise. It needs Chrome:
 one already running. CI runs it on every push; run it when you change the dashboard
 and have Chrome.
 
-The history traffic matrix runs first, while the seeded measurements age, and closes
-its temporary pages before the idle board opens. The same warmup requirements still
-apply. Idle measurement starts at a planned grid phase with its endpoints away from
+The history traffic matrix runs first and closes its temporary pages before the idle
+board opens. Quota, work and money seeds share an anchor ten minutes before the
+benchmark's aligned seed time. Warmup still checks actual observations: a fresh
+measurement requires its full fade, and the idle board settles for at least thirty seconds.
+Idle measurement starts at a planned grid phase with its endpoints away from
 minute ticks and includes one real five-minute cell transition in each chart.
 The benchmark anchors regular quota retirement fifty seconds before the chart grid
 transition, keeping their deadlines separate while admitting the warm deadline one
 minute before that grid edge. Planning includes both in the
-same observation window, retaining the original fade deadline, minimum settle wait
+same observation window, retaining the actual fade deadline, minimum settle wait
 and job limits. Sparse and eco histories keep their own cadence.
 Reports retain planned and observed bounds, inner CPU counter bounds, transition counts and actual
 performance duration; missing coverage is a failure and the 1 ms/s budget includes
@@ -651,6 +736,70 @@ before publication; native transport observations do not infer staging dispositi
 Reports retain attempted/completed/failed/aborted counts and uncertain body bounds.
 Proxy sockets and traffic tabs
 close before the benchmark stops its own demo.
+
+The manual CI input `history_scroll_control` requires `diagnostic_ref` and
+`expected_client_sha256`, and selects only the existing 20-minute history job.
+It runs one owned benchmark process with the original controlled traffic prefix, all
+24 native history cohorts and the six native cancellation cohorts, with every original
+assertion, reference-cut rule and deadline. The diagnostic prefix must complete without
+invalidations or budget failures. GDB is prepared before the run and first used only
+after an original failed command. In the direct history scroll control, passive original
+navigation evidence must establish the document before input; this does not bind a PID.
+Only after an original failure does the same page connection resolve its owned renderer
+and birth through a completed metadata trace, within the existing collection limit.
+Unknown or lost document or renderer identity permits neither native attach nor a page
+debugger fallback. Reports retain actual binding bookends only when it is resolved.
+The first failure stops without a diagnostic replay. Startup, compositor and legacy
+controls retain their pre-input metadata binding and existing reversal replay.
+The effects of diagnostic preparation are not qualified.
+This control also downloads the official debug archive
+for the installed Chrome version and installs only its unwind tables under the matching
+system build ID. Build IDs and the retained table bytes must agree; full symbol and
+source tables are discarded before Chrome starts. GDB still has its two-second limit,
+and saved frame positions are symbolized offline. Preparation does not execute Chrome
+or GDB; its effects on the OS file cache are not qualified. A completed diagnostic is
+an observation, never a canonical benchmark pass or proof that a hang was repaired.
+After retaining the successful original result, this direct control runs twelve fixed
+pairs of the original 1d/history/0ms/0.5/take1 and 30d/activity/100ms/0.5/take1 cohorts
+in fresh tabs of the same Chrome, with separate evidence and the original gestures and
+guards. The first failure, including a reference-cut change, stops without retry. The
+twenty-minute limit stays; an unfinished suffix remains inconclusive. Startup, compositor
+and ordinary checks omit this suffix; ordinary checks need no diagnostic preparation.
+Only the suffix's Activity pages also observe bounded history-pool operations. Their
+receipts retain tile coverage at response release and eviction; a completed HTTP body
+alone does not prove that its cells were published. Source binding runs after the
+traffic evidence is saved. This observation does not change retention or readiness.
+Pressure events also retain the period's current byte count and preparation flags.
+These flags describe simultaneous state, not the exclusive caller of a reservation.
+Within that same twenty-minute job, one eligible Activity page may wait up to sixty
+seconds for its captured work-prefix boundary before the cached return. The control
+requires committed prefix retirement and zero additional reads; a missing eligible
+boundary or unconfirmed retirement is inconclusive.
+
+The manual `startup_io_control` input observes a fixed A1/B/A2 startup sequence
+on one runner before running the unchanged full history control once, within the same
+20-minute job limit. Each arm prepares the current benchmark demo, SQLite history and
+event reader in a fresh Node process, then owns a fresh browser profile. Browser cleanup
+precedes backend cleanup; the worker must exit and be reaped before the next arm.
+Its shim advises `DONTNEED` only on the installed Chrome ELF through a read-only
+descriptor; B additionally reads it before exec. Advice, read and exec share the original
+twenty-second startup window. The advice does not guarantee eviction. No privileged
+or global cache reset is used. Source and file-stat pins bracket the probe; image
+content hashes are read only after its outcomes. The current preparation does not
+reproduce an earlier run's clock, cache or host state, and the diagnostic does not
+replace the required benchmark jobs. Missing receipts or unconfirmed cleanup remain
+inconclusive. Select it without any other diagnostic mode.
+
+The manual `compositor_guard_control` input compares the pending-tree compositor
+guard in pinned Google Chrome Beta 157.0.8103.15. Three independent runners execute
+the complete original history control, with the guard disabled in OLD1 and OLD2 and
+enabled in NEW. They use the same package and launcher, source and client pins,
+twenty-second startup and twenty-minute job limits. Matching native unwind tables
+must qualify before input. These parallel observations are not a sequential crossover.
+An ordinary CI run keeps its existing browser. This control is exclusive with every
+other diagnostic mode; successful runs without a matching original failure do not
+establish a repair. The upstream regression uses compositor hooks unavailable to a
+page, so this workload does not claim to reproduce those controlled scheduler states.
 
 ## Pull requests
 
