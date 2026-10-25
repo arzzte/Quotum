@@ -1,147 +1,63 @@
-import {test} from 'node:test';
 import assert from 'node:assert/strict';
-import {spawn} from 'node:child_process';
-import {existsSync,mkdtempSync,readFileSync,rmSync,writeFileSync} from 'node:fs';
-import {tmpdir} from 'node:os';
-import path from 'node:path';
-import {fileURLToPath,pathToFileURL} from 'node:url';
+import fs from 'node:fs';
+import {PassThrough} from 'node:stream';
+import {once,EventEmitter} from 'node:events';
+import {runInNewContext} from 'node:vm';
+import {test} from 'node:test';
+const {deviceNumbers,fileIdentity,traceProtocol,fixtureProof,fixtureTermProof,observeFilemapPhase,filemapWindowReady,controllerExitCode,isolatedCI,forwardBenchmark,traceComplete,diagnosticClassifier,runControl}=await import(new URL('../startupWaitControl.mjs',import.meta.url).href);
+const meta={dev:'64768',ino:'123456789123',size:'16777216',mtimeNs:'1730000000000000000',ctimeNs:'1730000000000000001',uid:'1001'};
+const row={pid:1234,birth:'200',parent:1000,group:1234,session:1234,uids:[1001,1001,1001,1001]};
+const sender={pid:1000,birth:'100',uid:1001},bracket={beforeNs:'9000000000',afterNs:'9000000010'};
+const json={status:'fixture-read-complete',pid:1234,birth:'200',group:1234,session:1234,owner:1001,fdmeta:{...meta},mainReads:16,threadReads:16,mappedTouches:16,offsets:16,pageBytes:4096,fdPosition:'0',coldstats:{adviceCalls:1,mincoreCalls:1,pages:4096,residentPages:0}};
+const base=()=>{const p=traceProtocol();p.add('QFW_TICK 3000000000');p.add('QFW_BIND 1 1234 2000000000 1000 1001 3000000010');p.add('QFW_FILE 1 1 1234 2000000000 253 0 123456789123 0 1 4000000000');p.add('QFW_FILE 1 2 1234 2000000000 253 0 123456789123 0 0 4000000001');return p;};
+const terms=()=>{const p=base();p.add('QFW_TERM 1 1234 2000000000 9000000005 1000 1000000000 1001 0');p.add('QFW_EXIT 1 1234 2000000000 9000000020');return p;};
+await test('GNU dev_t roundtrip, including high device bits',()=>{for(const [major,minor]of [[0n,0n],[253n,0n],[4095n,1048575n],[0x12345678n,0x23456789n]]){const dev=((major&0xfffn)<<8n)|((major&~0xfffn)<<32n)|(minor&0xffn)|((minor&~0xffn)<<12n);assert.deepEqual(deviceNumbers(dev),{major:String(major),minor:String(minor)});}});
+await test('exact BigInt file metadata keeps decimal precision',()=>{const v={dev:64768n,ino:123456789123456789n,size:16777216n,mtimeNs:1730000000000000001n,ctimeNs:1730000000000000002n,uid:1001n};assert.deepEqual(fileIdentity(v),Object.fromEntries(Object.entries(v).map(([k,v])=>[k,String(v)])));});
+await test('both own-file read-ready and fault contexts plus exact fixture JSON qualify',()=>assert.equal(fixtureProof(base().state,json,row,meta,1000,1001),true));
+await test('one origin alone does not qualify the fixture',()=>{const p=base();p.state.markers.pop();assert.equal(fixtureProof(p.state,json,row,meta,1000,1001),false);});
+await test('foreign PID, birth, parent, UID, process group and session refuse',()=>{for(const change of [{pid:99},{birth:'201'},{parent:999},{group:99},{session:99},{uids:[1001,1001,0,1001]}])assert.equal(fixtureProof(base().state,json,{...row,...change},meta,1000,1001),false);});
+await test('file event identity, range and both origins are exact',()=>{for(const change of [{inode:'9'},{major:'1'},{minor:'1'},{firstIndex:'4096',lastIndex:'4096'},{origin:1},{birthNs:'2000000001'},{pid:99}]){const p=base();Object.assign(p.state.markers.at(-1),change);assert.equal(fixtureProof(p.state,json,row,meta,1000,1001),false);}});
+await test('cold/read counts, descriptor and exact schema refuse contamination',()=>{for(const edit of [(v:any)=>v.secret='canary-never-save',(v:any)=>v.fdmeta.path='canary-never-save',(v:any)=>v.coldstats.path='canary-never-save',(v:any)=>v.coldstats.residentPages=1,(v:any)=>v.threadReads=15,(v:any)=>v.mappedTouches=15,(v:any)=>delete v.mappedTouches,(v:any)=>v.fdPosition='4096',(v:any)=>v.fdmeta.ino='123',(v:any)=>v.fdmeta.mtimeNs=Number(v.fdmeta.mtimeNs)]){const v=structuredClone(json);edit(v);assert.equal(fixtureProof(base().state,v,row,meta,1000,1001),false);}});
+await test('actual sender plus shared clock TERM bracket and exit qualify',()=>assert.equal(fixtureTermProof(terms().state,row,bracket,sender),true));
+await test('TERM generation outside bracket, sender, result or birth refuses',()=>{for(const change of [{ns:'8999999999'},{ns:'9000000011'},{senderPid:999},{senderBirthNs:'1010000000'},{senderUid:0},{result:1},{pid:99},{birthNs:'2000000001'}]){const p=terms();Object.assign(p.state.markers.at(-2),change);assert.equal(fixtureTermProof(p.state,row,bracket,sender),false);}});
+await test('missing, repeated or premature exit cannot qualify',()=>{const p=terms();p.state.markers.pop();assert.equal(fixtureTermProof(p.state,row,bracket,sender),false);const q=terms();q.state.markers.push({...q.state.markers.at(-2)});assert.equal(fixtureTermProof(q.state,row,bracket,sender),false);const r=terms();r.state.markers.at(-1).ns='9000000004';assert.equal(fixtureTermProof(r.state,row,bracket,sender),false);});
+await test('filemap context maps retain numeric counts without pending/duration proof',()=>{const p=base();p.add('QFW_WINDOW_CLOSED 25000000000');p.add('@capture_closed: 1');p.add('@count[2, 1, 253, 0, 1234]: 7');p.add('@files_omitted[2, 1]: 5');assert.equal(p.state.ended,false);assert.equal(p.state.maps.at(-1).filemapContextOnly,true);assert.equal(p.state.maps.at(-1).physicalWaitProof,false);assert.equal('censoredLowerBound'in p.state.maps.at(-1),false);assert.equal(p.state.invalid,0);p.add('QFW_END 25000000001');p.add('@term_sender[1]: (1000, 1000000000, 1001, 0)');assert.equal(traceComplete(p.state),true);for(const line of ['@pending_start[2]: 5','@sum_ns[2]: 5','@max_ns[2]: 5']){const q=traceProtocol();q.add(line);assert.equal(q.state.invalid,1);}});
+await test('raw paths, pointers, diagnostics, unknown names and malformed numbers are discarded',()=>{for(const line of ['/home/private-canary','0xffffffff81234567','lost 5 events','@private_map[1]: 2','@count[0x123]: 2','QFW_BIND 1 0 1 2 3 4','QFW_BIND 1 1 0 2 3 4','QFW_TICK 18446744073709551616','QFW_TERM 1 1234 2000000000 9000000005','QFW_FILE 1 3 1234 2000000000 253 0 1 0 0 9']){const p=traceProtocol();p.add(line);assert.equal(p.state.invalid,1);assert.equal(JSON.stringify(p.state).includes(line),false);}});
+await test('markers use logical time after END; row saturation is bounded',()=>{const p=traceProtocol();p.add('QFW_END 3');p.add('QFW_TICK 2');assert.equal(p.state.invalid,0);assert.equal(traceComplete(p.state),true);p.add('QFW_TICK 4');assert.equal(traceComplete(p.state),false);const q=traceProtocol();for(let i=1;i<=1600;i++)q.add('QFW_TICK '+i);assert.equal(q.state.markers.length,1536);assert.equal(q.state.omitted,64);assert.equal(fixtureProof(q.state,json,row,meta,1000,1001),false);});
+await test('actual CLI exit selection propagates original nonzero/signal and unknown',()=>{for(const[status,exit,signal,wanted]of [['observed',0,null,0],['observed',1,null,1],['observed',7,null,7],['observed',null,'SIGTERM',1],['unknown',0,null,2],['unknown',1,null,2]])assert.equal(controllerExitCode({status,benchmark:{exit,signal}}),wanted);});
+await test('isolated CI admission requires exact workspace and numeric event identity',()=>{const good={CI:'true',GITHUB_ACTIONS:'true',GITHUB_WORKSPACE:'/isolated/repo',GITHUB_RUN_ID:'1234',GITHUB_RUN_ATTEMPT:'1'};assert.equal(isolatedCI(good,'/isolated/repo'),true);for(const edit of [(v:any)=>delete v.CI,(v:any)=>v.CI='1',(v:any)=>delete v.GITHUB_ACTIONS,(v:any)=>v.GITHUB_WORKSPACE='/other/repo',(v:any)=>v.GITHUB_WORKSPACE='repo',(v:any)=>delete v.GITHUB_RUN_ID,(v:any)=>v.GITHUB_RUN_ID='',(v:any)=>v.GITHUB_RUN_ATTEMPT='not-number']){const v={...good};edit(v);assert.equal(isolatedCI(v,'/isolated/repo'),false);}});
+await test('actual runControl refuses local launch before mkdir/proc/helper work',async()=>{const before={CI:process.env.CI,GITHUB_ACTIONS:process.env.GITHUB_ACTIONS},mkdir=fs.mkdirSync;let calls=0;process.env.CI='false';process.env.GITHUB_ACTIONS='false';fs.mkdirSync=()=>{calls++;throw Error('must-not-run');};try{await assert.rejects(runControl('/isolated/repo','/isolated/new-out'),/isolated-ci/);assert.equal(calls,0);}finally{fs.mkdirSync=mkdir;for(const[k,v]of Object.entries(before))if(v===undefined)delete process.env[k];else process.env[k]=v;}});
+await test('canonical stdout/stderr forwarding is exact and does not cap/end destination',async()=>{const child={stdout:new PassThrough(),stderr:new PassThrough()},output={stdout:new PassThrough(),stderr:new PassThrough()},out:Buffer[]=[],err:Buffer[]=[];output.stdout.on('data',(v:any)=>out.push(v));output.stderr.on('data',(v:any)=>err.push(v));forwardBenchmark(child,output);const a=Buffer.alloc(70000,65),b=Buffer.from('original first failure\n');const ended=Promise.all([once(child.stdout,'end'),once(child.stderr,'end')]);child.stdout.end(a);child.stderr.end(b);await ended;assert.deepEqual(Buffer.concat(out),a);assert.deepEqual(Buffer.concat(err),b);assert.equal(output.stdout.writableEnded,false);assert.equal(output.stderr.writableEnded,false);output.stdout.destroy();output.stderr.destroy();});
+await test('flat and one balanced tuple key serialize identically; nesting and overflow refuse',()=>{const a=traceProtocol(),b=traceProtocol();a.add('@count[1, 1, 253, 0, 99, 0, 0]: 2');b.add('@count[(1, 1, 253, 0, 99, 0, 0)]: 2');assert.deepEqual(a.state,b.state);for(const line of ['@count[((1, 2))]: 2','@count[(1, 2]: 2','@count[1, 2)]: 2','@count[(1, 2), 3]: 2','@count[(1,2,3,4,5,6,7,8)]: 2','@count[1]: (1,2,3,4,5,6,7,8)']){const p=traceProtocol();p.add(line);assert.equal(p.state.invalid,1);}});
+await test('after reap logical END permits late earlier markers; duplicate/missing/future END fail',()=>{const p=base();p.add('QFW_END 9999999999');p.add('QFW_TERM 1 1234 2000000000 9000000005 1000 1000000000 1001 0');assert.equal(traceComplete(p.state),true);p.add('QFW_FILE 1 1 1234 2000000000 253 0 123456789123 0 0 10000000000');assert.equal(traceComplete(p.state),false);const q=traceProtocol();q.add('QFW_END 4');q.add('QFW_END 5');assert.equal(traceComplete(q.state),false);assert.equal(traceComplete(base().state),false);});
+await test('stderr classifier retains only safe categories/known bounded coordinates',()=>{const d=diagnosticClassifier();d.add(Buffer.from('/private/path/startupWaitOwner.bt:12:3-4: ERROR: syntax error; permission denied; BTF unknown struct; failed to attach; verifier invalid mem access; cannot allocate; lost 2 events; secret-canary 0xffffffff81234567\n'));d.add(Buffer.from('stdin:1001:4: syntax error\n/private/startupWaitCounters.py:2:1001: other\n'));const result=d.finish();assert.deepEqual(new Set(result.categories),new Set(['syntax','permission','BTF','layout','attach','verifier','resource','lost-events']));assert.deepEqual(result.locations,[{source:'bpf-script',line:12,column:3}]);assert.equal(result.discardedBytes,result.bytes);assert.equal(JSON.stringify(result).includes('secret-canary'),false);assert.equal(JSON.stringify(result).includes('/private'),false);assert.equal(JSON.stringify(result).includes('0xffffffff'),false);const saved=JSON.stringify(result);d.add(Buffer.from('EPERM'));assert.equal(JSON.stringify(d.finish()),saved);});
+await test('stderr classifier cap and chunk boundaries preserve UNKNOWN/other without raw tail',()=>{const d=diagnosticClassifier();d.add(Buffer.from('permission den'));d.add(Buffer.from('ied\nstdin:2:3: ERROR\n'));assert.deepEqual(d.finish().categories,['permission']);const q=diagnosticClassifier();q.add(Buffer.from('x'.repeat(16384)));q.add(Buffer.from('BTF permission denied'));const v=q.finish();assert.deepEqual(v.categories,['other']);assert.equal(v.scannedBytes,16384);assert.equal(v.limited,true);assert.equal(v.unscannedBytes,21);assert.equal(JSON.stringify(v).includes('xxxx'),false);});
+await test('old return-pair record is rejected rather than promoted to entry evidence',()=>{const p=traceProtocol();p.add('QFW_PAIR 1 1234 2000000000 1 253 0 123456789123 0 0 0 4000000000 4000001000');assert.equal(p.state.invalid,1);});
+await test('actual owned bench handlers stay uncapped; prior reduction cap is negative',()=>{const observe=(text:string)=>{const begin=text.indexOf('  const owned=')+'  const owned='.length,end=text.indexOf('  const anchor=',begin),functionText=text.slice(begin,end).trim().replace(/;$/,''),child=Object.assign(new EventEmitter(),{pid:123,stdout:new PassThrough(),stderr:new PassThrough(),stdin:new PassThrough()}),dest={stdout:new PassThrough(),stderr:new PassThrough()};dest.stdout.resume();dest.stderr.resume();const context={browserProcess:()=>({}),diagnosticClassifier,cancel:new AbortController(),report:{},leases:[],forwardBenchmark:(c:any)=>forwardBenchmark(c,dest)};const actual=runInNewContext('('+functionText+')',context),lease=actual(child,'bench');child.stderr.write(Buffer.alloc(20000,65));const bad=lease.state.bad;for(const stream of [child.stdout,child.stderr,child.stdin,dest.stdout,dest.stderr])stream.destroy();return bad;};const current=fs.readFileSync(new URL('../startupWaitControl.mjs',import.meta.url),'utf8'),prior=current.replace("if(kind==='trace'&&state.stderrBytes>0||kind==='fixture'&&state.stderrBytes>16384)","if(state.stderrBytes>16384)");assert.notEqual(prior,current);assert.equal(observe(prior),true);assert.equal(observe(current),false);});
+await test('fault must be singleton, read interval inclusive, bad origins/ranges reject',()=>{for(const line of ['QFW_FILE 1 2 1234 2000000000 253 0 123456789123 0 1 4000000000','QFW_FILE 1 1 1234 2000000000 253 0 123456789123 2 1 4000000000','QFW_FILE 1 0 1234 2000000000 253 0 123456789123 0 0 4000000000','QFW_FILE 1 1 0 2000000000 253 0 123456789123 0 0 4000000000']){const p=traceProtocol();p.add(line);assert.equal(p.state.invalid,1);}const p=base();p.state.markers=p.state.markers.filter((r:any)=>r.kind!=='QFW_FILE'||r.origin!==1);assert.equal(fixtureProof(p.state,json,row,meta,1000,1001),false);});
+await test('any tracer stderr remains fatal while safe diagnostic messages are preserved',()=>{const text=fs.readFileSync(new URL('../startupWaitControl.mjs',import.meta.url),'utf8');assert.equal(text.includes('traceExpectedWarning'),false);assert.equal(text.includes('traceWarningFilter'),false);const start=text.indexOf('  const owned=')+'  const owned='.length,end=text.indexOf('  const anchor=',start),actual=runInNewContext('('+text.slice(start,end).trim().replace(/;$/,'')+')',{browserProcess:()=>({}),diagnosticClassifier,cancel:new AbortController(),report:{},leases:[]}),child=Object.assign(new EventEmitter(),{pid:123,stdout:new PassThrough(),stderr:new PassThrough(),stdin:new PassThrough()}),lease=actual(child,'trace');child.stderr.write(Buffer.from('WARNING: safe fixture diagnostic\n'));assert.equal(lease.state.bad,true);assert.deepEqual(Array.from(lease.diagnostic.finish().toolMessages),['WARNING: safe fixture diagnostic']);for(const stream of [child.stdout,child.stderr,child.stdin])stream.destroy();});
 
-const repository=fileURLToPath(new URL('../../../',import.meta.url));
-const sha='a'.repeat(40),clientHash='b'.repeat(64),tree='c'.repeat(40);
-const expected={QUOTUM_BENCH_SOURCE_SHA:sha,QUOTUM_BENCH_EXPECTED_CLIENT_SHA256:clientHash};
-const keys=['QUOTUM_C1_REAL_CHROME','QUOTUM_C1_TRIAL','QUOTUM_C1_RECEIPT',...Object.keys(expected)];
-const json=(file:string)=>JSON.parse(readFileSync(file,'utf8'));
-
-async function fixture(){
-  const directory=mkdtempSync(path.join(tmpdir(),'quotum-startup-prefix-'));
-  try{
-    const workflow=readFileSync(path.join(repository,'.github/workflows/ci.yml'),'utf8');
-    const helper=workflow.match(/^          cat > "\$RUNNER_TEMP\/quotum-c1-aba\.mjs" <<'JS'\n([\s\S]*?)^          JS$/m);
-    const sequence=workflow.match(/      - name: Observe the fixed ABA sequence with fresh benchmark preparation\n[\s\S]*?        run: \|\n([\s\S]*?)(?=      - name:)/);
-    assert.ok(helper);assert.ok(sequence);
-    const module=path.join(directory,'actual.mjs'),shell=path.join(directory,'sequence.sh');
-    writeFileSync(module,helper[1].replace(/^          /gm,''));
-    let command=sequence[1].replace(/^          /gm,'');
-    for(const [before,after]of [
-      ['c1_node="$(command -v node)"','c1_node="$C1_TEST_NODE"'],
-      ['c1_worker="$RUNNER_TEMP/quotum-c1-aba.mjs"','c1_worker="$C1_TEST_WORKER"'],
-      ['c1_rollup="$c1_worker"','c1_rollup="$C1_TEST_ROLLUP"'],
-    ]){assert.equal(command.split(before).length,2);command=command.replace(before,after);}
-    writeFileSync(shell,command);
-    return{directory,module,shell,api:await import(pathToFileURL(module).href) as any};
-  }catch(error){rmSync(directory,{recursive:true,force:true});throw error;}
-}
-
-function environment(){
-  const before=Object.fromEntries(keys.map(key=>[key,process.env[key]]));Object.assign(process.env,expected);
-  return()=>{for(const key of keys)if(before[key]===undefined)delete process.env[key];else process.env[key]=before[key];};
-}
-function services(f:any,directory:string,fault='none',client?:any){
-  const order:string[]=[],abort=new AbortController(),report:any={stage:'ready'};let closed=false,stopped=false,launches=0;
-  class Owner{
-    signal=abort.signal;failures:unknown[]=[];
-    async start(run:(signal:AbortSignal)=>Promise<any>){this.signal.throwIfAborted();return run(this.signal);}
-    async close(){if(closed)return;closed=true;abort.abort();order.push('browser-close');report.cleanup={status:'closed',reaped:true,pipesClosed:true};}
-  }
-  const deps={Owner,pins:f.api.sourcePins(repository,()=>({status:'available',sha256:clientHash}),(args:string[])=>args[0]==='status'?(fault==='dirty'?' M file':''):args[1]==='HEAD'?sha:tree),
-    preparePrefix:async()=>{order.push('prefix');if(client)await client.Person.signUp('http://fixture.invalid',{email:'fixture',name:'Fixture',password:'fixture'},{setupCode:'fixture'});
-      if(fault==='cancel')process.emit('SIGHUP');return{evidence:{prepared:true},stop:async()=>{if(stopped)return;assert.equal(closed,true);stopped=true;order.push('prefix-stop');client?.haltRequests();}};},
-    launch:async(shim:string,visible:boolean,signal:AbortSignal)=>{launches++;order.push('launch');assert.equal(shim,path.join(f.directory,'shim'));assert.equal(visible,false);assert.equal(signal,abort.signal);
-      assert.equal(process.env.QUOTUM_C1_REAL_CHROME,path.join(f.directory,'chrome'));assert.equal(process.env.QUOTUM_C1_RECEIPT,path.join(directory,'shim-first.json'));
-      writeFileSync(path.join(directory,'shim-first.json'),JSON.stringify({phase:'exec-ready'}));return{launchReport:()=>report};}};
-  return{deps,order,launches:()=>launches,args:[repository,'A1',path.join(f.directory,'chrome'),path.join(f.directory,'shim'),directory]};
-}
-
-test('the actual worker restores flags and listeners and rejects dirty source or cancellation',async()=>{
-  const f=await fixture(),restore=environment();
-  try{for(const fault of ['none','dirty','cancel']){
-    const directory=path.join(f.directory,fault),h=services(f,directory,fault),before=keys.map(key=>process.env[key]),signals=['SIGINT','SIGTERM','SIGHUP'];
-    const listeners=signals.map(signal=>process.listenerCount(signal)),out=await f.api.workerMain(h.args,h.deps);
-    assert.equal(out.code,fault==='none'?0:2);assert.equal(h.launches(),fault==='none'?1:0);
-    assert.deepEqual(keys.map(key=>process.env[key]),before);assert.deepEqual(signals.map(signal=>process.listenerCount(signal)),listeners);
-    if(fault==='dirty')assert.deepEqual(h.order,[]);else assert.ok(h.order.indexOf('prefix-stop')>h.order.indexOf('browser-close'));
-    assert.equal(json(path.join(directory,'worker-first.json')).code,out.code);
-  }}finally{restore();rmSync(f.directory,{recursive:true,force:true});}
+await test('isolated tracer errors retain bounded useful text while paths and addresses are removed',()=>{
+ const d=diagnosticClassifier({toolMessages:true});d.add(Buffer.from('/isolated/private/startupWaitOwner.bt:71:43: ERROR: comparison of unsigned int64 and int64\nlibbpf: failed operation at 0xffffffff81234567, deadbeef and https://example.invalid/private TOKEN=secret-value\nC:\\private\\trace.bt: no such option\n'));
+ const r=d.finish(),text=JSON.stringify(r.toolMessages);assert.equal(r.toolMessages.length,3);assert.match(text,/comparison of unsigned int64 and int64/);assert.match(text,/no such option/);for(const value of ['/isolated','C:\\private','0xffffffff','deadbeef','example.invalid','secret-value'])assert.equal(text.includes(value),false);assert.equal(r.toolMessagesLimited,false);assert.match(r.toolMessages[0],/\[path\]:71:43: ERROR:/);
+});
+await test('tool error chunks, EOF and caps preserve diagnosis without changing default retention',()=>{
+ const plain=diagnosticClassifier();plain.add(Buffer.from('ERROR: unknown flag'));assert.equal('toolMessages'in plain.finish(),false);
+ const d=diagnosticClassifier({toolMessages:true});d.add(Buffer.from('ERROR: un'));d.add(Buffer.from('known flag'));assert.deepEqual(d.finish().toolMessages,['ERROR: unknown flag']);const before=d.finish();d.add(Buffer.from('later'));assert.deepEqual(d.finish(),before);
+ const cap=diagnosticClassifier({toolMessages:true});cap.add(Buffer.from(Array.from({length:10},()=> 'x'.repeat(300)).join('\n')));const r=cap.finish();assert.equal(r.toolMessages.length,8);assert.equal(r.toolMessages.every((v:string)=>v.length<=256),true);assert.equal(r.toolMessagesLimited,true);
 });
 
-test('actual demo HTTP halt state forbids a second prefix in the same process',async t=>{
-  const f=await fixture(),restore=environment(),client=await import(pathToFileURL(path.join(repository,'hub/demo/client.ts')).href+'?startup-prefix-test');
-  t.mock.method(globalThis,'fetch',async(_uri:any,options:any)=>{options.signal.throwIfAborted();return new Response(JSON.stringify({user:{id:'fixture'},boards:[{id:'fixture',personal:true}]}),{headers:{'content-type':'application/json','set-cookie':'session=fixture'}});});
-  try{
-    const a=services(f,path.join(f.directory,'A1'),'none',client),b=services(f,path.join(f.directory,'B'),'none',client);
-    assert.equal((await f.api.workerMain(a.args,a.deps)).code,0);
-    const out=await f.api.workerMain(b.args,b.deps);assert.equal(out.code,2);assert.equal(b.launches(),0);assert.equal(out.result.canonicalFixturePreparation,false);
-  }finally{restore();rmSync(f.directory,{recursive:true,force:true});}
-});
-
-function standin(f:any,hold:boolean){
-  const file=path.join(f.directory,'standin.mjs');
-  writeFileSync(file,`
-import assert from 'node:assert/strict';import {readFileSync,writeFileSync,writeSync} from 'node:fs';import path from 'node:path';
-import {workerEntry,sourcePins} from ${JSON.stringify(pathToFileURL(f.module).href)};
-import {Person,haltRequests} from ${JSON.stringify(pathToFileURL(path.join(repository,'hub/demo/client.ts')).href)};
-const [repo,trial,chrome,shim,directory]=process.argv.slice(2),abort=new AbortController(),report={stage:trial==='A2'?'spawn':'ready'},order=[];let closed=false,stopped=false;
-globalThis.fetch=async(_uri,options)=>{options.signal.throwIfAborted();return new Response(JSON.stringify({user:{id:'fixture'},boards:[{id:'fixture',personal:true}]}),{headers:{'content-type':'application/json','set-cookie':'session=fixture'}});};
-class Owner{signal=abort.signal;failures=[];async start(run){this.signal.throwIfAborted();return run(this.signal);}async close(){if(closed)return;closed=true;abort.abort();order.push('browser-close');report.cleanup={status:'closed',reaped:true,pipesClosed:true};}}
-await workerEntry([repo,trial,chrome,shim,directory],{Owner,
- pins:sourcePins(repo,()=>({status:'available',sha256:${JSON.stringify(clientHash)}}),args=>args[0]==='status'?'':args[1]==='HEAD'?${JSON.stringify(sha)}:${JSON.stringify(tree)}),
- preparePrefix:async()=>{await Person.signUp('http://fixture.invalid',{email:'fixture',name:'Fixture',password:'fixture'},{setupCode:'fixture'});order.push('prefix');setInterval(()=>{},1000);return{evidence:{prepared:true},stop:async()=>{if(stopped)return;assert.equal(closed,true);stopped=true;order.push('prefix-stop');haltRequests();writeFileSync(path.join(directory,'order.json'),JSON.stringify(order));}};},
- launch:async(value,visible,signal)=>{assert.equal(value,shim);assert.equal(visible,false);assert.equal(signal,abort.signal);order.push('launch');writeFileSync(path.join(directory,'shim-first.json'),JSON.stringify({phase:'exec-ready'}));
- if(${hold}&&trial==='A1'){
-  const pending=new Promise((_resolve,reject)=>{const stop=()=>{writeFileSync(path.join(directory,'launch-aborted.json'),JSON.stringify({pid:process.pid}));reject(signal.reason);};signal.addEventListener('abort',stop,{once:true});if(signal.aborted)stop();});
-  const stat=readFileSync('/proc/self/stat','utf8'),fields=stat.slice(stat.lastIndexOf(')')+2).trim().split(/\\s+/);
-  writeSync(1,JSON.stringify({kind:'held-launch-ready',pid:process.pid,birth:fields[19],group:Number(fields[2])})+'\\n');return await pending;
- }if(trial==='A2'){report.failure='original-deadline';throw Object.assign(new Error('original-startup'),{report});}return{launchReport:()=>report};}});
-`);return file;
+await test('released observer failure returns control to original E and keeps UNKNOWN/nonzero',async()=>{const report={status:'unknown',observationIssue:null,benchmark:{exit:0}},first=Object.assign(new Error('capture'),{controlReason:'capture-first'});let released=0,originalCompleted=false;const safe=await observeFilemapPhase(report,async()=>{throw first;},async()=>{released++;return{released:true,reaped:true,pipesClosed:true,residual:[]};});if(safe)originalCompleted=true;assert.equal(safe,true);assert.equal(originalCompleted,true);assert.equal(released,1);assert.equal(report.observationIssue,'capture-first');assert.equal(controllerExitCode(report),2);});
+await test('unreleased observer blocks E continuation and records resource issue',async()=>{for(const state of [{released:false,reaped:false,pipesClosed:false,residual:null},{released:true,reaped:true,pipesClosed:true,residual:[{pid:123}]},{released:true,reaped:false,pipesClosed:true,residual:[]}]){const report:any={};const safe=await observeFilemapPhase(report,async()=>{},async()=>state);assert.equal(safe,false);assert.equal(report.observationResourceIssue,'observation-resource-unreleased');}});
+await test('first capture issue and original benchmark primary survive later cleanup errors',async()=>{const report={primary:'benchmark-failed',observationIssue:'first-original-capture'},primary=new Error('original benchmark'),original=Promise.reject(primary);original.catch(()=>{});const safe=await observeFilemapPhase(report,async()=>{throw Object.assign(new Error('next'),{controlReason:'second'});},async()=>{throw Object.assign(new Error('release'),{controlReason:'third'});});assert.equal(safe,false);assert.equal(report.observationIssue,'first-original-capture');assert.equal(report.primary,'benchmark-failed');await assert.rejects(original,(error:any)=>error===primary);});
+await test('WINDOW/END already reaped is accepted before premature-exit check',()=>{const p=base();p.add('QFW_WINDOW_CLOSED 9000000000');p.add('QFW_END 9000000001');assert.equal(filemapWindowReady({reaped:true,bad:false},p.state),true);assert.throws(()=>filemapWindowReady({reaped:true,bad:false},base().state),(error:any)=>error.controlReason==='trace-capture');assert.throws(()=>filemapWindowReady({reaped:true,bad:true},p.state),(error:any)=>error.controlReason==='trace-capture');});
+const stopSource=fs.readFileSync(new URL('../startupWaitControl.mjs',import.meta.url),'utf8'),stopBegin=stopSource.indexOf('  const stop=')+'  const stop='.length;
+async function actualStop({natural,timeout=false,residual=[]}:{natural:boolean;timeout?:boolean;residual?:unknown[]}){
+ const end=stopSource.indexOf('  try{\n    requireValue(process.platform',stopBegin),body=stopSource.slice(stopBegin,end).trim().replace(/;$/,''),signal=new AbortController().signal,calls:number[]=[],signals:string[]=[],report={cleanup:[]};let resolve:(()=>void)|undefined;
+ const state:any={kind:'trace',naturalRequested:natural,reaped:!timeout,pipesClosed:!timeout,exit:timeout?null:0,signal:null},lease={state,closed:timeout?new Promise<void>(r=>resolve=r):Promise.resolve(),owner:{observe:async()=>residual},child:{stdin:{destroy(){}},stdout:{destroy(){}},stderr:{destroy(){}},unref(){}}};
+ const context={report,deadline:async(ms:number,work:(s:AbortSignal)=>unknown,parent?:AbortSignal)=>{calls.push(ms);if(ms===500&&timeout)throw Error('simulated natural timeout');return work(ms===1000?signal:parent??signal);},rootSignal:async(l:any,sig:string,parent:AbortSignal)=>{assert.equal(parent,signal);signals.push(sig);l.state[sig==='SIGKILL'?'killRequested':'termRequested']=true;l.state.reaped=true;l.state.pipesClosed=true;l.state.exit=null;l.state.signal=sig;resolve?.();},boundedCurrent:async()=>null,uid:1001};
+ const stop=runInNewContext('('+body+')',context);await stop(lease);return{state,lease,stop,calls,signals};
 }
-
-function sequence(f:any,hold=false){
-  const child=spawn('/bin/bash',[f.shell],{cwd:path.join(repository,'hub'),detached:true,stdio:['ignore','pipe','pipe'],env:{...process.env,...expected,
-    GITHUB_WORKSPACE:repository,RUNNER_TEMP:f.directory,QUOTUM_C1_REAL_CHROME:'/synthetic/chrome',QUOTUM_BENCH_DIAGNOSTICS_DIR:f.directory,GITHUB_OUTPUT:path.join(f.directory,'output'),
-    C1_TEST_NODE:process.execPath,C1_TEST_WORKER:standin(f,hold),C1_TEST_ROLLUP:f.module}});
-  let closed=false,marker:any,stdout='',stderr='',partial='',yes!:(value:any)=>void,no!:(error:Error)=>void;
-  const ready=new Promise<any>((resolve,reject)=>{yes=resolve;no=reject;});void ready.catch(()=>{});
-  const sameWorker=()=>{try{const stat=readFileSync('/proc/'+marker.pid+'/stat','utf8'),fields=stat.slice(stat.lastIndexOf(')')+2).trim().split(/\s+/);return fields[19]===marker.birth&&Number(fields[2])===child.pid;}catch{return false;}};
-  const stop=()=>{if(child.pid&&(!closed||marker&&sameWorker()))try{process.kill(-child.pid,'SIGKILL');}catch(error){if((error as NodeJS.ErrnoException).code!=='ESRCH')throw error;}};
-  const timer=setTimeout(stop,5000); // Only a failure watchdog; assertions use the explicit launch barrier.
-  const complete=new Promise<{code:number|null;signal:NodeJS.Signals|null;stderr:string}>((resolve,reject)=>{
-    child.once('error',error=>{no(error);reject(error);});
-    child.stdout.on('data',data=>{stdout+=data;partial+=data;if(stdout.length>65536)stop();const lines=partial.split('\n');partial=lines.pop()!;for(const line of lines)try{const value=JSON.parse(line);if(value.kind==='held-launch-ready'){marker=value;yes(value);}}catch{}});
-    child.stderr.on('data',data=>{stderr+=data;if(stderr.length>16384)stop();});
-    child.once('close',(code,signal)=>{closed=true;clearTimeout(timer);if(hold&&!marker)no(Error('Worker exited before launch barrier: '+stderr));resolve({code,signal,stderr});});
-  });void complete.catch(()=>{});
-  return{child,ready,complete,sameWorker,stop:async()=>{stop();await complete.catch(()=>{});}};
-}
-
-test('the actual sequence reaps three fresh workers and retains a clean original startup failure', {skip:process.platform!=='linux'},async()=>{
-  const f=await fixture(),restore=environment(),run=sequence(f);
-  try{
-    const out=await run.complete;assert.equal(out.code,1,out.stderr);assert.equal(out.signal,null);const pids:number[]=[];
-    for(const trial of ['A1','B','A2']){
-      const directory=path.join(f.directory,'probe',trial),result=json(path.join(directory,'result-first.json')),exit=json(path.join(directory,'worker-exit-first.json'));
-      assert.equal(exit.status,'reaped');assert.equal(exit.exit,0);assert.equal(exit.pid,result.workerPid);pids.push(exit.pid);
-      assert.equal(result.clean,true);assert.equal(result.shimReceipt.phase,'exec-ready');assert.deepEqual(json(path.join(directory,'order.json')),['prefix','launch','browser-close','prefix-stop']);
-    }
-    assert.equal(new Set(pids).size,3);const result=json(path.join(f.directory,'probe/result-first.json'));
-    assert.equal(result.historyReady,true);assert.equal(result.canonicalPass,false);assert.equal(result.C1RepairProven,false);
-    assert.equal(result.trials[2].first.status,'failed');assert.equal(result.trials[2].first.report.failure,'original-deadline');
-    assert.equal(json(path.join(f.directory,'probe/A2/startup-first.json')).report.failure,'original-deadline');assert.equal(readFileSync(path.join(f.directory,'output'),'utf8'),'history_ready=true\n');
-    for(const fault of ['source','pid','deadline','shim']){
-      const directory=path.join(f.directory,'probe/B'),file=path.join(directory,'result-first.json'),value=json(file),original=readFileSync(file,'utf8');
-      if(fault==='source')value.sourceAfter={...value.source,sha:'d'.repeat(40)};if(fault==='pid')value.workerPid=result.trials[0].workerPid;if(fault==='deadline')value.originalStartupDeadlineMs=25000;if(fault==='shim')value.shimReceipt.phase='unknown';
-      writeFileSync(file,JSON.stringify(value));rmSync(path.join(f.directory,'probe/result-first.json'));assert.equal(f.api.rollup(path.join(f.directory,'probe')).historyReady,false);writeFileSync(file,original);
-    }
-  }finally{await run.stop();restore();rmSync(f.directory,{recursive:true,force:true});}
-});
-
-test('the actual sequence forwards TERM, joins owned cleanup and starts no next arm', {skip:process.platform!=='linux'},async()=>{
-  const f=await fixture(),run=sequence(f,true);
-  try{
-    const marker=await run.ready;assert.equal(marker.group,run.child.pid);assert.equal(run.sameWorker(),true);assert.equal(run.child.kill('SIGTERM'),true);
-    const out=await run.complete;assert.equal(out.code,130,out.stderr);assert.equal(out.signal,null);assert.equal(run.sameWorker(),false);
-    const directory=path.join(f.directory,'probe/A1'),result=json(path.join(directory,'result-first.json'));
-    assert.equal(result.workerPid,marker.pid);assert.equal(result.cancelled,true);assert.equal(result.clean,false);assert.equal(json(path.join(directory,'launch-aborted.json')).pid,marker.pid);
-    assert.deepEqual(json(path.join(directory,'order.json')),['prefix','launch','browser-close','prefix-stop']);
-    for(const file of ['probe/B','probe/A2','probe/result-first.json','output'])assert.equal(existsSync(path.join(f.directory,file)),false);
-  }finally{await run.stop();rmSync(f.directory,{recursive:true,force:true});}
-});
+await test('actual stop body natural exit has single1000ms cap, no TERM or KILL',async()=>{const r=await actualStop({natural:true});assert.equal(r.state.released,true);assert.equal(r.state.exit,0);assert.equal(r.state.signal,null);assert.deepEqual(r.signals,[]);assert.equal(r.calls.filter((ms:number)=>ms===1000).length,1);assert.ok(r.calls.includes(500));});
+await test('actual stop body forcedKILL release is safe for E but capture remains UNKNOWN',async()=>{const r=await actualStop({natural:true,timeout:true}),report:any={status:'unknown',benchmark:{exit:0}};const safe=await observeFilemapPhase(report,async()=>{if(r.state.killRequested)throw Object.assign(new Error('capture'),{controlReason:'trace-release'});},async()=>{await r.stop(r.lease);return r.state;});assert.equal(safe,true);assert.equal(report.observationIssue,'trace-release');assert.equal(controllerExitCode(report),2);assert.deepEqual(r.signals,['SIGKILL']);assert.equal(r.calls.filter((ms:number)=>ms===1000).length,1);});
+await test('actual stop body preWINDOW failure retains TERM path and residual blocks E',async()=>{const r=await actualStop({natural:false,timeout:true,residual:[{pid:123,birth:'1',state:'S'}]});assert.deepEqual(r.signals,['SIGTERM']);assert.equal(r.calls.includes(500),false);assert.equal(r.state.released,false);const report:any={};assert.equal(await observeFilemapPhase(report,async()=>{},async()=>r.state),false);assert.equal(report.observationResourceIssue,'observation-resource-unreleased');});

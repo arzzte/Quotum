@@ -69,7 +69,11 @@ The `bench` check passes only when both jobs succeed; a failed, skipped or cance
 fails this check. The default `--scope all` runs the history matrix first, then every
 dashboard phase in the same order as `--scope dashboard`. CPU diagnostics (`trace`,
 `profile`, `native-trace`, `native-profile`) support `all` or `dashboard`; caption control
-requires `dashboard`. The optional `history_pool_control` manual CI input runs the full
+requires `dashboard`. The ordinary history job attempts to prepare GDB and matching
+Chrome unwind tables in an optional two-minute step inside its existing job limit.
+Its setup result remains visible; setup failure still runs every benchmark check.
+Native capture starts only after the original command deadline fails and retains
+the original failure. The optional `history_pool_control` manual CI input runs the full
 history matrix in its existing job with the existing bounded cache observer. It requires
 an exact `diagnostic_ref`, compiled-client hash and clean checkout, and rejects other
 diagnostic inputs. CI prepares the existing native debugger and matching unwind tables
@@ -794,19 +798,34 @@ seconds for its captured work-prefix boundary before the cached return. The cont
 requires committed prefix retirement and zero additional reads; a missing eligible
 boundary or unconfirmed retirement is inconclusive.
 
-The manual `startup_io_control` input observes a fixed A1/B/A2 startup sequence
-on one runner before running the unchanged full history control once, within the same
-20-minute job limit. Each arm prepares the current benchmark demo, SQLite history and
-event reader in a fresh Node process, then owns a fresh browser profile. Browser cleanup
-precedes backend cleanup; the worker must exit and be reaped before the next arm.
-Its shim advises `DONTNEED` only on the installed Chrome ELF through a read-only
-descriptor; B additionally reads it before exec. Advice, read and exec share the original
-twenty-second startup window. The advice does not guarantee eviction. No privileged
-or global cache reset is used. Source and file-stat pins bracket the probe; image
-content hashes are read only after its outcomes. The current preparation does not
-reproduce an earlier run's clock, cache or host state, and the diagnostic does not
-replace the required benchmark jobs. Missing receipts or unconfirmed cleanup remain
-inconclusive. Select it without any other diagnostic mode.
+The manual `startup_io_control` input observes file identities and page ranges from
+a Linux browser's filemap read and fault tracepoints on an isolated GitHub runner.
+A fixed owned-file batch must first produce matching read and fault observations,
+identity and SIGTERM generation before the
+unchanged full history benchmark starts. Missing BTF, an unavailable probe or an
+unconfirmed fixture stops this diagnostic; no retry substitutes for qualification.
+The observer admits only the known fixture and the benchmark's detached browser main
+thread, checking parent, birth and UID. It keeps numeric device/inode/page identifiers
+from the events, never kernel addresses, paths or stack data. A prepared read range's
+last index is inclusive. It is reported after successful page acquisition, whereas a
+fault entry is reported before the page-cache lookup. A fault entry is one page.
+A 21-second observation window does not delay browser termination;
+the original twenty-second launch and twenty-minute job limits remain unchanged.
+The tracer then exits and retains its final maps. Once the fixture has qualified,
+an observer error preserves an inconclusive diagnostic result while the original
+benchmark finishes, provided the observer's release is confirmed.
+These events identify filemap inputs. They do not prove a physical read, a completed
+fault, blocking, its duration, the file behind an earlier wait or the absence of other
+operations. No dynamic function probe or duration certificate is collected.
+Post-readiness inputs are not automatically startup cost. The original benchmark
+verdict and console output survive collection and cleanup, and this optional job
+cannot satisfy the required benchmark gate. Select it without other diagnostic modes.
+It prepares GDB and matching Chrome unwind tables so the existing postfailure
+capture can inspect a bound renderer if the original command deadline fails.
+Preparation can affect the runner's caches; this is not a cold-start comparison.
+Its isolated tracer retains at most eight 256-character tool-error lines from a 16 KiB
+prefix, with paths and memory addresses removed. Other launch diagnostics retain
+their fixed categories and coordinates.
 
 The manual `compositor_guard_control` input compares the pending-tree compositor
 guard in pinned Google Chrome Beta 157.0.8103.15. Three independent runners execute
