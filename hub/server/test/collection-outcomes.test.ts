@@ -383,14 +383,75 @@ test('a committed unique success can recover an unknown diagnostic before a late
 });
 
 test('atomic batches preserve event-time guarded account-scoped recovery',t=>{
-  for(const accounts of [[A,B],[B,A]]){
-    const f=fixture(t);f.ask(0,[A,B],[A,B]);
+  for(const accounts of [[A,B],[B,A]])for(const explicit of [false,true]){
+    const f=fixture(t);f.ask(0,[A,B],explicit?[A,B]:undefined);
     diagnosticBatch(f,12000,[],[diagnosticFailure(f,A,9000),diagnosticFailure(f,B,11000)]);
     diagnosticBatch(f,13000,accounts.map(account=>diagnosticSnapshot(f,account,10000)));
     assert.deepEqual(f.store.deviceFailures(f.user.id).map(row=>[row.accountKey,row.at]),[[B,T+11000]]);
     diagnosticBatch(f,14000,[diagnosticSnapshot(f,B,11000)]);
     assert.deepEqual(f.store.deviceFailures(f.user.id),[]);
   }
+});
+
+test('known native diagnostics follow their own account observations before, after and within a tied batch',t=>{
+  for(const accounts of [[A,B],[B,A]])for(const failureAt of ['before','after','same']){
+    const f=fixture(t);f.ask(0,[A,B]);
+    const failure=diagnosticFailure(f,A,9000),snapshots=accounts.map(account=>diagnosticSnapshot(f,account,10000));
+    if(failureAt==='before')diagnosticBatch(f,11000,[],[failure]);
+    const batch=diagnosticBatch(f,12000,snapshots,failureAt==='same'?[failure]:[]);
+    if(failureAt==='after')diagnosticBatch(f,13000,[],[failure]);
+    assert.equal(batch.accepted,2);assert.equal(f.store.deviceSource(f.device().id,'codex'),null);
+    assert.deepEqual(f.store.deviceFailures(f.user.id),[],`${failureAt}: known A recovers independently of native identity inference`);
+    const replay=diagnosticBatch(f,14000,snapshots,[failure]);
+    assert.equal(replay.duplicates,2);assert.deepEqual(f.store.deviceFailures(f.user.id),[]);
+  }
+});
+
+test('a noncurrent native account recovers from its own duplicate sample without touching other diagnostics',t=>{
+  const f=fixture(t);f.ask(0,[A,B]);f.deliver(20000,B);
+  diagnosticBatch(f,22000,[],[diagnosticFailure(f,A,9000),diagnosticFailure(f,B,21000),diagnosticFailure(f,null,21000)]);
+  const other={...f.sender,machine:{...f.sender.machine,id:'other-native-diagnostic-fixture'}};
+  f.ingest.checkin(f.credential,{...other,paced:true,capabilities:{measurementPolicy:1,attemptContext:1},subscriptions:[{provider:'codex',account:A,active:false}]},T+23000);
+  diagnosticBatch(f,30000,[diagnosticSnapshot(f,A,30000)],[],other);
+  diagnosticBatch(f,32000,[],[diagnosticFailure(f,A,31000)],other);
+  const second=f.directory.deviceByMachine(f.user.id,other.machine.id)!,source=f.store.findSource('codex',A)!;
+  const shared=JSON.stringify(f.store.state(source));
+  const hints:string[]=[];f.directory.setObserver({touchDevices:owner=>hints.push(owner),touchSources(){},touchBoards(){},touchUser(){},touchHub(){},history(){},dropSessions(){},dropMember(){},dropBoard(){}});
+  const duplicate=diagnosticBatch(f,33000,[diagnosticSnapshot(f,A,10000)]);
+  assert.equal(duplicate.accepted,0);assert.equal(duplicate.duplicates,1);assert.deepEqual(hints,[f.user.id]);
+  assert.equal(f.store.deviceSource(f.device().id,'codex'),f.store.findSource('codex',B),'the newer native login stays current');
+  const remaining=f.store.deviceFailures(f.user.id);
+  assert.equal(remaining.length,3);assert.ok(!remaining.some(row=>row.device===f.device().id&&row.accountKey===A));
+  assert.ok(remaining.some(row=>row.device===f.device().id&&row.accountKey===B&&row.at===T+21000));
+  assert.ok(remaining.some(row=>row.device===f.device().id&&!row.accountKey&&row.at===T+21000));
+  assert.ok(remaining.some(row=>row.device===second.id&&row.accountKey===A&&row.at===T+31000));
+  hints.length=0;diagnosticBatch(f,34000,[diagnosticSnapshot(f,A,10000)]);
+  assert.deepEqual(hints,[],'replayed recovery is a no-op');
+  diagnosticBatch(f,35000,[],[diagnosticFailure(f,A,12000)]);
+  assert.deepEqual(hints,[f.user.id],'a genuinely newer own failure is still admitted');
+  hints.length=0;diagnosticBatch(f,36000,[diagnosticSnapshot(f,A,11000)]);
+  assert.ok(f.store.deviceFailures(f.user.id).some(row=>row.device===f.device().id&&row.accountKey===A&&row.at===T+12000));
+  assert.deepEqual(hints,[],'stale own success cannot clear a newer error or emit a recovery hint');
+  diagnosticBatch(f,37000,[diagnosticSnapshot(f,A,12000)]);
+  assert.deepEqual(hints,[f.user.id],'equal-time own success recovers the known key');
+  hints.length=0;diagnosticBatch(f,38000,[],[diagnosticFailure(f,A,12000),diagnosticFailure(f,A,11000)]);
+  assert.deepEqual(hints,[]);assert.equal(f.store.deviceFailures(f.user.id).length,3);
+  assert.equal(JSON.stringify(f.store.state(source)),shared,'private recovery does not replace newer shared observations');
+});
+
+test('known recovery still requires explicit membership and policy admission',t=>{
+  const f=fixture(t);f.ask(0,[A,B],[A,B]);diagnosticBatch(f,9000,[],[diagnosticFailure(f,A,9000)]);
+  f.ask(10000,[B],[B]);diagnosticBatch(f,12000,[diagnosticSnapshot(f,A,11000)]);
+  const before=f.store.deviceFailures(f.user.id);assert.deepEqual(before.map(row=>[row.accountKey,row.at]),[[A,T+9000]]);
+  const hints:string[]=[];f.directory.setObserver({touchDevices:owner=>hints.push(owner),touchSources(){},touchBoards(){},touchUser(){},touchHub(){},history(){},dropSessions(){},dropMember(){},dropBoard(){}});
+  const suppressed=diagnosticBatch(f,13000,[{...diagnosticSnapshot(f,A,13000),attemptContext:{...f.context(A),collectorEpoch:1}}]);
+  assert.equal(suppressed.policySuppressed,1);
+  const withdrawn=diagnosticBatch(f,14000,[],[diagnosticFailure(f,A,14000)]);
+  assert.equal(withdrawn.duplicates,1);assert.deepEqual(f.store.deviceFailures(f.user.id),before);assert.deepEqual(hints,[]);
+  f.ask(15000,[A,B],[A,B]);assert.deepEqual(f.store.deviceFailures(f.user.id),before);
+  hints.length=0;const replay=diagnosticBatch(f,16000,[diagnosticSnapshot(f,A,11000)]);
+  assert.equal(replay.accepted,0);assert.equal(replay.duplicates,1);
+  assert.deepEqual(f.store.deviceFailures(f.user.id),[]);assert.deepEqual(hints,[f.user.id]);
 });
 
 test('policy-suppressed snapshots neither recover unknown errors nor create an ambiguous group',t=>{
@@ -440,7 +501,7 @@ test('healthy batches check unknown diagnostics once per provider without readin
   const f=fixture(t);f.ask(0,[A,B]);
   const accounts=Array.from({length:16},(_,n)=>n.toString(16).padStart(24,'0'));
   diagnosticBatch(f,1000,accounts.map(account=>diagnosticSnapshot(f,account,1000)));
-  const prepare=f.store.db.prepare.bind(f.store.db),reads:string[]=[],plans:string[][]=[];
+  const prepare=f.store.db.prepare.bind(f.store.db),reads:string[]=[],plans:string[][]=[],recoveries:{changes:number|bigint;details:string[]}[]=[];
   f.store.db.prepare=((sql:string)=>{
     const statement=prepare(sql);
     if(/^\s*SELECT\b/i.test(sql))for(const method of ['get','all'] as const){
@@ -451,6 +512,14 @@ test('healthy batches check unknown diagnostics once per provider without readin
         return (original as (...args:any[])=>unknown)(...args);
       }});
     }
+    if(/^DELETE FROM device_failures/.test(sql)){
+      const run=statement.run.bind(statement);
+      Object.defineProperty(statement,'run',{value:(...args:any[])=>{
+        const result=run(...args);
+        recoveries.push({changes:result.changes,details:prepare('EXPLAIN QUERY PLAN '+sql).all(...args).map(row=>String(row.detail))});
+        return result;
+      }});
+    }
     return statement;
   }) as typeof f.store.db.prepare;
   diagnosticBatch(f,2000,accounts.map(account=>diagnosticSnapshot(f,account,2000)));
@@ -458,4 +527,6 @@ test('healthy batches check unknown diagnostics once per provider without readin
   assert.equal(reads.filter(sql=>/FROM device_failures.*account_key=''/.test(sql)).length,1,'one indexed absence check for the whole provider group');
   assert.ok(!reads.some(sql=>/SELECT ds.device_id,ds.provider,ds.source_id,ds.seen_at,s.account,r.accounts/.test(sql)),'a healthy group never loads the full provenance projection');
   assert.ok(plans.length);assert.ok(plans.every(details=>details.every(detail=>!/\bSCAN\b/.test(detail))),JSON.stringify(plans));
+  assert.ok(recoveries.length>0&&recoveries.length<=accounts.length,'known recovery does at most one point DELETE per admitted account');
+  assert.ok(recoveries.every(({changes,details})=>Number(changes)===0&&details.every(detail=>!/\bSCAN\b/.test(detail))),JSON.stringify(recoveries));
 });

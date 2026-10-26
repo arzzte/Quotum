@@ -652,7 +652,8 @@ export class Store {
     const before=roster===null?this.latestDeviceSource(device,provider):null;
     this.db.prepare('INSERT INTO device_sources (device_id,provider,source_id,seen_at) VALUES (?,?,?,?) ON CONFLICT(device_id,provider,source_id) DO UPDATE SET seen_at=MAX(device_sources.seen_at,excluded.seen_at)').run(device, provider, source, at);
     const after=roster===null?this.latestDeviceSource(device,provider):null;
-    const cleared=(roster?.has(key)||roster===null&&after===source)&&this.db.prepare('DELETE FROM device_failures WHERE device_id=? AND provider=? AND account_key=? AND at<=?').run(device, provider, key, at).changes>0;
+    // Known diagnostics follow their own account evidence, independently of native current inference.
+    const cleared=(roster===null||roster.has(key))&&this.db.prepare('DELETE FROM device_failures WHERE device_id=? AND provider=? AND account_key=? AND at<=?').run(device, provider, key, at).changes>0;
     if(added||before!==after)this.deviceAssociationsChanged(device);
     return !!cleared;
   }
