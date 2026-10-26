@@ -402,8 +402,12 @@ members. A late withdrawn-account observation can preserve history but cannot re
 its current device association, authority or command. Accepted observations retain raw
 device/source provenance, including a first observation delivered after withdrawal,
 so disconnecting the last contributing device can release its holdings. This retained
-provenance supplies no candidate, activity or funding evidence. Rejoining current
-membership requires a new full roster.
+provenance supplies no candidate, activity or funding evidence. Device/source recency
+uses adjusted observation time, keeping each source's latest accepted time; late older
+observations cannot replace newer account evidence. Without an explicit roster, only
+a uniquely latest account is current; equal latest observations of different accounts
+leave current identity unknown. Rejoining explicit current membership requires a new
+full roster.
 
 Clients advertise `capabilities.accountRosters: 1` and
 `capabilities.collectionCompletions: 1`; the normal check-in reply confirms both at

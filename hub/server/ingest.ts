@@ -120,7 +120,7 @@ export class Ingest {
         const source = this.store.source(snapshot.provider, account, now);
         touched.add(source);
         this.store.hold(source, device.userId, now);
-        this.store.seenDevice(device.id, snapshot.provider, source, now);
+        this.store.seenDevice(device.id, snapshot.provider, source, observedAt);
         const previous = this.store.state(source);
         const measurement = {...toMeasurement(snapshot), observedAt};
         const recorded = this.store.record(source, measurement);

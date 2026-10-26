@@ -647,11 +647,19 @@ export class Store {
 
   /** Every accepted observation retains provenance, independently of current membership. */
   seenDevice(device: string, provider: Provider, source: string, at: number) {
-    const before=this.currentDeviceSources(device).map(row=>row.source).sort().join(',');
+    const key=this.account(source)!,roster=this.accountRoster(device,provider);
+    const added=roster!==null&&roster.has(key)&&!this.db.prepare('SELECT 1 FROM device_sources WHERE device_id=? AND provider=? AND source_id=?').get(device,provider,source);
+    const before=roster===null?this.latestDeviceSource(device,provider):null;
     this.db.prepare('INSERT INTO device_sources (device_id,provider,source_id,seen_at) VALUES (?,?,?,?) ON CONFLICT(device_id,provider,source_id) DO UPDATE SET seen_at=MAX(device_sources.seen_at,excluded.seen_at)').run(device, provider, source, at);
-    const key=this.account(source)!;
-    if(this.rosterAllows(device,provider,key))this.db.prepare("DELETE FROM device_failures WHERE device_id=? AND provider=? AND account_key IN ('',?)").run(device, provider, key);
-    if(before!==this.currentDeviceSources(device).map(row=>row.source).sort().join(','))this.deviceAssociationsChanged(device);
+    const after=roster===null?this.latestDeviceSource(device,provider):null;
+    if(roster?.has(key)||roster===null&&after===source)this.db.prepare("DELETE FROM device_failures WHERE device_id=? AND provider=? AND account_key IN ('',?)").run(device, provider, key);
+    if(added||before!==after)this.deviceAssociationsChanged(device);
+  }
+
+  /** Equal observations of different accounts provide no unique current identity. */
+  private latestDeviceSource(device:string,provider:Provider):string|null {
+    const rows=this.db.prepare('SELECT source_id,seen_at FROM device_sources WHERE device_id=? AND provider=? ORDER BY seen_at DESC LIMIT 2').all(device,provider) as {source_id:string;seen_at:number}[];
+    return rows.length&&rows[0].seen_at!==rows[1]?.seen_at?rows[0].source_id:null;
   }
 
   deviceSource(device: string, provider: Provider): string | null {
@@ -682,18 +690,22 @@ export class Store {
     tell(this.observer,o=>o.touchUser(owner.user_id));
   }
 
-  /** Raw provenance cannot restore a withdrawn account or an earlier native login. */
+  /** Raw provenance cannot restore a withdrawn account or an earlier login. */
   private currentDeviceSources(device:string|null=null,user:string|null=null):{device:string;provider:Provider;source:string;seenAt:number}[] {
-    const rows=this.db.prepare('SELECT ds.device_id,ds.provider,ds.source_id,ds.seen_at,s.account FROM device_sources ds JOIN sources s ON s.id=ds.source_id JOIN devices d ON d.id=ds.device_id WHERE d.revoked_at IS NULL AND (? IS NULL OR ds.device_id=?) AND (? IS NULL OR d.user_id=?) ORDER BY ds.seen_at DESC,ds.source_id').all(device,device,user,user) as {device_id:string;provider:Provider;source_id:string;seen_at:number;account:string}[];
-    const groups=new Map<string,Set<string>|null>();
-    const native=new Set<string>();
-    return rows.filter(row=>{
+    const scope=device!==null?' AND ds.device_id=?':user!==null?' AND d.user_id=?':'';
+    const rows=this.db.prepare('SELECT ds.device_id,ds.provider,ds.source_id,ds.seen_at,s.account,r.accounts FROM device_sources ds JOIN sources s ON s.id=ds.source_id JOIN devices d ON d.id=ds.device_id LEFT JOIN device_account_rosters r ON r.device_id=ds.device_id AND r.provider=ds.provider WHERE d.revoked_at IS NULL'+scope+' ORDER BY ds.seen_at DESC,ds.source_id').all(...(device!==null?[device]:user!==null?[user]:[])) as {device_id:string;provider:Provider;source_id:string;seen_at:number;account:string;accounts:string|null}[];
+    const groups=new Map<string,Set<string>|null>(),latest=new Map<string,{at:number;source:string|null}>();
+    for(const row of rows){
       const group=`${row.device_id}/${row.provider}`;
-      if(!groups.has(group))groups.set(group,this.accountRoster(row.device_id,row.provider));
-      const roster=groups.get(group)!;
-      if(roster!==null)return roster.has(row.account);
-      if(native.has(group))return false;
-      native.add(group);return true;
+      if(!groups.has(group))groups.set(group,row.accounts===null?null:new Set(JSON.parse(row.accounts) as string[]));
+      if(groups.get(group)!==null)continue;
+      const before=latest.get(group);
+      if(!before)latest.set(group,{at:row.seen_at,source:row.source_id});
+      else if(before.at===row.seen_at)before.source=null;
+    }
+    return rows.filter(row=>{
+      const group=`${row.device_id}/${row.provider}`,roster=groups.get(group);
+      return roster?roster.has(row.account):latest.get(group)?.source===row.source_id;
     }).map(row=>({device:row.device_id,provider:row.provider,source:row.source_id,seenAt:row.seen_at}));
   }
 

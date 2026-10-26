@@ -2207,6 +2207,12 @@ first grouping choice; Project remains the default. Client is visible by default
 owner-hideable independently of chart selection; narrow ordinary rows keep it quietly
 on the existing first line. Unknown and Not provided labels remain neutral everywhere.
 
+The owner-private `sources[].seenAt` in `GET /api/devices` is the latest accepted
+observation time for that device/source, adjusted for agent clock skew. It is separate
+from the device's receipt/contact time in `lastSeenAt`. Current associations follow
+explicit membership; without a roster, equal latest observations of different accounts
+leave the current source unknown.
+
 `GET /api/devices` adds owner-private `clients` entries (`clientId`, nullable `version`,
 `seenAt`) and current `sessions` with the safe board fields plus a held source ID or null.
 Device revocation removes inventory and current presence. Inventory changes use the

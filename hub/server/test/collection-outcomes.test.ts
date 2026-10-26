@@ -170,3 +170,61 @@ test('native current-source inference uses only its latest association while ret
   f.directory.transaction(()=>{f.directory.revokeDevice(f.user.id,f.device().id,T+4000);f.store.releaseRevoked(f.user.id);});
   assert.equal(f.store.held(f.user.id).length,0);
 });
+
+test('native account recency follows skew-adjusted observation time within one received batch',t=>{
+  const f=fixture(t),received=T+3600000;
+  const snapshots=[A,B].map((account,index)=>({provider:'codex',account,observedAt:new Date(T-100+index*50).toISOString(),via:'fixture',staleAfterMs:120000,windows:[{id:'session',kind:'session',usedPercent:5}]}));
+  f.ingest.accept(f.credential,{...f.sender,sentAt:new Date(T).toISOString(),snapshots},received);
+  const source=f.store.findSource('codex',B)!;
+  assert.equal(f.store.deviceSource(f.device().id,'codex'),source);
+  assert.deepEqual(f.store.deviceSources(f.user.id).map(row=>[row.source,row.seenAt]),[[source,received-50]]);
+  assert.equal(f.directory.deviceById(f.device().id)!.lastSeenAt,received,'contact remains receipt time');
+});
+
+test('late older native login observations preserve history without replacing newer identity or clearing its failure',t=>{
+  const f=fixture(t);f.ask(0,[A]);f.deliver(1000,A);f.ask(2000,[B]);f.deliver(3000,B);
+  f.store.deviceFailed(f.device().id,'codex','timeout',null,T+3500);
+  f.ingest.accept(f.credential,{...f.sender,sentAt:new Date(T+4000).toISOString(),snapshots:[{provider:'codex',account:A,observedAt:new Date(T+2000).toISOString(),via:'fixture',staleAfterMs:120000,windows:[{id:'session',kind:'session',usedPercent:10}]}]},T+4000);
+  assert.equal(f.store.deviceSource(f.device().id,'codex'),f.store.findSource('codex',B));
+  assert.equal(f.store.deviceFailures(f.user.id).length,1,'historical A cannot clear an unknown current failure');
+  assert.equal(f.store.state(f.store.findSource('codex',A)!).successAt,T+2000);
+});
+
+test('equal native account observations leave current identity unknown while explicit membership stays authoritative',t=>{
+  const f=fixture(t);f.ask(0,[A]);f.deliver(1000,A);f.deliver(1000,B);
+  assert.equal(f.store.deviceSource(f.device().id,'codex'),null);assert.deepEqual(f.store.deviceSources(f.user.id),[]);
+  f.ingest.sessions(f.credential,{...f.sender,sentAt:new Date(T+2000).toISOString(),sessions:[{provider:'codex',origin:'terminal',startedAt:new Date(T).toISOString(),working:true}]},T+2000);
+  assert.equal(f.ingest.live.deviceSessions(f.user.id,f.device().id,T+2000)[0].source,null);
+  f.ask(3000,[],[A,B]);
+  assert.equal(f.store.deviceSources(f.user.id).length,2,'explicit membership admits both equal-time observations');
+  f.ask(4000,[],[B]);
+  assert.deepEqual(f.store.deviceSources(f.user.id).map(row=>row.source),[f.store.findSource('codex',B)]);
+  f.deliver(5000,A);
+  assert.deepEqual(f.store.deviceSources(f.user.id).map(row=>row.source),[f.store.findSource('codex',B)],'even newer withdrawn provenance cannot restore membership');
+});
+
+test('steady provenance updates use indexed reads of their device account group',t=>{
+  for(const explicit of [false,true]){
+    const f=fixture(t);f.ask(0,[A,B],explicit?[A,B]:undefined);f.deliver(1000,A);f.deliver(2000,B);
+    for(let n=0;n<50;n++){
+      const device=f.directory.saveDevice({userId:f.user.id,machine:{...f.sender.machine,id:`other-fixture-${n}`},agent:'fixture',tokenId:null},T);
+      for(const account of [A,B])f.store.db.prepare('INSERT INTO device_sources VALUES (?,?,?,?)').run(device.id,'codex',f.store.findSource('codex',account),T);
+    }
+    const prepare=f.store.db.prepare.bind(f.store.db),plans=new Map<string,string[]>();
+    f.store.db.prepare=((sql:string)=>{
+      const statement=prepare(sql);
+      if(/^\s*SELECT\b/i.test(sql)&&/\bFROM device_sources\b/.test(sql))for(const method of ['get','all'] as const){
+        const original=statement[method].bind(statement);
+        Object.defineProperty(statement,method,{value:(...args:any[])=>{
+          if(!plans.has(sql))plans.set(sql,prepare('EXPLAIN QUERY PLAN '+sql).all(...args).map(row=>String(row.detail)));
+          return (original as (...args:any[])=>unknown)(...args);
+        }});
+      }
+      return statement;
+    }) as typeof f.store.db.prepare;
+    f.deliver(3000,B);
+    f.store.db.prepare=prepare;
+    assert.ok(plans.size);
+    for(const [sql,details] of plans)assert.ok(details.every(detail=>!/\bSCAN (ds|device_sources)\b/.test(detail)),JSON.stringify({sql,details}));
+  }
+});

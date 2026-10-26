@@ -71,7 +71,9 @@ delivery responsive. Membership, current candidate evidence and due accounts are
 separate: an individual observation cannot withdraw another roster member or restore a
 withdrawn account. Raw device/source provenance survives withdrawal for disconnect
 cleanup, including a first late observation; current connections filter it through
-persisted membership, or select only the latest native association. Provenance alone
+persisted membership, or select only a uniquely latest association by adjusted
+observation time. Equal observations leave identity unknown; late older observations
+cannot replace newer evidence. Provenance alone
 never supplies current account evidence. No-data completion answers its exact command
 without refreshing any resource or granting a waiting holder a new lease. The hub
 handles the same snapshots, failures and generic account/completion contract regardless
