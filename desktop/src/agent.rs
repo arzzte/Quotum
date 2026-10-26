@@ -20,7 +20,7 @@ use quotum_core::clients::ClientId;
 use quotum_core::collection::{AccountRef, CollectionOutcome, CollectionResult};
 use quotum_core::config::{Config, Hub, IntervalSource, Paths, home, machine};
 use quotum_core::holder::{Holder, LockError, RunLock, Running};
-use quotum_core::model::{Millis, Outcome, Provider, now_ms};
+use quotum_core::model::{Millis, Outcome, Provider};
 use quotum_core::runner::{Event, Runner};
 use quotum_core::sink::HubSink;
 use quotum_core::stop::{How, Stop};
@@ -81,6 +81,8 @@ pub enum Cause {
 /// The last measurement of a provider here.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Last {
+    #[serde(skip)]
+    status: &'static str,
     pub at: Millis,
     pub ok: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -392,19 +394,12 @@ fn measure(
     runner.run(&mut sink, |event| match event {
         Event::Measured(..) => {}
         Event::Collected(result, _) => {
-            record_account(&account_last, result);
+            record_collection(&last, &account_last, result);
             let outcome = match &result.outcome {
                 CollectionOutcome::Observed(s) => Some(Ok(s.clone())),
                 CollectionOutcome::Failed(f) => Some(Err(f.clone())),
                 CollectionOutcome::NoNewData => None,
             };
-            if let Some(outcome) = &outcome {
-                record(&last, outcome);
-            } else {
-                last.lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .insert(result.provider, Last { at: result.completed_at, ok: true, error: None, detail: None });
-            }
             shell.wake();
             if let (Some(Ok(_)), Some(smoke)) = (&outcome, &shell.smoke) {
                 smoke.measured(&shell);
@@ -470,12 +465,17 @@ fn summary(outcome: &Outcome) -> (Provider, String) {
     }
 }
 
-fn record(last: &Lasts, outcome: &Outcome) {
-    let (provider, entry) = match outcome {
-        Ok(s) => (s.provider, Last { at: now_ms(), ok: true, error: None, detail: None }),
-        Err(f) => (f.provider, Last { at: now_ms(), ok: false, error: Some(f.error), detail: f.detail.clone() }),
+/// Provider summary follows event order, including equal completion times in one batch.
+fn record_collection(last: &Lasts, accounts: &AccountLasts, result: &CollectionResult) {
+    record_account(accounts, result);
+    let (status, error, detail) = match &result.outcome {
+        CollectionOutcome::Observed(_) => ("observed", None, None),
+        CollectionOutcome::NoNewData => ("no_new_data", None, None),
+        CollectionOutcome::Failed(f) => ("failed", Some(f.error), f.detail.clone()),
     };
-    last.lock().unwrap_or_else(|e| e.into_inner()).insert(provider, entry);
+    last.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(result.provider, Last { status, at: result.completed_at, ok: error.is_none(), error, detail });
 }
 
 /// A delivery may outlast the wait. Keep its worker registered until it has finished:
@@ -833,11 +833,7 @@ fn project(agent: &Agent) -> (State, Vec<Provided>, Vec<Tracked>, bool) {
                 .map(|(_, last)| last.clone())
                 .collect(),
             collector: agent.config.providers.get(&p).is_some_and(|settings| settings.hooks.collect.is_some()),
-            latest_status: account_last
-                .iter()
-                .filter(|((provider, _), _)| *provider == p)
-                .max_by_key(|(_, last)| last.completed_at)
-                .map(|(_, last)| last.status),
+            latest_status: last.get(&p).map(|last| last.status),
         })
         .collect();
     let clients = ClientId::ALL
@@ -879,21 +875,24 @@ mod tests {
             let agent = Agent::new();
             assert!(project(&agent).1.iter().all(|p| p.accounts.is_empty() && p.latest_status.is_none()));
             let account = AccountRef::Supplier { account: "a".repeat(24) };
-            agent.account_last.lock().unwrap().insert(
-                (Provider::Codex, Some(account.clone())),
-                AccountLast {
+            record_collection(
+                &agent.last,
+                &agent.account_last,
+                &CollectionResult {
+                    version: 1,
+                    provider: Provider::Codex,
                     account: Some(account),
-                    status: "no_new_data",
+                    attempt_id: "fixture".into(),
+                    stage: "measure",
                     completed_at: 20,
-                    observed_at: Some(10),
-                    error: None,
+                    outcome: CollectionOutcome::NoNewData,
                 },
             );
             let (_, providers, _, _) = project(&agent);
             let codex = providers.iter().find(|p| p.id == "codex").unwrap();
             assert_eq!(codex.latest_status, Some("no_new_data"));
             assert_eq!(codex.accounts.len(), 1);
-            assert_eq!(codex.accounts[0].observed_at, Some(10));
+            assert_eq!(codex.accounts[0].observed_at, None);
             assert!(agent.account_last.try_lock().is_ok(), "projection releases its history guard");
             send.send(()).unwrap();
         });
@@ -1291,6 +1290,71 @@ mod tests {
     }
 
     #[test]
+    fn provider_outcome_follows_event_order_in_mixed_batches_with_equal_times() {
+        use quotum_core::model::{ErrorKind, Failure, Snapshot};
+        for names in [["z", "a"], ["a", "z"]] {
+            for no_data_last in [false, true] {
+                let agent = Agent::new();
+                let make = |name: &str, outcome, completed_at| CollectionResult {
+                    version: 1,
+                    provider: Provider::Antigravity,
+                    account: Some(AccountRef::Declared { account_name: Some(name.into()) }),
+                    attempt_id: "same-batch".into(),
+                    stage: "measure",
+                    completed_at,
+                    outcome,
+                };
+                for name in names {
+                    record_collection(
+                        &agent.last,
+                        &agent.account_last,
+                        &make(
+                            name,
+                            CollectionOutcome::Observed(Snapshot {
+                                provider: Provider::Antigravity,
+                                account: None,
+                                account_name: Some(name.into()),
+                                plan: None,
+                                observed_at: 5,
+                                via: "fixture".into(),
+                                client: None,
+                                stale_after_ms: 120000,
+                                windows: vec![],
+                                resets: None,
+                                resource_status: None,
+                                balances: None,
+                            }),
+                            8,
+                        ),
+                    );
+                }
+                for (i, name) in names.into_iter().enumerate() {
+                    let no_data = (i == 1) == no_data_last;
+                    let outcome = if no_data {
+                        CollectionOutcome::NoNewData
+                    } else {
+                        CollectionOutcome::Failed(Failure::new(Provider::Antigravity, ErrorKind::Timeout, ""))
+                    };
+                    record_collection(&agent.last, &agent.account_last, &make(name, outcome, 10));
+                }
+                let (_, providers, _, _) = project(&agent);
+                let provided = providers.iter().find(|p| p.id == "antigravity").unwrap();
+                let expected = if no_data_last { "no_new_data" } else { "failed" };
+                assert_eq!(provided.latest_status, Some(expected), "names={names:?}");
+                assert_eq!(provided.last.as_ref().unwrap().ok, no_data_last);
+                assert_eq!(provided.last.as_ref().unwrap().at, 10);
+                assert_eq!(provided.accounts.len(), 2);
+                assert!(provided.accounts.iter().all(|a| a.observed_at == Some(5)));
+                let json = serde_json::to_value(provided).unwrap();
+                assert_eq!(json["latestStatus"], expected);
+                assert!(json["last"].get("status").is_none(), "Last wire shape stays narrow");
+                assert_eq!(provided.accounts[0].account, Some(AccountRef::Declared { account_name: Some("a".into()) }));
+                assert_eq!(provided.accounts[1].account, Some(AccountRef::Declared { account_name: Some("z".into()) }));
+            }
+        }
+    }
+
+    #[test]
     fn account_outcomes_retain_observation_dates_and_sibling_failures() {
         let last = AccountLasts::default();
         let make = |account: &str, outcome| CollectionResult {
@@ -1351,7 +1415,13 @@ mod tests {
             serde_json::json!({"state": "failed", "cause": "config", "error": "x"})
         );
         assert_eq!(serde_json::to_value(State::TakingOver).unwrap(), serde_json::json!({"state": "taking_over"}));
-        let last = Last { at: 1, ok: false, error: Some(quotum_core::model::ErrorKind::NotLoggedIn), detail: None };
+        let last = Last {
+            status: "failed",
+            at: 1,
+            ok: false,
+            error: Some(quotum_core::model::ErrorKind::NotLoggedIn),
+            detail: None,
+        };
         assert_eq!(
             serde_json::to_value(&last).unwrap(),
             serde_json::json!({"at": 1, "ok": false, "error": "not_logged_in"})

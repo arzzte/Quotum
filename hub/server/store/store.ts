@@ -652,8 +652,9 @@ export class Store {
     const before=roster===null?this.latestDeviceSource(device,provider):null;
     this.db.prepare('INSERT INTO device_sources (device_id,provider,source_id,seen_at) VALUES (?,?,?,?) ON CONFLICT(device_id,provider,source_id) DO UPDATE SET seen_at=MAX(device_sources.seen_at,excluded.seen_at)').run(device, provider, source, at);
     const after=roster===null?this.latestDeviceSource(device,provider):null;
-    if(roster?.has(key)||roster===null&&after===source)this.db.prepare("DELETE FROM device_failures WHERE device_id=? AND provider=? AND account_key IN ('',?)").run(device, provider, key);
+    const cleared=(roster?.has(key)||roster===null&&after===source)&&this.db.prepare("DELETE FROM device_failures WHERE device_id=? AND provider=? AND account_key IN ('',?) AND at<=?").run(device, provider, key, at).changes>0;
     if(added||before!==after)this.deviceAssociationsChanged(device);
+    return !!cleared;
   }
 
   /** Equal observations of different accounts provide no unique current identity. */
@@ -691,9 +692,9 @@ export class Store {
   }
 
   /** Raw provenance cannot restore a withdrawn account or an earlier login. */
-  private currentDeviceSources(device:string|null=null,user:string|null=null):{device:string;provider:Provider;source:string;seenAt:number}[] {
-    const scope=device!==null?' AND ds.device_id=?':user!==null?' AND d.user_id=?':'';
-    const rows=this.db.prepare('SELECT ds.device_id,ds.provider,ds.source_id,ds.seen_at,s.account,r.accounts FROM device_sources ds JOIN sources s ON s.id=ds.source_id JOIN devices d ON d.id=ds.device_id LEFT JOIN device_account_rosters r ON r.device_id=ds.device_id AND r.provider=ds.provider WHERE d.revoked_at IS NULL'+scope+' ORDER BY ds.seen_at DESC,ds.source_id').all(...(device!==null?[device]:user!==null?[user]:[])) as {device_id:string;provider:Provider;source_id:string;seen_at:number;account:string;accounts:string|null}[];
+  private currentDeviceSources(device:string|null=null,user:string|null=null,provider:Provider|null=null):{device:string;provider:Provider;source:string;seenAt:number}[] {
+    const scope=(device!==null?' AND ds.device_id=?':user!==null?' AND d.user_id=?':'')+(provider!==null?' AND ds.provider=?':'');
+    const rows=this.db.prepare('SELECT ds.device_id,ds.provider,ds.source_id,ds.seen_at,s.account,r.accounts FROM device_sources ds JOIN sources s ON s.id=ds.source_id JOIN devices d ON d.id=ds.device_id LEFT JOIN device_account_rosters r ON r.device_id=ds.device_id AND r.provider=ds.provider WHERE d.revoked_at IS NULL'+scope+' ORDER BY ds.seen_at DESC,ds.source_id').all(...(device!==null?[device]:user!==null?[user]:[]),...(provider!==null?[provider]:[])) as {device_id:string;provider:Provider;source_id:string;seen_at:number;account:string;accounts:string|null}[];
     const groups=new Map<string,Set<string>|null>(),latest=new Map<string,{at:number;source:string|null}>();
     for(const row of rows){
       const group=`${row.device_id}/${row.provider}`;
@@ -714,9 +715,13 @@ export class Store {
     return this.currentDeviceSources(null,userId);
   }
 
-  /** The last failure a device reported for a provider, kept until it delivers for it again. */
+  /** Private diagnostics follow this device's own accepted observations, never another device's. */
   deviceFailed(device: string, provider: Provider, error: string, detail: string | null, at: number, accountKey = '') {
-    this.db.prepare('INSERT INTO device_failures VALUES (?,?,?,?,?,?) ON CONFLICT(device_id,provider,account_key) DO UPDATE SET error=excluded.error,detail=excluded.detail,at=excluded.at WHERE excluded.at>device_failures.at').run(device, provider, accountKey, error, detail, at);
+    const success=accountKey
+      ? (this.db.prepare('SELECT ds.seen_at AS at FROM sources s JOIN device_sources ds ON ds.source_id=s.id WHERE s.provider=? AND s.account=? AND ds.device_id=? AND ds.provider=?').get(provider,accountKey,device,provider) as {at:number}|undefined)?.at??-Infinity
+      : Math.max(-Infinity,...this.currentDeviceSources(device,null,provider).map(source=>source.seenAt));
+    if(at<=success)return false;
+    return this.db.prepare('INSERT INTO device_failures VALUES (?,?,?,?,?,?) ON CONFLICT(device_id,provider,account_key) DO UPDATE SET error=excluded.error,detail=excluded.detail,at=excluded.at WHERE excluded.at>device_failures.at').run(device, provider, accountKey, error, detail, at).changes>0;
   }
 
   deviceFailures(userId: string): DeviceFailure[] {

@@ -120,7 +120,7 @@ export class Ingest {
         const source = this.store.source(snapshot.provider, account, now);
         touched.add(source);
         this.store.hold(source, device.userId, now);
-        this.store.seenDevice(device.id, snapshot.provider, source, observedAt);
+        if(this.store.seenDevice(device.id, snapshot.provider, source, observedAt))this.directory.measurementsChanged(device.userId);
         const previous = this.store.state(source);
         const measurement = {...toMeasurement(snapshot), observedAt};
         const recorded = this.store.record(source, measurement);
@@ -178,8 +178,7 @@ export class Ingest {
         const at = failure.observedAt + skew;
         const key = this.measurementSelection.failureAccount(failure.provider, device.id, failure.attemptContext ?? null, now);
         if(!key&&failure.attemptContext?.target.kind==='verified'){result.duplicates++;continue;}
-        this.store.deviceFailed(device.id, failure.provider, failure.error, failure.detail, at,key??'');
-        this.directory.measurementsChanged(device.userId);
+        if(this.store.deviceFailed(device.id, failure.provider, failure.error, failure.detail, at,key??''))this.directory.measurementsChanged(device.userId);
         if (!key) continue;
         const source = this.store.findSource(failure.provider, key);
         const acknowledge = this.measurementSelection.acknowledges(key, failure.provider, device.id, at, failure.attemptContext ?? null, false);

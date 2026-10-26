@@ -228,3 +228,127 @@ test('steady provenance updates use indexed reads of their device account group'
     for(const [sql,details] of plans)assert.ok(details.every(detail=>!/\bSCAN (ds|device_sources)\b/.test(detail)),JSON.stringify({sql,details}));
   }
 });
+
+function diagnosticSnapshot(f:ReturnType<typeof fixture>,account:string,at:number){
+  return {provider:'codex',account,observedAt:new Date(T+at).toISOString(),via:'fixture',staleAfterMs:120000,windows:[{id:'session',kind:'session',usedPercent:50}],attemptContext:f.context(account)};
+}
+function diagnosticFailure(f:ReturnType<typeof fixture>,account:string|null,at:number){
+  return {provider:'codex',error:'timeout',observedAt:new Date(T+at).toISOString(),attemptContext:account?f.context(account):{...f.context(A),target:{kind:'unknown'}}};
+}
+function diagnosticBatch(f:ReturnType<typeof fixture>,received:number,snapshots:object[]=[],failures:object[]=[],sender=f.sender,sent=received){
+  return f.ingest.accept(f.credential,{...sender,sentAt:new Date(T+sent).toISOString(),snapshots,failures},T+received);
+}
+
+test('newer private failures survive delayed observations and duplicate replays until an equal or newer success',t=>{
+  const f=fixture(t);f.ask(0,[A],[A]);f.deliver(1000,A);
+  diagnosticBatch(f,63000,[],[diagnosticFailure(f,A,63000)]);
+  diagnosticBatch(f,64000,[diagnosticSnapshot(f,A,62000)]);
+  assert.deepEqual(f.store.deviceFailures(f.user.id).map(row=>[row.accountKey,row.at]),[[A,T+63000]]);
+  const replay=diagnosticBatch(f,65000,[diagnosticSnapshot(f,A,1000)]);
+  assert.equal(replay.accepted,0);assert.equal(replay.duplicates,1);
+  assert.equal(f.store.deviceFailures(f.user.id)[0].at,T+63000,'replayed success cannot erase a later error');
+  diagnosticBatch(f,66000,[diagnosticSnapshot(f,A,63000)]);
+  assert.deepEqual(f.store.deviceFailures(f.user.id),[],'equal-time success wins');
+  diagnosticBatch(f,67000,[],[diagnosticFailure(f,A,63000)]);
+  assert.deepEqual(f.store.deviceFailures(f.user.id),[],'a replayed equal-time failure cannot return');
+});
+
+test('private failures compare to their own device and account rather than another producer success',t=>{
+  const f=fixture(t);f.ask(0,[A,B],[A,B]);f.deliver(63000,A);
+  diagnosticBatch(f,64000,[],[diagnosticFailure(f,A,62000),diagnosticFailure(f,B,62000)]);
+  assert.deepEqual(f.store.deviceFailures(f.user.id).map(row=>row.accountKey),[B]);
+  const other={...f.sender,machine:{...f.sender.machine,id:'other-diagnostic-fixture'}};
+  f.ingest.checkin(f.credential,{...other,paced:true,capabilities:{measurementPolicy:1,attemptContext:1,accountRosters:1},subscriptions:[{provider:'codex',account:A,active:false}],accountRosters:[{provider:'codex',accounts:[{account:A}]}]},T+65000);
+  const second=f.directory.deviceByMachine(f.user.id,other.machine.id)!;
+  diagnosticBatch(f,70000,[diagnosticSnapshot(f,A,70000)],[],other);
+  diagnosticBatch(f,71000,[],[diagnosticFailure(f,A,64000)]);
+  assert.ok(f.store.deviceFailures(f.user.id).some(row=>row.device===f.device().id&&row.accountKey===A),'another device success is no recovery evidence');
+  diagnosticBatch(f,72000,[],[diagnosticFailure(f,A,69000)],other);
+  assert.ok(!f.store.deviceFailures(f.user.id).some(row=>row.device===second.id),'own newer success suppresses delayed failure');
+  diagnosticBatch(f,73000,[],[diagnosticFailure(f,A,72000)],other);
+  const hints:string[]=[];f.directory.setObserver({touchDevices:owner=>hints.push(owner),touchSources(){},touchBoards(){},touchUser(){},touchHub(){},history(){},dropSessions(){},dropMember(){},dropBoard(){}});
+  const duplicate=diagnosticBatch(f,74000,[diagnosticSnapshot(f,A,65000)]);
+  assert.deepEqual(hints,[f.user.id],'actual private recovery emits an owner hint even without a new shared observation');
+  assert.equal(duplicate.accepted,0,'the shared source already has a newer observation from the other device');
+  const failures=f.store.deviceFailures(f.user.id);
+  assert.ok(!failures.some(row=>row.device===f.device().id&&row.accountKey===A),'own success still recovers private status even when globally duplicated');
+  assert.ok(failures.some(row=>row.device===f.device().id&&row.accountKey===B));
+  assert.ok(failures.some(row=>row.device===second.id&&row.accountKey===A&&row.at===T+72000));
+  hints.length=0;
+  diagnosticBatch(f,75000,[diagnosticSnapshot(f,A,65000)]);
+  diagnosticBatch(f,76000,[diagnosticSnapshot(f,A,1000)]);
+  diagnosticBatch(f,77000,[],[diagnosticFailure(f,A,64000)]);
+  assert.deepEqual(hints,[],'replayed/stale outcomes without a private mutation emit no recovery hints');
+});
+
+test('one backlog batch respects event time and success wins true timestamp ties',t=>{
+  const f=fixture(t);f.ask(0,[A],[A]);f.deliver(1000,A);
+  const batch=diagnosticBatch(f,65000,[diagnosticSnapshot(f,A,63000),diagnosticSnapshot(f,A,1000)],[diagnosticFailure(f,A,63000),diagnosticFailure(f,A,64000),diagnosticFailure(f,A,62000)]);
+  assert.equal(batch.accepted,1);assert.equal(batch.duplicates,1);
+  assert.equal(f.store.deviceFailures(f.user.id)[0].at,T+64000);
+  diagnosticBatch(f,66000,[diagnosticSnapshot(f,A,65000)],[diagnosticFailure(f,A,65000),diagnosticFailure(f,A,64000)]);
+  assert.deepEqual(f.store.deviceFailures(f.user.id),[]);
+});
+
+test('private success and failure guards compare the same skew-adjusted observation clock',t=>{
+  const f=fixture(t),skew=3600000;f.ask(0,[A],[A]);f.deliver(63000,A);
+  diagnosticBatch(f,64000,[],[diagnosticFailure(f,A,64000-skew)],f.sender,64000-skew);
+  assert.equal(f.store.deviceFailures(f.user.id)[0].at,T+64000);
+  diagnosticBatch(f,65000,[diagnosticSnapshot(f,A,63000-skew)],[],f.sender,65000-skew);
+  assert.equal(f.store.deviceFailures(f.user.id)[0].at,T+64000);
+  diagnosticBatch(f,66000,[diagnosticSnapshot(f,A,64000-skew)],[],f.sender,66000-skew);
+  assert.deepEqual(f.store.deviceFailures(f.user.id),[]);
+  diagnosticBatch(f,67000,[],[diagnosticFailure(f,A,64000-skew)],f.sender,67000-skew);
+  assert.deepEqual(f.store.deviceFailures(f.user.id),[]);
+});
+
+test('unknown private failures use only current eligible recovery evidence without inheriting an account',t=>{
+  const f=fixture(t);f.ask(0,[A],[A]);f.deliver(10000,A);f.ask(11000,[],[B]);
+  diagnosticBatch(f,12000,[],[diagnosticFailure(f,null,9000)]);
+  assert.equal(f.store.deviceFailures(f.user.id).length,1,'withdrawn historical A cannot suppress an unknown failure');
+  assert.equal(f.store.deviceFailures(f.user.id)[0].accountKey,undefined);
+  diagnosticBatch(f,13000,[diagnosticSnapshot(f,A,13000)]);
+  assert.equal(f.store.deviceFailures(f.user.id).length,1,'new withdrawn provenance is still no recovery evidence');
+  diagnosticBatch(f,14000,[diagnosticSnapshot(f,B,14000)]);
+  assert.deepEqual(f.store.deviceFailures(f.user.id),[]);
+  diagnosticBatch(f,15000,[],[diagnosticFailure(f,null,13000),diagnosticFailure(f,null,14000)]);
+  assert.deepEqual(f.store.deviceFailures(f.user.id),[]);
+  diagnosticBatch(f,16000,[],[diagnosticFailure(f,null,15000)]);
+  assert.equal(f.store.deviceFailures(f.user.id)[0].accountKey,undefined);
+});
+
+test('ambiguous native current identity is no recovery evidence for an unknown failure',t=>{
+  const f=fixture(t);f.ask(0,[A]);f.deliver(10000,A);f.deliver(10000,B);
+  diagnosticBatch(f,12000,[],[diagnosticFailure(f,null,9000)]);
+  assert.equal(f.store.deviceFailures(f.user.id).length,1);
+  assert.equal(f.store.deviceFailures(f.user.id)[0].accountKey,undefined);
+  diagnosticBatch(f,13000,[diagnosticSnapshot(f,B,11000)]);
+  assert.deepEqual(f.store.deviceFailures(f.user.id),[]);
+  diagnosticBatch(f,14000,[],[diagnosticFailure(f,null,11000)]);
+  assert.deepEqual(f.store.deviceFailures(f.user.id),[],'equal-time current native success wins');
+});
+
+test('private diagnostic chronology reads stay indexed within the target device and provider',t=>{
+  const f=fixture(t);f.ask(0,[A,B],[A,B]);f.deliver(1000,A);f.deliver(2000,B);
+  for(let n=0;n<50;n++){
+    const device=f.directory.saveDevice({userId:f.user.id,machine:{...f.sender.machine,id:`other-diagnostic-${n}`},agent:'fixture',tokenId:null},T);
+    for(const account of [A,B])f.store.db.prepare('INSERT INTO device_sources VALUES (?,?,?,?)').run(device.id,'codex',f.store.findSource('codex',account),T+100000);
+  }
+  const prepare=f.store.db.prepare.bind(f.store.db),plans=new Map<string,string[]>();
+  f.store.db.prepare=((sql:string)=>{
+    const statement=prepare(sql);
+    if(/^\s*SELECT\b/i.test(sql)&&/\bdevice_sources\b/.test(sql))for(const method of ['get','all'] as const){
+      const original=statement[method].bind(statement);
+      Object.defineProperty(statement,method,{value:(...args:any[])=>{
+        if(!plans.has(sql))plans.set(sql,prepare('EXPLAIN QUERY PLAN '+sql).all(...args).map(row=>String(row.detail)));
+        return (original as (...args:any[])=>unknown)(...args);
+      }});
+    }
+    return statement;
+  }) as typeof f.store.db.prepare;
+  diagnosticBatch(f,3000,[],[diagnosticFailure(f,A,3000),diagnosticFailure(f,null,3000)]);
+  f.store.db.prepare=prepare;
+  assert.deepEqual(new Set(f.store.deviceFailures(f.user.id).map(row=>row.accountKey??'')),new Set([A,'']));
+  assert.ok(plans.size>=2);
+  for(const [sql,details] of plans)assert.ok(details.every(detail=>!/\bSCAN (ds|device_sources)\b/.test(detail)),JSON.stringify({sql,details}));
+});

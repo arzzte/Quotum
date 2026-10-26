@@ -29,6 +29,8 @@ for installation discovery and activity tracking. Hook accounts do not become na
 login evidence or change which client sessions are attributed to a subscription.
 The desktop app preserves hook settings when saving other preferences. It exposes
 account outcomes read-only; neither the web dashboard nor IPC installs commands.
+The provider summary follows local result event order, including results sharing one
+batch completion time; the account disclosure retains each account independently.
 
 ## Process contract
 

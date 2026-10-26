@@ -2340,4 +2340,12 @@ when their native facts have not changed. The ordinary GET history route also ac
 
 A refresh request may finish with `status: "no_new_data"`: collection completed without a new observation. `finishedAt` is the completion admission time. Existing resource values and freshness are unchanged; the ordinary refresh state/event and 60-second terminal retention apply.
 
-The owner-private `/api/devices` response may contain several `sources` for one device/provider. A failure optionally carries `accountKey` for its verified account; an absent key denotes a genuinely unknown provider-level failure. A successful observation clears its own account failure without removing sibling failures. These references are not added to shared board projections.
+The owner-private `/api/devices` response may contain several `sources` for one
+device/provider. A failure optionally carries `accountKey` for its verified account;
+an absent key denotes a genuinely unknown provider-level failure. A successful
+observation clears its own account failure only when its adjusted observation time is
+at least the failure time, without removing sibling failures. Older or equal-time
+failures cannot replace that same device/account's newer success; another device's
+success is independent. Unknown failures compare only with this device's currently
+eligible provider observations. These references are not added to shared board
+projections.
