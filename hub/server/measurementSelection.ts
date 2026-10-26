@@ -142,7 +142,7 @@ export class MeasurementSelection {
       pending:source!==null&&this.pending(source,provider,key,now)};
   }
 
-  claim(source: string | null, provider: ClientProvider, key: string, device: string, active: boolean, now: number) {
+  claim(source: string | null, provider: ClientProvider, key: string, device: string, active: boolean, now: number, starter = true) {
     this.releaseUnconfigured(key,provider,now);
     if(!this.configured(device,provider,now))return {measure:false,until:now+60_000};
     const preferred = this.preferred(source, provider, key, now), holder = this.duty.holder(key);
@@ -155,7 +155,7 @@ export class MeasurementSelection {
       }
       // A preferred holder cannot lose authority merely to another candidate's activity.
     }
-    return this.duty.claim(key, device, active, now);
+    return this.duty.claim(key, device, active, now, starter);
   }
 
   issue(key: string, provider: ClientProvider, device: string, modern: boolean, now: number): string | undefined {

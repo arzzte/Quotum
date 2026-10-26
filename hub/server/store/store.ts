@@ -645,25 +645,17 @@ export class Store {
     tell(this.observer, o => o.touchSources([id]));
   }
 
-  /** Remembers which source a device last delivered for a provider; its failures for the provider are over. */
+  /** Every accepted observation retains provenance, independently of current membership. */
   seenDevice(device: string, provider: Provider, source: string, at: number) {
+    const before=this.currentDeviceSources(device).map(row=>row.source).sort().join(',');
+    this.db.prepare('INSERT INTO device_sources (device_id,provider,source_id,seen_at) VALUES (?,?,?,?) ON CONFLICT(device_id,provider,source_id) DO UPDATE SET seen_at=MAX(device_sources.seen_at,excluded.seen_at)').run(device, provider, source, at);
     const key=this.account(source)!;
-    if(!this.rosterAllows(device,provider,key))return;
-    const changed = !this.db.prepare('SELECT 1 FROM device_sources WHERE device_id=? AND provider=? AND source_id=?').get(device,provider,source);
-    if(this.accountRoster(device,provider)===null)this.db.prepare('DELETE FROM device_sources WHERE device_id=? AND provider=? AND source_id<>?').run(device,provider,source);
-    this.db.prepare('INSERT INTO device_sources (device_id,provider,source_id,seen_at) VALUES (?,?,?,?) ON CONFLICT(device_id,provider,source_id) DO UPDATE SET seen_at=excluded.seen_at').run(device, provider, source, at);
-    this.db.prepare("DELETE FROM device_failures WHERE device_id=? AND provider=? AND account_key IN ('',?)").run(device, provider, key);
-    if (changed) {
-      const owner = this.db.prepare('SELECT user_id FROM devices WHERE id=?').get(device) as {user_id: string} | undefined;
-      if (owner) tell(this.observer, o => o.touchUser(owner.user_id));
-    }
+    if(this.rosterAllows(device,provider,key))this.db.prepare("DELETE FROM device_failures WHERE device_id=? AND provider=? AND account_key IN ('',?)").run(device, provider, key);
+    if(before!==this.currentDeviceSources(device).map(row=>row.source).sort().join(','))this.deviceAssociationsChanged(device);
   }
 
   deviceSource(device: string, provider: Provider): string | null {
-    const row = this.db.prepare('SELECT source_id FROM device_sources WHERE device_id = ? AND provider = ? ORDER BY seen_at DESC,source_id LIMIT 1').get(device, provider) as
-      | {source_id: string}
-      | undefined;
-    return row?.source_id ?? null;
+    return this.currentDeviceSources(device).find(row=>row.provider===provider)?.source??null;
   }
 
   accountRoster(device:string,provider:Provider):Set<string>|null {
@@ -676,18 +668,38 @@ export class Store {
   }
 
   replaceAccountRoster(device:string,provider:Provider,accounts:Set<string>,now:number) {
+    const prior=this.accountRoster(device,provider);
+    if(prior!==null&&prior.size===accounts.size&&[...accounts].every(account=>prior.has(account)))return;
+    const before=this.currentDeviceSources(device).map(row=>row.source).sort().join(',');
     this.db.prepare('INSERT INTO device_account_rosters VALUES (?,?,?,?) ON CONFLICT(device_id,provider) DO UPDATE SET accounts=excluded.accounts,updated_at=excluded.updated_at').run(device,provider,JSON.stringify([...accounts].sort()),now);
-    for(const row of this.db.prepare('SELECT ds.source_id,s.account FROM device_sources ds JOIN sources s ON s.id=ds.source_id WHERE ds.device_id=? AND ds.provider=?').all(device,provider) as {source_id:string;account:string}[]) {
-      if(!accounts.has(row.account))this.db.prepare('DELETE FROM device_sources WHERE device_id=? AND provider=? AND source_id=?').run(device,provider,row.source_id);
-    }
+    if(before!==this.currentDeviceSources(device).map(row=>row.source).sort().join(','))this.deviceAssociationsChanged(device);
   }
 
-  /** Which sources each device of a person delivers to. */
+  private deviceAssociationsChanged(device:string) {
+    const owner=this.db.prepare('SELECT user_id FROM devices WHERE id=?').get(device) as {user_id:string}|undefined;
+    if(!owner)return;
+    this.db.prepare('INSERT INTO account_revisions VALUES (?,1) ON CONFLICT(user_id) DO UPDATE SET revision=revision+1').run(owner.user_id);
+    tell(this.observer,o=>o.touchUser(owner.user_id));
+  }
+
+  /** Raw provenance cannot restore a withdrawn account or an earlier native login. */
+  private currentDeviceSources(device:string|null=null,user:string|null=null):{device:string;provider:Provider;source:string;seenAt:number}[] {
+    const rows=this.db.prepare('SELECT ds.device_id,ds.provider,ds.source_id,ds.seen_at,s.account FROM device_sources ds JOIN sources s ON s.id=ds.source_id JOIN devices d ON d.id=ds.device_id WHERE d.revoked_at IS NULL AND (? IS NULL OR ds.device_id=?) AND (? IS NULL OR d.user_id=?) ORDER BY ds.seen_at DESC,ds.source_id').all(device,device,user,user) as {device_id:string;provider:Provider;source_id:string;seen_at:number;account:string}[];
+    const groups=new Map<string,Set<string>|null>();
+    const native=new Set<string>();
+    return rows.filter(row=>{
+      const group=`${row.device_id}/${row.provider}`;
+      if(!groups.has(group))groups.set(group,this.accountRoster(row.device_id,row.provider));
+      const roster=groups.get(group)!;
+      if(roster!==null)return roster.has(row.account);
+      if(native.has(group))return false;
+      native.add(group);return true;
+    }).map(row=>({device:row.device_id,provider:row.provider,source:row.source_id,seenAt:row.seen_at}));
+  }
+
+  /** Current associations, separate from all retained observation provenance. */
   deviceSources(userId: string): {device: string; provider: Provider; source: string; seenAt: number}[] {
-    const rows = this.db
-      .prepare('SELECT d.device_id, d.provider, d.source_id, d.seen_at FROM device_sources d JOIN devices ON devices.id = d.device_id WHERE devices.user_id = ?')
-      .all(userId) as {device_id: string; provider: Provider; source_id: string; seen_at: number}[];
-    return rows.map(r => ({device: r.device_id, provider: r.provider, source: r.source_id, seenAt: r.seen_at}));
+    return this.currentDeviceSources(null,userId);
   }
 
   /** The last failure a device reported for a provider, kept until it delivers for it again. */

@@ -69,9 +69,13 @@ only the due accounts. Native and custom collection share one coordinator and dy
 account schedule. One active collection worker leaves policy contact and activity
 delivery responsive. Membership, current candidate evidence and due accounts are
 separate: an individual observation cannot withdraw another roster member or restore a
-withdrawn account. No-data completion answers its exact command without refreshing any
-resource. The hub handles the same snapshots, failures and generic account/completion
-contract regardless of how the device obtained them.
+withdrawn account. Raw device/source provenance survives withdrawal for disconnect
+cleanup, including a first late observation; current connections filter it through
+persisted membership, or select only the latest native association. Provenance alone
+never supplies current account evidence. No-data completion answers its exact command
+without refreshing any resource or granting a waiting holder a new lease. The hub
+handles the same snapshots, failures and generic account/completion contract regardless
+of how the device obtained them.
 
 Independent local success/failure observers receive normalized account outcomes on a
 bounded volatile worker queue. They cannot affect collection or delivery, retry events,

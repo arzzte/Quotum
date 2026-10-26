@@ -178,7 +178,9 @@ observer gets one attempt, a 10-second deadline, 256 KiB stdin and 16 KiB stdout
 stdout and stderr are discarded. Overflow or process errors produce fixed local
 codes, not measurement failures, and never invoke another observer. There is no
 persistent observer outbox, retry or replay. Normal one-shot exit gives the entire
-queue a shared 10-second grace period. Explicit stop cancels it immediately.
+queue a shared 10-second grace period. Explicit stop cancels it immediately. Provider
+policy changes also cancel queued and running discovery-failure observers when the
+provider has not discovered any accounts yet.
 
 A collector connected to a hub requires that hub to advertise `accountRosters: 1`
 and `collectionCompletions: 1` in its normal check-in reply. Missing support is an

@@ -34,6 +34,14 @@ impl AccountRef {
         }
     }
 }
+/// A local label contains only the pseudonym or the explicitly configured account name.
+pub fn account_label(account: Option<&AccountRef>) -> String {
+    match account {
+        Some(AccountRef::Supplier { account }) => account.chars().take(8).collect(),
+        Some(AccountRef::Declared { account_name }) => account_name.clone().unwrap_or_else(|| "default".into()),
+        None => "unknown account".into(),
+    }
+}
 #[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(tag = "status", content = "value", rename_all = "snake_case")]
 pub enum CollectionOutcome {

@@ -399,7 +399,11 @@ provider. An absent group changes nothing. Hub-measured providers are ignored be
 parsing their account fields. Membership persists across restart, but does not create
 sources, holdings, candidate evidence or duty. A due subset does not remove other
 members. A late withdrawn-account observation can preserve history but cannot restore
-its device association, authority or command. Rejoining requires a new full roster.
+its current device association, authority or command. Accepted observations retain raw
+device/source provenance, including a first observation delivered after withdrawal,
+so disconnecting the last contributing device can release its holdings. This retained
+provenance supplies no candidate, activity or funding evidence. Rejoining current
+membership requires a new full roster.
 
 Clients advertise `capabilities.accountRosters: 1` and
 `capabilities.collectionCompletions: 1`; the normal check-in reply confirms both at
@@ -419,8 +423,10 @@ account evidence and exact immutable command context. Two matches are independen
 the current holder's command and a still-pending refresh's retained original command.
 A retained-only match finishes that refresh without touching the replacement command,
 its cadence or duty. Each effective item counts once in the response's `completions`
-integer, even when both matches apply. Replays and unmatched items count as duplicates;
-policy denials count as `policySuppressed`. Commands are volatile across hub restart.
+integer, even when both matches apply. A later paced wait does not renew an expired
+starter lease; only an actual new command grants execution protection. Replays and
+unmatched items count as duplicates; policy denials count as `policySuppressed`.
+Commands are volatile across hub restart.
 A completion-bearing client requires the `completions` response counter before dropping
 its persisted item. Completion shares the ordinary ingest spool and retry path.
 

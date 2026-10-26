@@ -2,7 +2,8 @@
 
 use crate::collection::{AccountRef, CollectionOutcome, CollectionResult, Completion, CompletionOutcome};
 use crate::hooks::Identity;
-use crate::observers::{Diagnostic, Observers};
+pub use crate::observers::Diagnostic;
+use crate::observers::Observers;
 use crate::sink::AccountRoster;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -248,7 +249,10 @@ impl Runner {
             if self.stop.requested() {
                 break;
             }
-            let outcome = self.measure(index);
+            let mut outcome = self.measure(index);
+            if let Ok(snapshot) = &mut outcome {
+                snapshot.stale_after_ms = self.config.interval_ms(snapshot.provider).min(crate::model::STALE_LIMIT_MS);
+            }
             if self.stop.requested() {
                 break;
             }
@@ -325,13 +329,30 @@ impl Runner {
         let mut hook_runs: Vec<HookRun> = self
             .hooks
             .iter()
-            .map(|hook| HookRun { provider: hook.provider, due: 0, failures: 0, ready: false, slots: BTreeMap::new() })
+            .map(|hook| HookRun {
+                provider: hook.provider,
+                admission: self.stop.child(),
+                due: 0,
+                failures: 0,
+                ready: false,
+                slots: BTreeMap::new(),
+            })
             .collect();
         let mut observers = Observers::new(&self.paths, &self.stop);
         let mut native_admission: Vec<Stop> = self.adapters.iter().map(|_| self.stop.child()).collect();
         let mut admission_policy: Option<MeasurementPolicy> = None;
         let mut native_rosters: BTreeMap<Provider, AccountRef> = BTreeMap::new();
         let mut active: Option<ActiveCollection> = None;
+        // A terminal sink response fences both workers before either is joined.
+        macro_rules! check_refusal {
+            () => {
+                if let Some(reason) = sink.refused().map(str::to_owned) {
+                    cancel_collection(&mut active, &mut observers);
+                    return Some(reason);
+                }
+            };
+        }
+        check_refusal!();
 
         let activity_paths: Vec<Vec<PathBuf>> = self.adapters.iter().map(|a| a.activity_paths(&self.home)).collect();
         let identity_paths: Vec<Vec<PathBuf>> = self.adapters.iter().map(|a| a.identity_paths(&self.home)).collect();
@@ -347,6 +368,7 @@ impl Runner {
         let mut command_accounts: Vec<Option<String>> = vec![None; self.adapters.len()];
         let mut policy_contact = Instant::now();
         let target = if !self.stop.requested() && !self.activity_deferred { sink.activity_target() } else { None };
+        check_refusal!();
         let observed = target.is_some() || self.activity_deferred;
         let enabled = self.config.sessions() && !self.clients.is_empty();
         let mut activity_delivery = target.and_then(|target| {
@@ -373,12 +395,15 @@ impl Runner {
             .ok()
             .map(crate::observed::delivery::Delivery::new)
         });
+        check_refusal!();
         let mut observed_inventory = Inventory::default();
         let mut inventory_at: Option<Instant> = None;
         let mut inventory = Vec::new();
         if sink.managed() {
             policy = sink.checkin_managed(&[], &collectors).policy;
+            check_refusal!();
             sink.flush();
+            check_refusal!();
             for (index, provider) in providers.iter().enumerate() {
                 schedule.block(index, !sink.allows_measurement(*provider), now_ms());
             }
@@ -396,7 +421,9 @@ impl Runner {
             watch.activity.track(&self.clients);
         }
 
+        check_refusal!();
         while !self.stop.requested() {
+            check_refusal!();
             sync_admission(
                 &mut schedule,
                 &policy,
@@ -438,7 +465,7 @@ impl Runner {
                                         let mut slot = old.remove(&identity.account).unwrap_or_else(|| AccountSlot {
                                             identity: identity.clone(),
                                             index: schedule.insert(self.config.interval_ms(job.provider), now_ms()),
-                                            admission: self.stop.child(),
+                                            admission: run.admission.child(),
                                             command: None,
                                             target: None,
                                         });
@@ -464,7 +491,7 @@ impl Runner {
                                             .saturating_mul(1 << run.failures.saturating_sub(1).min(4)))
                                         .min(900_000) as i64;
                                     let result = local_result(job.provider, None, Err(failure), id, "discover");
-                                    if let Some(d) = observers.enqueue(&self.config, &result, &self.stop) {
+                                    if let Some(d) = observers.enqueue(&self.config, &result, &run.admission) {
                                         each(Event::Diagnostic(&d));
                                     }
                                     each(Event::Collected(&result, run.due));
@@ -484,7 +511,9 @@ impl Runner {
                                 accounts: vec![account.clone()],
                             }));
                             sink.account_rosters(&rosters);
+                            check_refusal!();
                             let answer = sink.checkin_managed(&[], &collectors);
+                            check_refusal!();
                             policy = answer.policy.or(policy);
                             sync_admission(
                                 &mut schedule,
@@ -495,9 +524,7 @@ impl Runner {
                                 &mut hook_runs,
                                 &self.stop,
                             );
-                            if sink.refused().is_some() {
-                                observers.finish(false);
-                            }
+                            check_refusal!();
                             policy_contact = Instant::now();
                         }
                     }
@@ -536,6 +563,7 @@ impl Runner {
                                 &mut each,
                                 Finished { result: &result, next, attempt: attempt.as_ref(), admission: &admission },
                             );
+                            check_refusal!();
                         }
                     }
                     (
@@ -576,7 +604,9 @@ impl Runner {
                                         accounts: vec![account.clone()],
                                     }));
                                     sink.account_rosters(&rosters);
+                                    check_refusal!();
                                     let answer = sink.checkin_managed(&[], &collectors);
+                                    check_refusal!();
                                     policy = answer.policy.or(policy);
                                     sync_admission(
                                         &mut schedule,
@@ -587,9 +617,7 @@ impl Runner {
                                         &mut hook_runs,
                                         &self.stop,
                                     );
-                                    if sink.refused().is_some() {
-                                        observers.finish(false);
-                                    }
+                                    check_refusal!();
                                     policy_contact = Instant::now();
                                 }
                             }
@@ -614,6 +642,7 @@ impl Runner {
                                         admission: &admission,
                                     },
                                 );
+                                check_refusal!();
                                 let legacy = match &result.outcome {
                                     CollectionOutcome::Observed(s) => Ok(s.clone()),
                                     CollectionOutcome::Failed(f) => Err(f.clone()),
@@ -642,17 +671,19 @@ impl Runner {
                 {
                     let hook = self.hooks[hi].clone();
                     let paths = self.paths.clone();
+                    check_refusal!();
                     active = Some(ActiveCollection::spawn(
                         hook.provider,
                         CollectionJob::Discover { hook: hi, id: attempt_id() },
                         &policy,
-                        &self.stop,
+                        &hook_runs[hi].admission,
                         move |stop| BackendResult::Discovered(hook.discover(&paths, &stop)),
                     ));
                 }
             }
             if active.is_some() && policy_contact.elapsed() >= self.policy_contact_every.min(Duration::from_secs(15)) {
                 let answer = sink.checkin_managed(&[], &collectors);
+                check_refusal!();
                 policy = answer.policy.or(policy);
                 sync_admission(
                     &mut schedule,
@@ -663,11 +694,10 @@ impl Runner {
                     &mut hook_runs,
                     &self.stop,
                 );
-                if sink.refused().is_some() {
-                    observers.finish(false);
-                }
+                check_refusal!();
                 policy_contact = Instant::now();
                 sink.flush();
+                check_refusal!();
                 if let Some(job) = &active {
                     if !job.admitted(&policy, sink) {
                         job.stop.request(crate::stop::How::Exit);
@@ -684,15 +714,7 @@ impl Runner {
                 }
             }
 
-            if let Some(reason) = sink.refused() {
-                if let Some(mut job) = active.take() {
-                    job.stop.request(crate::stop::How::Exit);
-                    if let Some(worker) = job.worker.take() {
-                        let _ = worker.join();
-                    }
-                }
-                return Some(reason.to_string());
-            }
+            check_refusal!();
             if let Some(delivery) = &mut activity_delivery {
                 #[cfg(all(feature = "activity-bench", target_os = "linux"))]
                 let context_cpu = crate::observed::probe::cpu();
@@ -718,6 +740,7 @@ impl Runner {
                     }
                 }
                 delivery.turn(sink, &inventory);
+                check_refusal!();
             }
             // Only while the list can go somewhere: no looking for a hub that does not take it
             // (now: an older one is asked again later, and looking starts over then).
@@ -755,19 +778,12 @@ impl Runner {
                     // A list the hub did not take goes out again at the next look.
                     if watch.worth_sending(&report) {
                         let accepted = sink.report(&report);
+                        check_refusal!();
                         watch.acknowledged(report, accepted);
                     }
                 }
             }
-            if let Some(reason) = sink.refused() {
-                if let Some(mut job) = active.take() {
-                    job.stop.request(crate::stop::How::Exit);
-                    if let Some(worker) = job.worker.take() {
-                        let _ = worker.join();
-                    }
-                }
-                return Some(reason.to_string());
-            }
+            check_refusal!();
             // A clock set back (by hand, or synced after a wrong start) would leave every
             // due time far ahead: move them back with it.
             let back = clock.went_back(now_ms());
@@ -818,7 +834,9 @@ impl Runner {
                     })
                     .collect();
                 let answer = sink.checkin_managed(&asks, &collectors);
+                check_refusal!();
                 sink.flush();
+                check_refusal!();
                 policy_contact = Instant::now();
                 policy = answer.policy.or(policy);
                 sync_admission(
@@ -830,9 +848,7 @@ impl Runner {
                     &mut hook_runs,
                     &self.stop,
                 );
-                if sink.refused().is_some() {
-                    observers.finish(false);
-                }
+                check_refusal!();
                 for (index, provider) in providers.iter().enumerate() {
                     schedule.block(index, !sink.allows_measurement(*provider), now_ms());
                 }
@@ -892,6 +908,7 @@ impl Runner {
                         let kind = CollectionJob::Accounts { launches, id: attempt_id() };
                         let paths = self.paths.clone();
                         let interval = self.config.interval_ms(hook.provider);
+                        check_refusal!();
                         active = Some(ActiveCollection::spawn(hook.provider, kind, &policy, &admission, move |stop| {
                             let (outcomes, diagnostic) = hook.measure(&selected, &paths, &stop, interval);
                             BackendResult::Accounts(outcomes, diagnostic)
@@ -931,6 +948,7 @@ impl Runner {
                             admission: native_admission[index].clone(),
                         };
                         schedule.busy(index, true);
+                        check_refusal!();
                         active = Some(ActiveCollection::spawn(
                             provider,
                             kind,
@@ -962,15 +980,7 @@ impl Runner {
             if self.stop.requested() {
                 break;
             }
-            if let Some(reason) = sink.refused() {
-                if let Some(mut job) = active.take() {
-                    job.stop.request(crate::stop::How::Exit);
-                    if let Some(worker) = job.worker.take() {
-                        let _ = worker.join();
-                    }
-                }
-                return Some(reason.to_string());
-            }
+            check_refusal!();
             // A hook's check-in may have learned a new whole-device gate.
             for (index, provider) in providers.iter().enumerate() {
                 schedule.block(index, !sink.allows_measurement(*provider), now_ms());
@@ -1060,6 +1070,7 @@ impl Runner {
                     .map(|(&provider, reference)| AccountRoster { provider, accounts: vec![reference.clone()] }),
             );
             sink.account_rosters(&rosters);
+            check_refusal!();
             let asks: Vec<Ask> = asked
                 .iter()
                 .map(|(index, account)| {
@@ -1090,6 +1101,7 @@ impl Runner {
                 })
                 .collect();
             let answer = sink.checkin_managed(&asks, &collectors);
+            check_refusal!();
             policy_contact = Instant::now();
             policy = answer.policy.or(policy);
             sync_admission(
@@ -1101,9 +1113,7 @@ impl Runner {
                 &mut hook_runs,
                 &self.stop,
             );
-            if sink.refused().is_some() {
-                observers.finish(false);
-            }
+            check_refusal!();
             for (index, provider) in providers.iter().enumerate() {
                 schedule.block(index, !sink.allows_measurement(*provider), now_ms());
             }
@@ -1120,18 +1130,11 @@ impl Runner {
             }
             let directives = answer.directives;
             // Refused just now: measuring would only start a client for nothing.
-            if let Some(reason) = sink.refused() {
-                if let Some(mut job) = active.take() {
-                    job.stop.request(crate::stop::How::Exit);
-                    if let Some(worker) = job.worker.take() {
-                        let _ = worker.join();
-                    }
-                }
-                return Some(reason.to_string());
-            }
+            check_refusal!();
             // The hub answers again: what it did not take before goes now, or it would take the provider for silent.
             if directives.iter().any(|d| *d != Directive::Unanswered) {
                 sink.flush();
+                check_refusal!();
             }
             let answers: Vec<(usize, Directive)> = asked.iter().map(|(index, _)| *index).zip(directives).collect();
             for index in schedule.answer(&answers, now_ms()) {
@@ -1140,13 +1143,7 @@ impl Runner {
                 }
             }
         }
-        if let Some(mut job) = active.take() {
-            job.stop.request(crate::stop::How::Exit);
-            if let Some(worker) = job.worker.take() {
-                let _ = worker.join();
-            }
-        }
-        observers.finish(false);
+        cancel_collection(&mut active, &mut observers);
         None
     }
 }
@@ -1494,6 +1491,14 @@ impl Drop for ActiveCollection {
         }
     }
 }
+fn cancel_collection(active: &mut Option<ActiveCollection>, observers: &mut Observers) {
+    observers.cancel();
+    if let Some(job) = active.as_ref() {
+        job.stop.request(crate::stop::How::Exit);
+    }
+    active.take();
+    observers.finish(false);
+}
 // The idle coordinator keeps metadata-only discovery available while an adapter is owned by the worker.
 struct Suspended {
     provider: Provider,
@@ -1553,6 +1558,7 @@ fn finish_schedule(
 
 struct HookRun {
     provider: Provider,
+    admission: Stop,
     due: Millis,
     failures: u32,
     ready: bool,
@@ -1693,11 +1699,13 @@ fn sync_admission(
     }
     for run in runs.iter_mut() {
         if changed(run.provider) {
+            run.admission.request(crate::stop::How::Exit);
+            run.admission = root.child();
             for slot in run.slots.values_mut() {
                 schedule.block(slot.index, true, now_ms());
                 schedule.block(slot.index, false, now_ms());
                 slot.admission.request(crate::stop::How::Exit);
-                slot.admission = root.child();
+                slot.admission = run.admission.child();
                 slot.command = None;
                 slot.target = None;
             }
@@ -1719,6 +1727,239 @@ pub enum Event<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn discovery_observers_are_cancelled_by_provider_policy_before_any_accounts_exist() {
+        use crate::config::HookSettings;
+        use crate::measurement_policy::CollectorPolicy;
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+        struct Control {
+            root: Stop,
+            failures: Arc<AtomicUsize>,
+            count: usize,
+            started: PathBuf,
+            release: PathBuf,
+            denied: Option<Instant>,
+            change: &'static str,
+        }
+        impl Sink for Control {
+            fn deliver(&mut self, _: &Outcome) {
+                panic!("discovery has no data delivery")
+            }
+            fn managed(&self) -> bool {
+                true
+            }
+            fn needs_policy_contact(&self) -> bool {
+                true
+            }
+            fn allows_measurement(&self, provider: Provider) -> bool {
+                self.change != "disable" || self.denied.is_none() || provider != Provider::Codex
+            }
+            fn checkin_managed(&mut self, asks: &[Ask], _: &[Provider]) -> crate::sink::CheckinAnswer {
+                assert!(asks.is_empty());
+                if self.failures.load(Ordering::SeqCst) == self.count && self.denied.is_none() {
+                    let until = Instant::now() + Duration::from_secs(2);
+                    while !self.started.exists() && Instant::now() < until {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                    assert!(self.started.exists(), "the first callback must be executing");
+                    self.denied = Some(Instant::now());
+                    let release = self.release.clone();
+                    thread::spawn(move || {
+                        thread::sleep(Duration::from_millis(500));
+                        std::fs::write(release, "release").unwrap();
+                    });
+                }
+                if self.denied.is_some_and(|at| at.elapsed() > Duration::from_millis(750)) {
+                    self.root.request(crate::stop::How::Exit);
+                }
+                crate::sink::CheckinAnswer {
+                    directives: vec![],
+                    commands: vec![],
+                    accounts: vec![],
+                    policy: Some(MeasurementPolicy {
+                        version: 1,
+                        authority: if self.denied.is_some() && self.change == "authority" {
+                            "22222222-2222-4222-8222-222222222222"
+                        } else {
+                            "11111111-1111-4111-8111-111111111111"
+                        }
+                        .into(),
+                        revision: u64::from(self.denied.is_some()),
+                        enabled: true,
+                        collectors: Provider::ALL
+                            .into_iter()
+                            .map(|p| {
+                                (
+                                    p,
+                                    CollectorPolicy {
+                                        enabled: self.allows_measurement(p),
+                                        epoch: u64::from(
+                                            self.denied.is_some() && self.change == "epoch" && p == Provider::Codex,
+                                        ),
+                                        requires_epoch: false,
+                                        changed_at: None,
+                                    },
+                                )
+                            })
+                            .collect(),
+                    }),
+                }
+            }
+        }
+        for queued in [false, true] {
+            for change in ["disable", "epoch", "authority"] {
+                let dir = std::env::temp_dir().join(format!("quotum-discovery-{}", crate::config::random_hex()));
+                std::fs::create_dir(&dir).unwrap();
+                let started = dir.join("started");
+                let release = dir.join("release");
+                let completed = dir.join("completed");
+                let mut config = Config::parse("sessions=false").unwrap();
+                for provider in if queued { vec![Provider::Claude, Provider::Codex] } else { vec![Provider::Codex] } {
+                    let hooks = &mut config.providers.entry(provider).or_default().hooks;
+                    hooks.collect =
+                        Some(HookSettings { path: "/bin/sh".into(), args: vec!["-c".into(), "exit 1".into()] });
+                    let script = if queued && provider == Provider::Codex {
+                        "cat >/dev/null; printf done > \"$3\""
+                    } else {
+                        "cat >/dev/null; printf started > \"$1\"; while [ ! -f \"$2\" ]; do sleep 0.01; done; printf done > \"$3\""
+                    };
+                    let output = if queued && provider == Provider::Claude {
+                        dir.join("first-completed")
+                    } else {
+                        completed.clone()
+                    };
+                    hooks.on_collection_failed = Some(HookSettings {
+                        path: "/bin/sh".into(),
+                        args: vec![
+                            "-c".into(),
+                            script.into(),
+                            "fixture".into(),
+                            started.to_str().unwrap().into(),
+                            release.to_str().unwrap().into(),
+                            output.to_str().unwrap().into(),
+                        ],
+                    });
+                }
+                let root = Stop::new();
+                let failures = Arc::new(AtomicUsize::new(0));
+                let paths = Paths { config: dir.join("config"), state: dir.clone(), work: dir.clone() };
+                let mut runner = Runner::with_adapters(config, paths, vec![], dir.clone(), root.clone());
+                runner.policy_contact_every = Duration::from_millis(10);
+                let mut control = Control {
+                    root,
+                    failures: failures.clone(),
+                    count: if queued { 2 } else { 1 },
+                    started,
+                    release,
+                    denied: None,
+                    change,
+                };
+                assert!(
+                    runner
+                        .run(&mut control, |event| {
+                            if let Event::Collected(result, _) = event {
+                                assert_eq!(result.stage, "discover");
+                                assert!(result.account.is_none());
+                                failures.fetch_add(1, Ordering::SeqCst);
+                            }
+                        })
+                        .is_none()
+                );
+                assert_eq!(failures.load(Ordering::SeqCst), control.count);
+                assert!(!completed.exists(), "{change} must cancel queued={queued} discovery callbacks");
+                std::fs::remove_dir_all(dir).unwrap();
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_terminal_flush_fences_discovery_before_dispatch() {
+        use crate::config::HookSettings;
+        struct RefusingFlush {
+            terminal: bool,
+            started: PathBuf,
+        }
+        impl Sink for RefusingFlush {
+            fn managed(&self) -> bool {
+                true
+            }
+            fn deliver(&mut self, _: &Outcome) {
+                panic!("no delivery")
+            }
+            fn flush(&mut self) {
+                self.terminal = true;
+            }
+            fn refused(&self) -> Option<&str> {
+                if !self.terminal {
+                    return None;
+                }
+                // Give a wrongly dispatched worker time to enter its real process, rather
+                // than letting pre-stop cancellation hide a launch after known refusal.
+                let until = Instant::now() + Duration::from_millis(200);
+                while !self.started.exists() && Instant::now() < until {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Some("revoked")
+            }
+        }
+        let dir = std::env::temp_dir().join(format!("quotum-flush-{}", crate::config::random_hex()));
+        std::fs::create_dir(&dir).unwrap();
+        let started = dir.join("started");
+        let mut config = Config::parse("sessions=false").unwrap();
+        config.providers.entry(Provider::Codex).or_default().hooks.collect = Some(HookSettings {
+            path: "/bin/sh".into(),
+            args: vec![
+                "-c".into(),
+                "printf started > \"$1\"; exit 1".into(),
+                "fixture".into(),
+                started.to_str().unwrap().into(),
+            ],
+        });
+        let paths = Paths { config: dir.join("config"), state: dir.clone(), work: dir.clone() };
+        let mut runner = Runner::with_adapters(config, paths, vec![], dir.clone(), Stop::new());
+        let mut sink = RefusingFlush { terminal: false, started: started.clone() };
+        assert_eq!(runner.run(&mut sink, |_| panic!("no events after refusal")).as_deref(), Some("revoked"));
+        assert!(!started.exists(), "terminal flush must prevent discovery dispatch");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn native_one_shot_observations_use_the_configured_interval_and_stale_limit() {
+        struct Native;
+        impl Collector for Native {
+            fn provider(&self) -> Provider {
+                Provider::Antigravity
+            }
+            fn activity_paths(&self, _: &std::path::Path) -> Vec<PathBuf> {
+                vec![]
+            }
+            fn measure(&mut self, _: &Context) -> Outcome {
+                snapshot()
+            }
+        }
+        for (seconds, expected) in [(300, 300_000), (172_800, crate::model::STALE_LIMIT_MS)] {
+            let mut config = Config::parse("sessions=false").unwrap();
+            // Embedders can supply Config directly; retain the wire clamp as well as parser bounds.
+            config.interval = Some(seconds);
+            let paths = Paths { config: "/unused".into(), state: std::env::temp_dir(), work: std::env::temp_dir() };
+            let mut runner =
+                Runner::with_adapters(config, paths, vec![Box::new(Native)], std::env::temp_dir(), Stop::new());
+            let mut measured = 0;
+            runner.collect_all(|result| {
+                let CollectionOutcome::Observed(snapshot) = &result.outcome else { panic!("expected observation") };
+                assert_eq!(snapshot.stale_after_ms, expected);
+                assert_eq!(serde_json::to_value(snapshot).unwrap()["staleAfterMs"], expected);
+                measured += 1;
+            });
+            assert_eq!(measured, 1);
+        }
+    }
 
     #[cfg(unix)]
     #[test]

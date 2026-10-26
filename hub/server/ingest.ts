@@ -296,7 +296,7 @@ export class Ingest {
             const askInMs = Math.ceil(Math.min(paused - now, 10 * 60_000));
             return {provider: s.provider, measure: false, onDuty: !(holder !== null && holder !== device.id && leased), askInMs, until: iso(now + askInMs)};
           }
-          const directive = this.measurementSelection.claim(source, s.provider, key, device.id, s.active, now);
+          const directive = this.measurementSelection.claim(source, s.provider, key, device.id, s.active, now, false);
           this.cadence.settleRefresh(key, this.refreshDuty(key), now);
           if (!directive.measure) {
             return {provider: s.provider, measure: false, onDuty: false, askInMs: directive.until - now, until: iso(directive.until)};

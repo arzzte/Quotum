@@ -107,3 +107,66 @@ test('revocation releases orphan holdings before removing every account associat
   f.directory.transaction(()=>{f.directory.revokeDevice(f.user.id,f.device().id,T+3000);f.store.releaseRevoked(f.user.id);});
   assert.equal(f.store.deviceSources(f.user.id).length,0);assert.equal(f.store.held(f.user.id).length,0);
 });
+
+test('no-data waiting never renews an expired starter and another healthy device can take duty',t=>{
+  const f=fixture(t);
+  const body={...f.sender,paced:true,capabilities:{measurementPolicy:1,attemptContext:1},subscriptions:[{provider:'codex',account:A,active:false,minIntervalMs:600000}]};
+  const first=f.ingest.checkin(f.credential,body,T).subscriptions[0];
+  assert.equal(first.measure,true);assert.equal(f.duty.until(A),T+300000);
+  assert.equal(f.complete(1000,A,first.commandId).completions,1);
+  assert.equal(f.ingest.checkin(f.credential,body,T+301000).subscriptions[0].measure,false);
+  assert.equal(f.duty.until(A),T+300000,'waiting A has no fresh starter lease');
+  const other={...body,machine:{...f.sender.machine,id:'healthy-fixture-machine'}};
+  const takeover=f.ingest.checkin(f.credential,other,T+302000).subscriptions[0];
+  assert.equal(takeover.measure,true);
+  assert.equal(f.duty.holder(A),f.directory.deviceByMachine(f.user.id,other.machine.id)!.id);
+  assert.equal(f.duty.until(A),T+602000,'only an actual command protects B');
+});
+
+test('withdrawn provenance releases every orphan holding, including a first late observation',t=>{
+  for(const firstLate of [false,true]){
+    const f=fixture(t),answer=f.ask(0,[A,B],[A,B]);
+    if(!firstLate)f.deliver(1000,A,answer.subscriptions[0].commandId);
+    f.deliver(2000,B,answer.subscriptions[1].commandId);f.ask(3000,[B],[B]);
+    f.ingest.accept(f.credential,{...f.sender,sentAt:new Date(T+3500).toISOString(),failures:[{provider:'codex',error:'timeout',observedAt:new Date(T+3500).toISOString(),attemptContext:f.context(B)}]},T+3500);
+    const beforeB=f.store.deviceFailures(f.user.id);
+    f.deliver(4000,A,answer.subscriptions[0].commandId);
+    const source=f.store.findSource('codex',A)!;
+    assert.ok(f.store.holds(f.user.id,source));
+    assert.ok(f.store.db.prepare('SELECT 1 FROM device_sources WHERE device_id=? AND source_id=?').get(f.device().id,source));
+    assert.deepEqual(f.store.deviceSources(f.user.id).map(row=>row.source),[f.store.findSource('codex',B)]);
+    assert.equal(f.store.deviceSource(f.device().id,'codex'),f.store.findSource('codex',B));
+    assert.ok(!f.ingest.measurementSelection.candidateAccounts(f.device().id).some(account=>account.key===A));
+    assert.deepEqual(f.store.deviceFailures(f.user.id),beforeB,'late A does not clear B diagnostics');
+    const history=JSON.stringify(f.store.state(source));
+    f.directory.transaction(()=>{f.directory.revokeDevice(f.user.id,f.device().id,T+5000);f.store.releaseRevoked(f.user.id);});
+    assert.equal(f.store.held(f.user.id).length,0);
+    assert.equal(JSON.stringify(f.store.state(source)),history,'revocation preserves source evidence');
+  }
+});
+
+test('persisted membership changes invalidate owner connections after restart and identical groups are no-ops',t=>{
+  const f=fixture(t),answer=f.ask(0,[A,B],[A,B]);f.deliver(1000,A,answer.subscriptions[0].commandId);f.deliver(2000,B,answer.subscriptions[1].commandId);
+  const filename=f.store.db.prepare('PRAGMA database_list').get()!.file as string;
+  const store=new Store(filename,T+3000);t.after(()=>store.close());
+  const directory=new Directory(store.db),ingest=new Ingest(store,directory,new Duty(),new Cadence());
+  const touched:string[]=[];
+  store.setObserver({touchUser:user=>touched.push(user),touchSources(){},touchBoards(){},touchHub(){},history(){},dropSessions(){},dropMember(){},dropBoard(){}});
+  const before=directory.connectionsRevision(f.user.id);
+  const body={...f.sender,capabilities:{measurementPolicy:1,attemptContext:1,accountRosters:1},accountRosters:[{provider:'codex',accounts:[]}]};
+  ingest.checkin(f.credential,body,T+3000);
+  assert.equal(store.deviceSources(f.user.id).length,0);assert.ok(directory.connectionsRevision(f.user.id)>before);
+  assert.ok(touched.includes(f.user.id));const revision=directory.connectionsRevision(f.user.id);touched.length=0;
+  ingest.checkin(f.credential,body,T+4000);
+  assert.equal(directory.connectionsRevision(f.user.id),revision);assert.deepEqual(touched,[]);
+  assert.equal(store.db.prepare('SELECT COUNT(*) AS n FROM device_sources WHERE device_id=?').get(f.device().id)!.n,2,'raw provenance remains');
+});
+
+test('native current-source inference uses only its latest association while retaining older provenance',t=>{
+  const f=fixture(t);f.ask(0,[A]);f.deliver(1000,A);f.ask(2000,[B]);f.deliver(3000,B);
+  assert.deepEqual(f.store.deviceSources(f.user.id).map(row=>row.source),[f.store.findSource('codex',B)]);
+  assert.equal(f.store.deviceSource(f.device().id,'codex'),f.store.findSource('codex',B));
+  assert.equal(f.store.db.prepare('SELECT COUNT(*) AS n FROM device_sources WHERE device_id=?').get(f.device().id)!.n,2);
+  f.directory.transaction(()=>{f.directory.revokeDevice(f.user.id,f.device().id,T+4000);f.store.releaseRevoked(f.user.id);});
+  assert.equal(f.store.held(f.user.id).length,0);
+});

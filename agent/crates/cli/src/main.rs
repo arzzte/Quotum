@@ -4,6 +4,7 @@ mod hold;
 mod update;
 
 use hold::Prepared;
+use quotum_core::collection::account_label;
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -386,7 +387,7 @@ fn status(config: Config, paths: Paths, only: &[ClientId], json: bool) -> ExitCo
         }
         Event::Diagnostic(d) => {
             if !json {
-                eprintln!("{} {}: {}", d.provider.id(), d.hook, d.code);
+                eprintln!("{d}");
             }
             diagnostics.push(d.clone());
         }
@@ -481,6 +482,10 @@ fn run(paths: Paths, only: &[ClientId], overrides: Option<Hub>) -> ExitCode {
 /// What the agent logs of its measurements: waiting once per change, not on every
 /// check-in, and a failure that repeats itself once.
 fn logged() -> impl FnMut(Event) {
+    logged_to(log)
+}
+
+fn logged_to(mut log: impl FnMut(&str)) -> impl FnMut(Event) {
     let mut waiting: BTreeMap<Provider, bool> = BTreeMap::new();
     let mut failing = BTreeMap::new();
     move |event| match event {
@@ -497,7 +502,10 @@ fn logged() -> impl FnMut(Event) {
                         .collect::<Vec<_>>()
                         .join(", ")
                 }
-                CollectionOutcome::NoNewData => "no new data".into(),
+                CollectionOutcome::NoNewData => {
+                    failing.remove(&key);
+                    "no new data".into()
+                }
                 CollectionOutcome::Failed(f) => {
                     let summary = f.error.describe().to_string();
                     if failing.insert(key, summary.clone()).as_ref() == Some(&summary) {
@@ -514,7 +522,7 @@ fn logged() -> impl FnMut(Event) {
                 until(next - now_ms())
             ));
         }
-        Event::Diagnostic(d) => log(&format!("{} {}: {}", d.provider.id(), d.hook, d.code)),
+        Event::Diagnostic(d) => log(&d.to_string()),
         Event::Waiting(provider, next) => {
             if waiting.insert(provider, true) != Some(true) {
                 log(&format!(
@@ -527,14 +535,6 @@ fn logged() -> impl FnMut(Event) {
     }
 }
 
-fn account_label(account: Option<&quotum_core::collection::AccountRef>) -> String {
-    use quotum_core::collection::AccountRef;
-    match account {
-        Some(AccountRef::Supplier { account }) => account.chars().take(8).collect(),
-        Some(AccountRef::Declared { account_name }) => account_name.clone().unwrap_or_else(|| "default".into()),
-        None => "unknown account".into(),
-    }
-}
 fn print_collection(result: &quotum_core::collection::CollectionResult, style: &Style) {
     use quotum_core::collection::CollectionOutcome;
     println!("{} {}", result.provider.id(), account_label(result.account.as_ref()));
@@ -868,6 +868,47 @@ impl Style {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn no_data_reopens_only_its_own_failure_log_and_diagnostics_keep_safe_accounts() {
+        use quotum_core::collection::{AccountRef, CollectionOutcome, CollectionResult};
+        use quotum_core::model::{ErrorKind, Failure};
+        use quotum_core::runner::Diagnostic;
+        let mut lines = Vec::new();
+        let mut logger = logged_to(|line| lines.push(line.to_string()));
+        let mut result = CollectionResult {
+            version: 1,
+            provider: Provider::Codex,
+            account: Some(AccountRef::Supplier { account: "a".repeat(24) }),
+            attempt_id: "fixture".into(),
+            stage: "measure",
+            completed_at: 0,
+            outcome: CollectionOutcome::Failed(Failure::new(Provider::Codex, ErrorKind::Timeout, "fixture")),
+        };
+        let failed = result.outcome.clone();
+        logger(Event::Collected(&result, 0));
+        result.account = Some(AccountRef::Supplier { account: "b".repeat(24) });
+        logger(Event::Collected(&result, 0));
+        result.account = Some(AccountRef::Supplier { account: "a".repeat(24) });
+        result.outcome = CollectionOutcome::NoNewData;
+        logger(Event::Collected(&result, 0));
+        result.outcome = failed;
+        logger(Event::Collected(&result, 0));
+        result.account = Some(AccountRef::Supplier { account: "b".repeat(24) });
+        logger(Event::Collected(&result, 0));
+        logger(Event::Diagnostic(&Diagnostic {
+            provider: Provider::Codex,
+            hook: "on_collected",
+            account: result.account.clone(),
+            code: "failed",
+        }));
+        drop(logger);
+        assert_eq!(lines.len(), 5, "B remains suppressed, A logs its new failure");
+        assert!(lines[2].contains("aaaaaaaa: no new data"));
+        assert!(lines[3].contains("aaaaaaaa:") && !lines[3].contains("no new data"));
+        assert_eq!(lines[4], "codex bbbbbbbb on_collected: failed");
+        assert!(!lines[4].contains(&"b".repeat(24)));
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

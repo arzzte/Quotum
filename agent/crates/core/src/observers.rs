@@ -17,6 +17,18 @@ pub struct Diagnostic {
     pub account: Option<AccountRef>,
     pub code: &'static str,
 }
+impl std::fmt::Display for Diagnostic {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} {} {}: {}",
+            self.provider.id(),
+            crate::collection::account_label(self.account.as_ref()),
+            self.hook,
+            self.code
+        )
+    }
+}
 struct Job {
     command: HookSettings,
     payload: Vec<u8>,

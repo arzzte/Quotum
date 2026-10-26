@@ -418,10 +418,14 @@ fn measure(
                 false
             };
             if !repeated {
-                log.line(&format!("{}: {message}", result.provider.id()));
+                log.line(&format!(
+                    "{} {}: {message}",
+                    result.provider.id(),
+                    quotum_core::collection::account_label(result.account.as_ref())
+                ));
             }
         }
-        Event::Diagnostic(d) => log.line(&format!("{} {}: {}", d.provider.id(), d.hook, d.code)),
+        Event::Diagnostic(d) => log.line(&d.to_string()),
         Event::Waiting(provider, _) => {
             log.line(&format!("{}: another device measures this subscription", provider.id()))
         }
@@ -805,7 +809,11 @@ pub struct Tracked {
 }
 
 pub fn snapshot(shell: &Arc<Shell>) -> (State, Vec<Provided>, Vec<Tracked>, bool) {
-    let agent = shell.agent();
+    project(&shell.agent())
+}
+
+fn project(agent: &Agent) -> (State, Vec<Provided>, Vec<Tracked>, bool) {
+    let account_last = agent.account_last.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let last = agent.last.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let providers = Provider::ALL
         .into_iter()
@@ -819,19 +827,13 @@ pub fn snapshot(shell: &Arc<Shell>) -> (State, Vec<Provided>, Vec<Tracked>, bool
             account: agent.config.account_name(p).map(str::to_string),
             client: agent.clients.get(&ClientId::from(p)).cloned().flatten().map(|c| c.display().to_string()),
             last: last.get(&p).cloned(),
-            accounts: agent
-                .account_last
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+            accounts: account_last
                 .iter()
                 .filter(|((provider, _), _)| *provider == p)
                 .map(|(_, last)| last.clone())
                 .collect(),
             collector: agent.config.providers.get(&p).is_some_and(|settings| settings.hooks.collect.is_some()),
-            latest_status: agent
-                .account_last
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
+            latest_status: account_last
                 .iter()
                 .filter(|((provider, _), _)| *provider == p)
                 .max_by_key(|(_, last)| last.completed_at)
@@ -871,6 +873,35 @@ mod tests {
     use super::*;
 
     #[test]
+    fn app_state_projection_finishes_with_empty_and_populated_account_history() {
+        let (send, receive) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            let agent = Agent::new();
+            assert!(project(&agent).1.iter().all(|p| p.accounts.is_empty() && p.latest_status.is_none()));
+            let account = AccountRef::Supplier { account: "a".repeat(24) };
+            agent.account_last.lock().unwrap().insert(
+                (Provider::Codex, Some(account.clone())),
+                AccountLast {
+                    account: Some(account),
+                    status: "no_new_data",
+                    completed_at: 20,
+                    observed_at: Some(10),
+                    error: None,
+                },
+            );
+            let (_, providers, _, _) = project(&agent);
+            let codex = providers.iter().find(|p| p.id == "codex").unwrap();
+            assert_eq!(codex.latest_status, Some("no_new_data"));
+            assert_eq!(codex.accounts.len(), 1);
+            assert_eq!(codex.accounts[0].observed_at, Some(10));
+            assert!(agent.account_last.try_lock().is_ok(), "projection releases its history guard");
+            send.send(()).unwrap();
+        });
+        receive.recv_timeout(Duration::from_secs(2)).expect("app_state projection must not deadlock");
+        worker.join().unwrap();
+    }
+
+    #[test]
     fn intervals_not_set_go_to_the_board_as_null() {
         let provided = Provided {
             id: "codex",
@@ -882,11 +913,14 @@ mod tests {
             account: None,
             client: None,
             last: None,
+            accounts: vec![],
+            collector: false,
+            latest_status: None,
         };
         let json = serde_json::to_value(&provided).unwrap();
         assert_eq!(
             json,
-            serde_json::json!({"id": "codex", "enabled": true, "intervalS": null, "intervalFrom": null, "inheritedS": null, "inheritedFrom": null})
+            serde_json::json!({"id": "codex", "enabled": true, "intervalS": null, "intervalFrom": null, "inheritedS": null, "inheritedFrom": null, "accounts": [], "collector": false, "latestStatus": null})
         );
         let set =
             Provided { interval_s: Some(300), interval_from: Some(source_id(IntervalSource::Provider)), ..provided };
