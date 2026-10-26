@@ -2347,5 +2347,7 @@ observation clears its own account failure only when its adjusted observation ti
 at least the failure time, without removing sibling failures. Older or equal-time
 failures cannot replace that same device/account's newer success; another device's
 success is independent. Unknown failures compare only with this device's currently
-eligible provider observations. These references are not added to shared board
-projections.
+eligible provider observations. Unknown recovery uses the final eligible observations
+of the whole policy-admitted snapshot batch, not an intermediate prefix. Once a
+committed unique success closes a diagnostic, later ambiguity or membership changes
+do not resurrect it. These references are not added to shared board projections.

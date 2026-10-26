@@ -109,6 +109,7 @@ export class Ingest {
       // Every source the batch is about: its pace and its holder's duty move even when nothing new is recorded.
       const touched = new Set<string>();
       const evidenceGroups=new Map<ClientProvider,Set<string>>();
+      const observations=new Map<ClientProvider,Map<string,number>>();
 
       for (const snapshot of [...batch.snapshots].sort((a, b) => a.observedAt - b.observedAt)) {
         if (admitMeasurement(policy, snapshot.provider, snapshot.attemptContext ?? null) !== 'accepted') {
@@ -121,6 +122,8 @@ export class Ingest {
         touched.add(source);
         this.store.hold(source, device.userId, now);
         if(this.store.seenDevice(device.id, snapshot.provider, source, observedAt))this.directory.measurementsChanged(device.userId);
+        let group=observations.get(snapshot.provider);if(!group)observations.set(snapshot.provider,group=new Map());
+        group.set(source,Math.max(group.get(source)??-Infinity,observedAt));
         const previous = this.store.state(source);
         const measurement = {...toMeasurement(snapshot), observedAt};
         const recorded = this.store.record(source, measurement);
@@ -152,6 +155,9 @@ export class Ingest {
           this.measurementSelection.releaseUnconfigured(account,snapshot.provider,now);
         });
       }
+
+      // Unknown recovery needs the final eligible identity, never a unique prefix of this batch.
+      for(const [provider,group] of observations)if(this.store.recoverUnknownDeviceFailure(device.id,provider,group))this.directory.measurementsChanged(device.userId);
 
       const completedIds=new Set<string>();
       for(const completion of batch.completions) {

@@ -328,6 +328,87 @@ test('ambiguous native current identity is no recovery evidence for an unknown f
   assert.deepEqual(f.store.deviceFailures(f.user.id),[],'equal-time current native success wins');
 });
 
+test('unknown recovery uses the final eligible group of one atomic snapshot batch',t=>{
+  for(const accounts of [[A,B],[B,A]])for(const recovery of ['unique','roster']){
+    const f=fixture(t);f.ask(0,[A,B]);
+    diagnosticBatch(f,9000,[],[diagnosticFailure(f,null,9000)]);
+    const hints:string[]=[];f.directory.setObserver({touchDevices:owner=>hints.push(owner),touchSources(){},touchBoards(){},touchUser(){},touchHub(){},history(){},dropSessions(){},dropMember(){},dropBoard(){}});
+    const snapshots=accounts.map(account=>diagnosticSnapshot(f,account,10000));
+    const accepted=diagnosticBatch(f,12000,snapshots);
+    assert.equal(accepted.accepted,2);assert.equal(f.store.deviceSource(f.device().id,'codex'),null);
+    assert.deepEqual(f.store.deviceFailures(f.user.id).map(row=>[row.accountKey,row.at]),[[undefined,T+9000]],'an intermediate unique prefix is not committed recovery evidence');
+    assert.deepEqual(hints,[f.user.id,f.user.id],'new shared observations still notify their owners');hints.length=0;
+    const replay=diagnosticBatch(f,13000,snapshots);
+    assert.equal(replay.duplicates,2);assert.equal(f.store.deviceFailures(f.user.id).length,1);assert.deepEqual(hints,[]);
+    if(recovery==='roster'){
+      f.ask(14000,[],[A,B]);hints.length=0;
+      const duplicate=diagnosticBatch(f,15000,snapshots);
+      assert.equal(duplicate.accepted,0);assert.equal(duplicate.duplicates,2,'an actual own sample can recover even when globally duplicated');
+    }else diagnosticBatch(f,15000,[diagnosticSnapshot(f,B,11000)]);
+    assert.deepEqual(f.store.deviceFailures(f.user.id),[]);
+    assert.equal(hints.length,recovery==='roster'?1:2,'private recovery notifies the owner, also when the shared observations are duplicates');
+    assert.ok(hints.every(owner=>owner===f.user.id));
+    hints.length=0;diagnosticBatch(f,16000,snapshots);
+    assert.deepEqual(hints,[],'no-op replay emits no recovery hint');
+  }
+});
+
+test('atomic unknown recovery keeps event-time guards under skew',t=>{
+  for(const accounts of [[A,B],[B,A]])for(const skew of [0,3600000]){
+    const f=fixture(t);f.ask(0,[A,B]);
+    diagnosticBatch(f,9000,[],[diagnosticFailure(f,null,9000-skew)],f.sender,9000-skew);
+    diagnosticBatch(f,12000,accounts.map(account=>diagnosticSnapshot(f,account,10000-skew)),[diagnosticFailure(f,null,9000-skew)],f.sender,12000-skew);
+    assert.deepEqual(f.store.deviceFailures(f.user.id).map(row=>[row.accountKey,row.at]),[[undefined,T+9000]]);
+    diagnosticBatch(f,13000,[diagnosticSnapshot(f,B,11000-skew)],[],f.sender,13000-skew);
+    assert.deepEqual(f.store.deviceFailures(f.user.id),[]);
+    diagnosticBatch(f,14000,[],[diagnosticFailure(f,null,12000-skew)],f.sender,14000-skew);
+    diagnosticBatch(f,15000,[diagnosticSnapshot(f,B,11000-skew)],[],f.sender,15000-skew);
+    assert.equal(f.store.deviceFailures(f.user.id)[0].at,T+12000,'a stale replay cannot borrow the retained observation timestamp');
+    diagnosticBatch(f,16000,[diagnosticSnapshot(f,B,12000-skew)],[diagnosticFailure(f,null,12000-skew)],f.sender,16000-skew);
+    assert.deepEqual(f.store.deviceFailures(f.user.id),[],'equal-time current success also wins for unknown scope');
+  }
+});
+
+test('a committed unique success can recover an unknown diagnostic before a later ambiguity',t=>{
+  for(const accounts of [[A,B],[B,A]]){
+    const f=fixture(t);f.ask(0,accounts);diagnosticBatch(f,9000,[],[diagnosticFailure(f,null,9000)]);
+    diagnosticBatch(f,11000,[diagnosticSnapshot(f,accounts[0],10000)]);
+    assert.deepEqual(f.store.deviceFailures(f.user.id),[],'this committed packet has a unique eligible success');
+    diagnosticBatch(f,12000,[diagnosticSnapshot(f,accounts[1],10000)]);
+    assert.equal(f.store.deviceSource(f.device().id,'codex'),null);
+    assert.deepEqual(f.store.deviceFailures(f.user.id),[],'later ambiguity does not resurrect a closed diagnostic');
+    f.ask(13000,[],[]);
+    assert.deepEqual(f.store.deviceFailures(f.user.id),[],'membership changes do not resurrect a closed diagnostic');
+  }
+});
+
+test('atomic batches preserve event-time guarded account-scoped recovery',t=>{
+  for(const accounts of [[A,B],[B,A]]){
+    const f=fixture(t);f.ask(0,[A,B],[A,B]);
+    diagnosticBatch(f,12000,[],[diagnosticFailure(f,A,9000),diagnosticFailure(f,B,11000)]);
+    diagnosticBatch(f,13000,accounts.map(account=>diagnosticSnapshot(f,account,10000)));
+    assert.deepEqual(f.store.deviceFailures(f.user.id).map(row=>[row.accountKey,row.at]),[[B,T+11000]]);
+    diagnosticBatch(f,14000,[diagnosticSnapshot(f,B,11000)]);
+    assert.deepEqual(f.store.deviceFailures(f.user.id),[]);
+  }
+});
+
+test('policy-suppressed snapshots neither recover unknown errors nor create an ambiguous group',t=>{
+  for(const accounts of [[A,B],[B,A]]){
+    const f=fixture(t);f.ask(0,[A,B]);diagnosticBatch(f,9000,[],[diagnosticFailure(f,null,9000)]);
+    const hints:string[]=[];f.directory.setObserver({touchDevices:owner=>hints.push(owner),touchSources(){},touchBoards(){},touchUser(){},touchHub(){},history(){},dropSessions(){},dropMember(){},dropBoard(){}});
+    const suppressed=(account:string)=>({...diagnosticSnapshot(f,account,10000),attemptContext:{...f.context(account),collectorEpoch:1}});
+    const refused=diagnosticBatch(f,11000,accounts.map(suppressed));
+    assert.equal(refused.policySuppressed,2);assert.equal(f.store.deviceFailures(f.user.id).length,1);assert.deepEqual(hints,[]);
+    assert.deepEqual(f.store.deviceSources(f.user.id),[]);
+    const mixed=diagnosticBatch(f,12000,accounts.map(account=>account===A?suppressed(account):diagnosticSnapshot(f,account,10000)));
+    assert.equal(mixed.policySuppressed,1);assert.equal(mixed.accepted,1);
+    assert.equal(f.store.findSource('codex',A),null,'a suppressed tie contributes no provenance');
+    assert.equal(f.store.deviceSource(f.device().id,'codex'),f.store.findSource('codex',B));
+    assert.deepEqual(f.store.deviceFailures(f.user.id),[]);assert.deepEqual(hints,[f.user.id,f.user.id]);
+  }
+});
+
 test('private diagnostic chronology reads stay indexed within the target device and provider',t=>{
   const f=fixture(t);f.ask(0,[A,B],[A,B]);f.deliver(1000,A);f.deliver(2000,B);
   for(let n=0;n<50;n++){
@@ -347,8 +428,34 @@ test('private diagnostic chronology reads stay indexed within the target device 
     return statement;
   }) as typeof f.store.db.prepare;
   diagnosticBatch(f,3000,[],[diagnosticFailure(f,A,3000),diagnosticFailure(f,null,3000)]);
-  f.store.db.prepare=prepare;
   assert.deepEqual(new Set(f.store.deviceFailures(f.user.id).map(row=>row.accountKey??'')),new Set([A,'']));
+  diagnosticBatch(f,5000,[diagnosticSnapshot(f,A,4000),diagnosticSnapshot(f,B,4000)]);
+  f.store.db.prepare=prepare;
+  assert.deepEqual(f.store.deviceFailures(f.user.id),[]);
   assert.ok(plans.size>=2);
   for(const [sql,details] of plans)assert.ok(details.every(detail=>!/\bSCAN (ds|device_sources)\b/.test(detail)),JSON.stringify({sql,details}));
+});
+
+test('healthy batches check unknown diagnostics once per provider without reading the provenance projection',t=>{
+  const f=fixture(t);f.ask(0,[A,B]);
+  const accounts=Array.from({length:16},(_,n)=>n.toString(16).padStart(24,'0'));
+  diagnosticBatch(f,1000,accounts.map(account=>diagnosticSnapshot(f,account,1000)));
+  const prepare=f.store.db.prepare.bind(f.store.db),reads:string[]=[],plans:string[][]=[];
+  f.store.db.prepare=((sql:string)=>{
+    const statement=prepare(sql);
+    if(/^\s*SELECT\b/i.test(sql))for(const method of ['get','all'] as const){
+      const original=statement[method].bind(statement);
+      Object.defineProperty(statement,method,{value:(...args:any[])=>{
+        reads.push(sql);
+        if(/FROM device_failures/.test(sql))plans.push(prepare('EXPLAIN QUERY PLAN '+sql).all(...args).map(row=>String(row.detail)));
+        return (original as (...args:any[])=>unknown)(...args);
+      }});
+    }
+    return statement;
+  }) as typeof f.store.db.prepare;
+  diagnosticBatch(f,2000,accounts.map(account=>diagnosticSnapshot(f,account,2000)));
+  f.store.db.prepare=prepare;
+  assert.equal(reads.filter(sql=>/FROM device_failures.*account_key=''/.test(sql)).length,1,'one indexed absence check for the whole provider group');
+  assert.ok(!reads.some(sql=>/SELECT ds.device_id,ds.provider,ds.source_id,ds.seen_at,s.account,r.accounts/.test(sql)),'a healthy group never loads the full provenance projection');
+  assert.ok(plans.length);assert.ok(plans.every(details=>details.every(detail=>!/\bSCAN\b/.test(detail))),JSON.stringify(plans));
 });

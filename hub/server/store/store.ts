@@ -652,9 +652,18 @@ export class Store {
     const before=roster===null?this.latestDeviceSource(device,provider):null;
     this.db.prepare('INSERT INTO device_sources (device_id,provider,source_id,seen_at) VALUES (?,?,?,?) ON CONFLICT(device_id,provider,source_id) DO UPDATE SET seen_at=MAX(device_sources.seen_at,excluded.seen_at)').run(device, provider, source, at);
     const after=roster===null?this.latestDeviceSource(device,provider):null;
-    const cleared=(roster?.has(key)||roster===null&&after===source)&&this.db.prepare("DELETE FROM device_failures WHERE device_id=? AND provider=? AND account_key IN ('',?) AND at<=?").run(device, provider, key, at).changes>0;
+    const cleared=(roster?.has(key)||roster===null&&after===source)&&this.db.prepare('DELETE FROM device_failures WHERE device_id=? AND provider=? AND account_key=? AND at<=?').run(device, provider, key, at).changes>0;
     if(added||before!==after)this.deviceAssociationsChanged(device);
     return !!cleared;
+  }
+
+  /** Only admitted observations of the complete batch can recover an unknown diagnostic. */
+  recoverUnknownDeviceFailure(device:string,provider:Provider,observations:ReadonlyMap<string,number>) {
+    if(!this.db.prepare("SELECT 1 FROM device_failures WHERE device_id=? AND provider=? AND account_key=''").get(device,provider))return false;
+    let at=-Infinity;
+    for(const source of this.currentDeviceSources(device,null,provider))at=Math.max(at,observations.get(source.source)??-Infinity);
+    if(at===-Infinity)return false;
+    return this.db.prepare("DELETE FROM device_failures WHERE device_id=? AND provider=? AND account_key='' AND at<=?").run(device,provider,at).changes>0;
   }
 
   /** Equal observations of different accounts provide no unique current identity. */
