@@ -63,7 +63,21 @@ directly. These are the client interfaces used by the agent:
 | Codex | `codex app-server`, JSON-RPC `account/rateLimits/read` (the protocol of the IDE extensions) | Plan, per-model limits, free resets, purchased credits, account id. |
 | Antigravity | `agy -p /usage --output-format json` (agy 1.1.11+) | The agent sends agy's log to its own file; otherwise agy writes a new log file on every run. |
 
-What follows from this:
+A provider may instead use an explicitly configured [local hook](hook-collectors.md).
+It replaces only that provider's measurements. The agent executes a trusted user command,
+not a built-in provider API client; credential handling stays in the user's script.
+A versioned stdin/stdout contract separates local identity discovery from measurement
+of the accounts selected by the hub. Raw Claude and Codex supplier identities are hashed
+by the existing model and never enter delivery or logs. Antigravity's user-chosen
+`accountName` is sent in check-ins and snapshots and can enter the spool, as with native
+collection. Each discovered account reuses `Schedule`, duty, launch-scoped attempt
+evidence and the paired sink; the complete roster is checked in
+together so a partial due set cannot look like a changed native login. Hooks run
+sequentially in the same runner loop, with the native process runner's environment,
+stop and cleanup, a 60-second deadline and a 256 KiB output cap. Pooled identities
+never replace a native client's login evidence in activity reports.
+
+What follows for the native collectors:
 
 - The agent never reads tokens or cookies and never refreshes them: the client does
   that itself, as when a person uses it. No model request is made.

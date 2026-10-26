@@ -74,6 +74,17 @@ pub struct ProviderSettings {
     /// A name for this subscription when the client does not identify the account
     /// (Antigravity), to tell two subscriptions of one owner apart.
     pub account: Option<String>,
+    /// A trusted local command replacing this provider's native measurement collector.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hook: Option<HookSettings>,
+}
+
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HookSettings {
+    pub path: PathBuf,
+    #[serde(default)]
+    pub args: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
@@ -135,6 +146,25 @@ impl Config {
         for (provider, settings) in &self.providers {
             check_interval(&format!("providers.{}.interval", provider.id()), settings.interval)?;
             name(&format!("providers.{}.account", provider.id()), settings.account.as_deref())?;
+            if let Some(hook) = &settings.hook {
+                let batch = hook
+                    .path
+                    .extension()
+                    .and_then(|ext| ext.to_str())
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat"));
+                if !hook.path.is_absolute() || batch || hook.path.as_os_str().as_encoded_bytes().contains(&0) {
+                    return Err(format!(
+                        "providers.{}.hook.path: use an absolute executable path, not a shell command or batch file",
+                        provider.id()
+                    ));
+                }
+                if hook.args.len() > 32 || hook.args.iter().any(|arg| arg.len() > 4096 || arg.contains('\0')) {
+                    return Err(format!(
+                        "providers.{}.hook.args: at most 32 arguments of 4096 bytes, without NUL",
+                        provider.id()
+                    ));
+                }
+            }
         }
         Ok(())
     }

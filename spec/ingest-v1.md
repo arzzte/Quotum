@@ -892,6 +892,17 @@ boolean. It sends no process list, paths, configuration values, environment or c
 The raw scope and route-policy snapshots remain private. Shared boards can receive a
 source-level quota-growth finding and its quality, with no holder or device identity.
 
+The reference agent's optional local hooks use a separate
+[local JSON contract](../docs/hook-collectors.md), not an ingest extension. It hashes
+hook-supplied Claude and Codex supplier identities with the native pseudonym function
+and delivers ordinary snapshots (`via: "local-hook/v1"`) and failures through the
+existing connection. Antigravity's user-chosen `accountName` is sent in check-ins and
+snapshots and can enter the agent's spool, just as with native collection. Its identity
+uses the trimmed, lowercased name. Raw hook replies, command arguments and parser
+diagnostics are never included.
+Participation epochs and per-account command contexts are captured before invocation;
+a pooled account does not establish the login of a native client.
+
 What never leaves the machine: provider tokens, cookies, account ids and emails,
 prompts, file contents, file paths.
 

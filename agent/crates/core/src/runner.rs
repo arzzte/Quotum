@@ -127,6 +127,7 @@ pub struct Runner {
     paths: Paths,
     home: PathBuf,
     adapters: Vec<Box<dyn Collector>>,
+    hooks: Vec<crate::hooks::Hook>,
     clients: Vec<ClientId>,
     /// Ends this run, a measurement under way included.
     stop: Stop,
@@ -140,11 +141,16 @@ impl Runner {
         let order = [Provider::Codex, Provider::Claude, Provider::Antigravity];
         let adapters = order
             .into_iter()
-            .filter(|p| config.enabled(*p) && (only.is_empty() || only.contains(&ClientId::from(*p))))
+            .filter(|p| {
+                config.enabled(*p)
+                    && config.providers.get(p).is_none_or(|settings| settings.hook.is_none())
+                    && (only.is_empty() || only.contains(&ClientId::from(*p)))
+            })
             .map(adapter)
             .collect();
         let mut runner = Runner::with_adapters(config, paths, adapters, home(), stop);
         runner.clients.retain(|c| only.is_empty() || only.contains(c));
+        runner.hooks.retain(|h| only.is_empty() || only.contains(&ClientId::from(h.provider())));
         runner
     }
 
@@ -158,6 +164,7 @@ impl Runner {
     ) -> Runner {
         let clients = ClientId::ALL.into_iter().filter(|c| config.tracks(*c)).collect();
         Runner {
+            hooks: crate::hooks::Hook::configured(&config),
             config,
             paths,
             home,
@@ -179,7 +186,7 @@ impl Runner {
     }
 
     pub fn providers(&self) -> Vec<Provider> {
-        self.adapters.iter().map(|a| a.provider()).collect()
+        self.adapters.iter().map(|a| a.provider()).chain(self.hooks.iter().map(|h| h.provider())).collect()
     }
 
     fn measure(&mut self, index: usize) -> Outcome {
@@ -222,6 +229,12 @@ impl Runner {
             }
             each(&outcome);
         }
+        for hook in &mut self.hooks {
+            if self.stop.requested() {
+                break;
+            }
+            hook.once(&self.paths, &self.stop, &mut each);
+        }
     }
 
     /// Measures on the schedule until its stop is requested or the hub refuses this device
@@ -241,7 +254,8 @@ impl Runner {
         let mut used = vec![false; self.adapters.len()];
         // The account each provider last reported, and the state of its sign-in files then.
         let mut accounts: Vec<Option<(Option<String>, Option<SystemTime>)>> = vec![None; self.adapters.len()];
-        let providers = self.providers();
+        let providers = self.adapters.iter().map(|a| a.provider()).collect::<Vec<_>>();
+        let collectors = self.providers();
         let mut policy: Option<MeasurementPolicy> = None;
         let mut commands: Vec<Option<String>> = vec![None; self.adapters.len()];
         let mut command_accounts: Vec<Option<String>> = vec![None; self.adapters.len()];
@@ -277,7 +291,7 @@ impl Runner {
         let mut inventory_at: Option<Instant> = None;
         let mut inventory = Vec::new();
         if sink.managed() {
-            policy = sink.checkin_managed(&[], &providers).policy;
+            policy = sink.checkin_managed(&[], &collectors).policy;
             sink.flush();
             for (index, provider) in providers.iter().enumerate() {
                 schedule.block(index, !sink.allows_measurement(*provider), now_ms());
@@ -355,6 +369,9 @@ impl Runner {
                     let back = watch.clocked_witness(&mut report, watch.activity.complete(), &mut clock, now_ms());
                     if back > 0 {
                         schedule.shift(-back);
+                        for hook in &mut self.hooks {
+                            hook.shift(back);
+                        }
                     }
                     // A list the hub did not take goes out again at the next look.
                     if watch.worth_sending(&report) {
@@ -376,13 +393,16 @@ impl Runner {
             }
             if back > 0 {
                 schedule.shift(-back);
+                for hook in &mut self.hooks {
+                    hook.shift(back);
+                }
                 if let Some(watch) = &mut watch {
                     watch.continuity_fault = true;
                 }
             }
 
             // One recovery contact in the existing loop, including with sessions and every collector off.
-            if !providers.is_empty()
+            if !collectors.is_empty()
                 && sink.needs_policy_contact()
                 && policy_contact.elapsed() >= self.policy_contact_every
                 && !schedule.has_cleared()
@@ -410,7 +430,7 @@ impl Runner {
                         min_interval_ms: least[i],
                     })
                     .collect();
-                let answer = sink.checkin_managed(&asks, &providers);
+                let answer = sink.checkin_managed(&asks, &collectors);
                 sink.flush();
                 policy_contact = Instant::now();
                 policy = answer.policy.or(policy);
@@ -481,6 +501,21 @@ impl Runner {
                 continue;
             }
 
+            for hook in &mut self.hooks {
+                if hook.tick(&self.paths, &self.stop, sink, &collectors, &mut policy, &mut each) {
+                    policy_contact = Instant::now();
+                }
+            }
+            if self.stop.requested() {
+                break;
+            }
+            if let Some(reason) = sink.refused() {
+                return Some(reason.to_string());
+            }
+            // A hook's check-in may have learned a new whole-device gate.
+            for (index, provider) in providers.iter().enumerate() {
+                schedule.block(index, !sink.allows_measurement(*provider), now_ms());
+            }
             let now = now_ms();
             let due = schedule.asks(now);
             if due.is_empty() {
@@ -529,7 +564,7 @@ impl Runner {
                     }
                 })
                 .collect();
-            let answer = sink.checkin_managed(&asks, &providers);
+            let answer = sink.checkin_managed(&asks, &collectors);
             policy_contact = Instant::now();
             policy = answer.policy.or(policy);
             for (index, provider) in providers.iter().enumerate() {

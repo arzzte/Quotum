@@ -5,6 +5,7 @@ pub mod activity;
 pub mod clients;
 pub mod config;
 pub mod holder;
+mod hooks;
 pub mod measurement_policy;
 pub mod model;
 pub mod observed;

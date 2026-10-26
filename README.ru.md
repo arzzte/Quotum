@@ -689,6 +689,12 @@ account = "work"        # различает две подписки Antigravity
 # path = "/opt/agy/bin/agy"
 ```
 
+Чтобы заменить штатный коллектор своей локальной программой, в том числе для нескольких
+аккаунтов на одном устройстве, задайте `[providers.claude.hook]` с абсолютным `path`
+и массивом `args`. Это явное разрешение выполнять доверенный код пользователя, не песочница.
+[Контракт hook](docs/hook-collectors.ru.md) оставляет псевдонимы, расписание каждого
+аккаунта и доставку через существующий `quotum connect` внутри Quotum.
+
 Переменные окружения `QUOTUM_HUB_URL`, `QUOTUM_HUB_TOKEN`,
 `QUOTUM_INTERVAL`, `QUOTUM_CONFIG` и `QUOTUM_STATE_DIR` переопределяют файл. Ещё команды:
 `quotum --json` (один замер в формате хаба), `quotum --only codex`,

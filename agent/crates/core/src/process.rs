@@ -313,9 +313,26 @@ impl Client {
     /// Inventory reads are bounded before any line allocation or reader queue. Success
     /// requires both EOF and the terminal exit; dropping a failed probe reaps its tree.
     pub fn version_output(program: &Path, cwd: &Path, stop: &Stop) -> Result<Vec<u8>, ProcError> {
-        let mut client =
-            Self::spawn_reader(program, &["--version"], &[], cwd, Duration::from_secs(5), stop, Some(16 * 1024))?;
-        client.stdin = None;
+        Self::command_output(program, &["--version"], None, cwd, Duration::from_secs(5), stop, 16 * 1024)
+    }
+
+    /// One bounded command, with optional JSON on stdin. A command that does not read
+    /// stdin cannot block the deadline: its writer is released when the tree is killed.
+    pub fn command_output<S: AsRef<OsStr>>(
+        program: &Path,
+        args: &[S],
+        input: Option<Vec<u8>>,
+        cwd: &Path,
+        timeout: Duration,
+        stop: &Stop,
+        limit: usize,
+    ) -> Result<Vec<u8>, ProcError> {
+        let mut client = Self::spawn_reader(program, args, &[], cwd, timeout, stop, Some(limit))?;
+        if let (Some(mut stdin), Some(input)) = (client.stdin.take(), input) {
+            thread::spawn(move || {
+                let _ = stdin.write_all(&input);
+            });
+        }
         let bytes = client.bytes.take().ok_or(ProcError::Closed)?;
         let mut output = None;
         loop {
@@ -624,6 +641,52 @@ mod tests {
         fs::write(&program, "#!/bin/sh\necho 1.2.3\n").unwrap();
         assert_eq!(Client::version_output(&program, &dir, &Stop::new()).unwrap(), b"1.2.3\n");
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hook_commands_bound_output_exit_stdin_and_stop_without_echoing_stderr() {
+        let run = |body: &str, input: Option<Vec<u8>>, stop: &Stop| {
+            Client::command_output(
+                Path::new("/bin/sh"),
+                &["-c", body],
+                input,
+                &env::temp_dir(),
+                Duration::from_millis(300),
+                stop,
+                1024,
+            )
+        };
+        assert_eq!(run("cat", Some(b"{\"version\":1}".to_vec()), &Stop::new()).unwrap(), b"{\"version\":1}");
+        assert!(matches!(
+            run("printf valid; echo synthetic-secret >&2; exit 7", None, &Stop::new()),
+            Err(ProcError::Closed)
+        ));
+        assert!(matches!(run("head -c 2048 /dev/zero", None, &Stop::new()), Err(ProcError::OutputLimit)));
+        for body in ["sleep 30", "exec 1>&-; sleep 30", "sleep 30 & exit 0"] {
+            let started = Instant::now();
+            assert!(matches!(run(body, Some(vec![b'x'; 128 * 1024]), &Stop::new()), Err(ProcError::Timeout)));
+            assert!(started.elapsed() < Duration::from_secs(2));
+        }
+        let stop = Stop::new();
+        let signal = stop.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(30));
+            signal.request(crate::stop::How::Exit);
+        });
+        assert!(matches!(run("sleep 30", None, &stop), Err(ProcError::Stopped)));
+        // Arguments are literal: no implicit shell expands a hook's arguments.
+        let output = Client::command_output(
+            Path::new("/usr/bin/printf"),
+            &["%s", "$(echo expanded); *"],
+            None,
+            &env::temp_dir(),
+            Duration::from_secs(2),
+            &Stop::new(),
+            1024,
+        )
+        .unwrap();
+        assert_eq!(output, b"$(echo expanded); *");
     }
 
     #[cfg(unix)]
