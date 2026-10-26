@@ -17,6 +17,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime};
 
 use quotum_core::clients::ClientId;
+use quotum_core::collection::{AccountRef, CollectionOutcome, CollectionResult};
 use quotum_core::config::{Config, Hub, IntervalSource, Paths, home, machine};
 use quotum_core::holder::{Holder, LockError, RunLock, Running};
 use quotum_core::model::{Millis, Outcome, Provider, now_ms};
@@ -88,6 +89,17 @@ pub struct Last {
     pub detail: Option<String>,
 }
 
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountLast {
+    pub account: Option<AccountRef>,
+    pub status: &'static str,
+    pub completed_at: Millis,
+    pub observed_at: Option<Millis>,
+    pub error: Option<quotum_core::model::ErrorKind>,
+}
+type AccountLasts = Arc<Mutex<BTreeMap<(Provider, Option<AccountRef>), AccountLast>>>;
+
 type Lasts = Arc<Mutex<BTreeMap<Provider, Last>>>;
 
 /// A run of the agent on a thread of its own, for one start of the hub.
@@ -110,6 +122,7 @@ pub struct Agent {
     seen: Option<(Option<SystemTime>, u64)>,
     pub clients: BTreeMap<ClientId, Option<PathBuf>>,
     pub last: Lasts,
+    account_last: AccountLasts,
     /// Numbers the saves: only the last of several quick ones restarts the agent.
     saves: u64,
     /// A stopped worker still owns its spool until delivery has finished.
@@ -130,6 +143,7 @@ impl Agent {
             seen: None,
             clients: BTreeMap::new(),
             last: Arc::default(),
+            account_last: Arc::default(),
             saves: 0,
             restart_pending: false,
             started: false,
@@ -343,8 +357,9 @@ fn run(shell: &Arc<Shell>) {
         shell.agent_log.clone(),
         agent.last.clone(),
     );
+    let account_last = agent.account_last.clone();
     let (measuring, asked) = (shell.clone(), stop.clone());
-    let thread = thread::spawn(move || measure(config, paths, asked, ready, log, last, measuring));
+    let thread = thread::spawn(move || measure(config, paths, asked, ready, log, (last, account_last), measuring));
     agent.run = Some(Run { stop, thread, generation });
 }
 
@@ -355,9 +370,10 @@ fn measure(
     stop: Stop,
     ready: Ready,
     log: Arc<Log>,
-    last: Lasts,
+    history: (Lasts, AccountLasts),
     shell: Arc<Shell>,
 ) -> Option<String> {
+    let (last, account_last) = history;
     let (config, defer_activity) = settings;
     let hub = Hub { url: ready.origin(), token: ready.token };
     let identity = machine(&paths, &config);
@@ -372,31 +388,68 @@ fn measure(
     if defer_activity {
         runner.defer_activity();
     }
-    let mut failing: BTreeMap<Provider, String> = BTreeMap::new();
+    let mut failing = BTreeMap::new();
     runner.run(&mut sink, |event| match event {
-        Event::Measured(outcome, _) => {
-            record(&last, outcome);
+        Event::Measured(..) => {}
+        Event::Collected(result, _) => {
+            record_account(&account_last, result);
+            let outcome = match &result.outcome {
+                CollectionOutcome::Observed(s) => Some(Ok(s.clone())),
+                CollectionOutcome::Failed(f) => Some(Err(f.clone())),
+                CollectionOutcome::NoNewData => None,
+            };
+            if let Some(outcome) = &outcome {
+                record(&last, outcome);
+            } else {
+                last.lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(result.provider, Last { at: result.completed_at, ok: true, error: None, detail: None });
+            }
             shell.wake();
-            if let (Ok(_), Some(smoke)) = (outcome, &shell.smoke) {
+            if let (Some(Ok(_)), Some(smoke)) = (&outcome, &shell.smoke) {
                 smoke.measured(&shell);
             }
-            let (provider, summary) = summary(outcome);
-            // A failure that repeats itself is logged once.
-            let repeated = match outcome {
-                Ok(_) => {
-                    failing.remove(&provider);
-                    false
-                }
-                Err(_) => failing.insert(provider, summary.clone()).as_ref() == Some(&summary),
+            let key = (result.provider, result.account.clone());
+            let message = outcome.as_ref().map(|o| summary(o).1).unwrap_or_else(|| "no new data".into());
+            let repeated = if matches!(&result.outcome, CollectionOutcome::Failed(_)) {
+                failing.insert(key.clone(), message.clone()).as_ref() == Some(&message)
+            } else {
+                failing.remove(&key);
+                false
             };
             if !repeated {
-                log.line(&format!("{}: {summary}", provider.id()));
+                log.line(&format!("{}: {message}", result.provider.id()));
             }
         }
+        Event::Diagnostic(d) => log.line(&format!("{} {}: {}", d.provider.id(), d.hook, d.code)),
         Event::Waiting(provider, _) => {
-            log.line(&format!("{}: another device measures this subscription", provider.id()));
+            log.line(&format!("{}: another device measures this subscription", provider.id()))
         }
     })
+}
+
+fn record_account(last: &AccountLasts, result: &CollectionResult) {
+    let mut last = last.lock().unwrap_or_else(|e| e.into_inner());
+    let key = (result.provider, result.account.clone());
+    let observed = match &result.outcome {
+        CollectionOutcome::Observed(s) => Some(s.observed_at),
+        _ => last.get(&key).and_then(|l| l.observed_at),
+    };
+    let (status, error) = match &result.outcome {
+        CollectionOutcome::Observed(_) => ("observed", None),
+        CollectionOutcome::NoNewData => ("no_new_data", None),
+        CollectionOutcome::Failed(f) => ("failed", Some(f.error)),
+    };
+    last.insert(
+        key,
+        AccountLast {
+            account: result.account.clone(),
+            status,
+            completed_at: result.completed_at,
+            observed_at: observed,
+            error,
+        },
+    );
 }
 
 fn summary(outcome: &Outcome) -> (Provider, String) {
@@ -738,6 +791,9 @@ pub struct Provided {
     pub client: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last: Option<Last>,
+    pub accounts: Vec<AccountLast>,
+    pub collector: bool,
+    pub latest_status: Option<&'static str>,
 }
 
 #[derive(Serialize)]
@@ -763,6 +819,23 @@ pub fn snapshot(shell: &Arc<Shell>) -> (State, Vec<Provided>, Vec<Tracked>, bool
             account: agent.config.account_name(p).map(str::to_string),
             client: agent.clients.get(&ClientId::from(p)).cloned().flatten().map(|c| c.display().to_string()),
             last: last.get(&p).cloned(),
+            accounts: agent
+                .account_last
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .filter(|((provider, _), _)| *provider == p)
+                .map(|(_, last)| last.clone())
+                .collect(),
+            collector: agent.config.providers.get(&p).is_some_and(|settings| settings.hooks.collect.is_some()),
+            latest_status: agent
+                .account_last
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .filter(|((provider, _), _)| *provider == p)
+                .max_by_key(|(_, last)| last.completed_at)
+                .map(|(_, last)| last.status),
         })
         .collect();
     let clients = ClientId::ALL
@@ -1181,6 +1254,51 @@ mod tests {
         closer.join().unwrap();
         assert!(!close_requires_exit(&agent, &operations, || true, || false), "a later open stays");
         assert!(!close_requires_exit(&agent, &operations, || false, || true), "consent was already given");
+    }
+
+    #[test]
+    fn account_outcomes_retain_observation_dates_and_sibling_failures() {
+        let last = AccountLasts::default();
+        let make = |account: &str, outcome| CollectionResult {
+            version: 1,
+            provider: Provider::Codex,
+            account: Some(AccountRef::Supplier { account: account.into() }),
+            attempt_id: "fixture".into(),
+            stage: "measure",
+            completed_at: 10,
+            outcome,
+        };
+        record_account(
+            &last,
+            &make(
+                "b",
+                CollectionOutcome::Failed(quotum_core::model::Failure::new(
+                    Provider::Codex,
+                    quotum_core::model::ErrorKind::Timeout,
+                    "",
+                )),
+            ),
+        );
+        let snapshot = quotum_core::model::Snapshot {
+            provider: Provider::Codex,
+            account: Some("a".into()),
+            account_name: None,
+            plan: None,
+            observed_at: 5,
+            via: "fixture".into(),
+            client: None,
+            stale_after_ms: 120000,
+            windows: vec![],
+            resets: None,
+            resource_status: None,
+            balances: None,
+        };
+        record_account(&last, &make("a", CollectionOutcome::Observed(snapshot.clone())));
+        record_account(&last, &make("a", CollectionOutcome::NoNewData));
+        let states = last.lock().unwrap();
+        assert_eq!(states.len(), 2);
+        assert_eq!(states[&(Provider::Codex, Some(AccountRef::Supplier { account: "a".into() }))].observed_at, Some(5));
+        assert_eq!(states[&(Provider::Codex, Some(AccountRef::Supplier { account: "b".into() }))].status, "failed");
     }
 
     #[test]

@@ -75,8 +75,15 @@ pub struct ProviderSettings {
     /// (Antigravity), to tell two subscriptions of one owner apart.
     pub account: Option<String>,
     /// A trusted local command replacing this provider's native measurement collector.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub hook: Option<HookSettings>,
+    pub hooks: ProviderHooks,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ProviderHooks {
+    pub collect: Option<HookSettings>,
+    pub on_collected: Option<HookSettings>,
+    pub on_collection_failed: Option<HookSettings>,
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
@@ -128,7 +135,7 @@ impl Config {
     /// The settings a file holds, checked as the agent checks them when it reads the file,
     /// without the environment: for whatever writes the file (the desktop app).
     pub fn parse(text: &str) -> Result<Config, String> {
-        let config = toml::from_str::<Config>(text).map_err(|e| e.to_string())?;
+        let config = toml::from_str::<Config>(text).map_err(|_| "invalid configuration fields or types".to_string())?;
         config.check()?;
         Ok(config)
     }
@@ -146,7 +153,12 @@ impl Config {
         for (provider, settings) in &self.providers {
             check_interval(&format!("providers.{}.interval", provider.id()), settings.interval)?;
             name(&format!("providers.{}.account", provider.id()), settings.account.as_deref())?;
-            if let Some(hook) = &settings.hook {
+            for (name, hook) in [
+                ("collect", &settings.hooks.collect),
+                ("on_collected", &settings.hooks.on_collected),
+                ("on_collection_failed", &settings.hooks.on_collection_failed),
+            ] {
+                let Some(hook) = hook else { continue };
                 let batch = hook
                     .path
                     .extension()
@@ -154,13 +166,13 @@ impl Config {
                     .is_some_and(|ext| ext.eq_ignore_ascii_case("cmd") || ext.eq_ignore_ascii_case("bat"));
                 if !hook.path.is_absolute() || batch || hook.path.as_os_str().as_encoded_bytes().contains(&0) {
                     return Err(format!(
-                        "providers.{}.hook.path: use an absolute executable path, not a shell command or batch file",
+                        "providers.{}.hooks.{name}.path: use an absolute executable path, not a shell command or batch file",
                         provider.id()
                     ));
                 }
                 if hook.args.len() > 32 || hook.args.iter().any(|arg| arg.len() > 4096 || arg.contains('\0')) {
                     return Err(format!(
-                        "providers.{}.hook.args: at most 32 arguments of 4096 bytes, without NUL",
+                        "providers.{}.hooks.{name}.args: at most 32 arguments of 4096 bytes, without NUL",
                         provider.id()
                     ));
                 }

@@ -1,168 +1,185 @@
-# Local hook collectors
+# Local provider hooks
 
-A hook replaces one native subscription collector with a local executable you control.
-It can measure several accounts of that provider on the same device. Quotum still owns
-identity pseudonyms, per-account scheduling, duty, participation policy, delivery and
-retries. No extra hub token, virtual device, service or ingest implementation is needed.
-The existing `quotum connect` connection is used. Hooks do not change client discovery,
-activity tracking or which subscription a native client is signed in to.
-
-## Configure
+Quotum can run trusted local programs to collect a provider's measurements or react
+to a completed collection. Configure them in the agent's `config.toml`. These programs
+run with your operating-system permissions. They are not sandboxed.
 
 ```toml
-[providers.claude.hook]
-path = "/absolute/path/to/usage-hook"
-args = []
+[providers.codex.hooks.collect]
+path = "/usr/bin/python3"
+args = ["/home/me/bin/collect-codex.py"]
+
+[providers.codex.hooks.on_collected]
+path = "/home/me/bin/export-measurement"
+
+[providers.codex.hooks.on_collection_failed]
+path = "/home/me/bin/report-failure"
 ```
 
-Or point `path` at an interpreter and put the script path in `args`:
+The three optional hooks are independent. `collect` replaces only that provider's
+native measurement adapter; failure never falls back to a native client. Observers
+also work with native collection. The available provider keys are `claude`, `codex`
+and `antigravity`. A command has an absolute executable or interpreter `path` and an
+optional `args` array of up to 32 literal arguments, each at most 4096 bytes. There
+is no shell expansion. `.cmd` and `.bat` files require an explicitly selected
+interpreter. Unknown configuration fields and hook names are rejected.
 
-```toml
-[providers.claude.hook]
-path = "/absolute/path/to/python3"
-args = ["-I", "/absolute/path/to/usage-hook.py"]
-```
+`providers.<provider>.path` and `clients.<client>.path` still select the native client
+for installation discovery and activity tracking. Hook accounts do not become native
+login evidence or change which client sessions are attributed to a subscription.
+The desktop app preserves hook settings when saving other preferences. It exposes
+account outcomes read-only; neither the web dashboard nor IPC installs commands.
 
-Only the existing client-measured providers (`claude`, `codex`, `antigravity`) are
-supported. The hook replaces measurement, not the provider's client `path` setting.
-`enabled = false` and `--only` apply as usual; the provider's `interval` is still its
-minimum interval with a hub. Restart the agent after changing the configuration.
-`quotum --only claude --json` runs discovery and measures the returned accounts once.
-`quotum run --only claude` follows the hub's schedule.
+## Process contract
 
-The executable path must be absolute. There is no shell, tilde expansion or command
-string parsing. Arguments are passed literally (at most 32, each at most 4096 bytes,
-without NUL). Batch files (`.cmd`, `.bat`) are refused; on Windows use an executable or
-an interpreter explicitly. The hook runs in Quotum's neutral work directory at low
-priority, with the normal client environment (no `QUOTUM_*` variables). Standard error
-is discarded. Each invocation has a 60-second deadline and a 256 KiB stdout limit,
-including output without newlines; both EOF and successful exit are required. Stop,
-timeout or completion tears down the process tree using the native client runner.
+Each collector invocation reads one UTF-8 JSON request from stdin, followed by EOF, and writes
+one JSON object to stdout before exiting successfully. Version 1 uses camelCase;
+unknown fields are rejected. The collector has a 60-second deadline and 256 KiB input
+and output limits. Its stderr is discarded. The process starts at low priority in a
+neutral working directory, with `QUOTUM_*` environment variables removed. No hub
+credentials, config paths or raw native-client replies are included in the request.
 
-## Contract v1
+Measurement processes run one at a time. A collect invocation receives all admitted
+due accounts of its selected provider in one batch. The coordinator continues control-plane
+contact and activity delivery while a collection runs. Shutdown or a learned policy
+restriction cancels running work. Results are checked against the launch's immutable
+account, policy epoch and command before they are delivered. Process groups on Unix
+and a Job object on Windows clean up children. A bounded command fails if Windows
+cannot attach its Job object. Deliberately escaping those
+mechanisms is outside this trusted-code contract.
 
-Each invocation reads one JSON request from stdin until EOF, prints exactly one JSON
-reply to stdout, and exits. Do not print progress, credentials, paths, full provider
-responses or diagnostics on stdout. Version 1 rejects unknown fields. The account
-list has at most 16 entries, the existing check-in limit; each entry's `provider` must
-match the configured provider. Duplicate identities, including those differing only
-by the native pseudonym's normalization, are invalid.
+## Account identities
 
-### Discovery
+Only these provider-specific forms are accepted:
 
-Request:
+| Provider | Identity |
+| --- | --- |
+| Claude | `{"email":"one@example.com","organization":"Example"}` |
+| Codex | `{"accountId":"provider-stable-account-id"}` |
+| Antigravity | `{"accountName":"work"}` or `{"accountName":null}` |
+
+Required strings are nonempty, control-free and at most 120 characters. Claude's
+organization may be empty. Antigravity's `accountName` field is required even when
+null: that is a known unnamed default account, with the same source as native
+Antigravity without a configured name. The name `"default"` is a different account.
+Names compare after trimming and lowercasing. Supplier identities are hashed with
+the native pseudonym function before delivery; raw email and account IDs stay local.
+
+## Discovery
+
+The same collector first receives:
 
 ```json
-{"version":1,"action":"discover"}
+{"version":1,"action":"discover","provider":"codex"}
 ```
 
-Reply:
+It returns the complete list of accounts it can measure, at most 16:
 
 ```json
-{"version":1,"accounts":[
-  {"provider":"claude","identity":{"email":"user@example.com","organization":"Example"}},
-  {"provider":"claude","identity":{"email":"second@example.com","organization":"Example"}}
-]}
+{"version":1,"accounts":[{"identity":{"accountId":"one"}},{"identity":{"accountId":"two"}}]}
 ```
 
-Discovery lists identities only: no windows, plan or errors. It must do no provider
-work and make no model requests. The agent checks participation before even discovery.
-Discovery is repeated on the configured provider interval (120 seconds by default),
-so accounts can appear and disappear without restarting the agent. Unchanged accounts
-keep their existing schedules. An empty list is valid. A failed discovery suspends
-check-ins and measurements for that roster and retries with bounded backoff, retaining
-per-account schedules until discovery succeeds. Only confirmed removals discard state.
+A successful empty list withdraws this device's membership for the provider. A failed
+or malformed discovery retains the previous membership and suspends new collection
+until discovery succeeds. Duplicate canonical identities invalidate the whole list.
+Discovery repeats on the configured provider interval, with bounded failure backoff.
 
-### Measurement
+Membership is independent of which accounts are due. Removing an account withdraws
+this device's association and duty; it does not delete the account's history.
 
-Before measuring, Quotum checks in for the complete discovered roster. The hub selects
-which accounts are due on this device. Only those identities are passed to the hook:
+## Collection
+
+When an account is due and the device has permission to measure it:
 
 ```json
-{"version":1,"action":"measure","accounts":[
-  {"email":"user@example.com","organization":"Example"}
-]}
+{"version":1,"action":"measure","provider":"codex","accounts":[{"identity":{"accountId":"two"}}]}
 ```
 
-Reply:
+Return one result for every requested account:
 
 ```json
-{"version":1,"accounts":[{
-  "provider":"claude",
-  "identity":{"email":"user@example.com","organization":"Example"},
-  "plan":"max",
-  "windows":[
-    {"id":"session","kind":"session","minutes":300,"usedPercent":12.5,"resetsAt":"2026-10-26T23:00:00Z"},
-    {"id":"weekly","kind":"weekly","minutes":10080,"usedPercent":37,"resetsAt":"2026-11-01T23:00:00Z"},
-    {"id":"weekly:sonnet","kind":"weekly","minutes":10080,"label":"Sonnet","usedPercent":8}
-  ]
-}]}
+{"version":1,"results":[{"identity":{"accountId":"two"},"status":"observed","observedAt":"2026-10-26T12:00:00Z","plan":"pro","windows":[{"id":"session","kind":"session","minutes":300,"usedPercent":12.5,"resetsAt":"2026-10-26T17:00:00Z"}]}]}
 ```
 
-Measure **only** the requested identities. Do not return another account, even if a
-credential changed during collection: that invalidates the reply. Return one entry
-per requested identity; an omitted entry becomes an error for that account. Order
-does not matter. One account's failure need not discard another's good measurement:
+There are three exclusive result forms:
+
+- `observed`: a newly obtained observation, even if its values equal the previous
+  observation. Include `observedAt`, `windows`, and optionally `plan`, `resets`,
+  `resourceStatus` and `balances` as described below. Do not invent a fresh timestamp
+  for retained data. A timestamp more than 30 seconds in the future is rejected.
+- `no_new_data`: only `identity` and `status`. The attempt finished without a new
+  observation. Retained values and their timestamps, availability and history remain
+  unchanged. A matching refresh finishes as **No new data**; collection follows its
+  normal interval without a failure backoff or immediate retry.
+- `failed`: `identity`, `status` and `error`, one of `not_installed`, `not_logged_in`,
+  `unsupported`, `timeout`, `invalid_output` or `failed`. Free-text errors are not
+  accepted.
+
+For example:
 
 ```json
-{"version":1,"accounts":[{
-  "provider":"claude",
-  "identity":{"email":"user@example.com","organization":"Example"},
-  "error":"not_logged_in"
-}]}
+{"version":1,"results":[{"identity":{"accountId":"one"},"status":"no_new_data"},{"identity":{"accountId":"two"},"status":"failed","error":"timeout"}]}
 ```
 
-Errors are `not_installed`, `not_logged_in`, `unsupported`, `timeout`, `invalid_output`
-or `failed`; they exclude `windows` and `plan`. Do not include a free-text error body.
-A nonzero exit, deadline, excess output or invalid JSON is a measurement error for all
-requested accounts, never a crash. The agent emits fixed diagnostics, never raw output,
-arguments, provider errors or parser messages.
+Results are independent by account. A missing, duplicated or malformed requested
+result fails that account. An unrequested or unrecognizable identity produces a safe
+local diagnostic and never creates an account. Invalid envelope JSON or version fails
+the whole invocation. The program cannot choose a pseudonym, producer metadata,
+`staleAfterMs`, or a hub command context.
 
-A success has 1–32 unique windows. `kind` is `session`, `weekly` or `other`, independent
-of the id. `usedPercent` is finite and between 0 and 100; `minutes`, when present, is
-positive; `resetsAt`, when present, is RFC 3339 with a timezone. Unknown reset times
-are omitted or null. Plan, ids and labels are nonempty, control-free text of at most
-120 characters; ids must remain unique after trimming. Plan is optional: omit it when
-not reported rather than guessing. The contract initially covers percentage windows,
-not balances or free resets. Quotum supplies the observation time after the command
-returns, freshness from the account's schedule, and `via = "local-hook/v1"`.
+### Resources
 
-### Provider identities
+Resources match [ingest v1](../spec/ingest-v1.md). They do not add provider APIs:
 
-| Provider | `identity` | Handling |
-|---|---|---|
-| Claude | `{"email":"user@example.com","organization":"Example"}` | The exact email and organization reported by Claude Code; organization is required, but can be empty. |
-| Codex | `{"accountId":"provider-account-id"}` | The same stable account id returned by the native app-server. |
-| Antigravity | `{"accountName":"work"}` | The owner's subscription name, as with native `providers.antigravity.account`; no supplier pseudonym is invented. |
+- Up to 32 windows, with unique nonempty `id`, `kind` (`session`, `weekly`, `other`),
+  finite `usedPercent` from 0 to 100, optional positive integer `minutes`, `label`
+  and RFC3339 `resetsAt`.
+- Optional `resets`: integer `available` from 0 to 1000 and up to 50 `expiring`
+  groups. Each group has a positive `count` and optional RFC3339 `expiresAt`.
+  Counts sum to at most available; expiry times are unique and increasing, with an
+  unknown expiry last. Zero is a confirmed observation.
+- Identified Codex may include `resourceStatus.windows` and `.resets`, each
+  `observed`, `missing`, `unsupported` or `invalid`. `observed` means its numeric
+  payload is present; other statuses mean it is absent. Empty windows are valid with
+  these explicit statuses, including a credits-only observation.
+- Only Codex accepts `balances`, at most one, with `id: "balance:credits"` and
+  `unit: "credits:codex"`. Its `status` is `finite`, `unlimited`, `missing`,
+  `unsupported` or `invalid`. Only `finite` has `amount`, an exact decimal string
+  with at most 18 significant fractional places and a coefficient at most signed
+  64-bit maximum. No float conversion or rounding is performed. Optional
+  `hasCredits` is a boolean.
 
-Do not mix the identity fields of different providers. Identity fields are bounded to
-120 characters without controls; only organization can be empty. For Claude and Codex,
-Quotum calls the same pseudonym function as the native adapter. The script must not
-hash identities or construct ingest packets. The same raw identity gives the same
-subscription on any device, whether measured natively or by a hook. Raw Claude and
-Codex supplier identities remain in memory and the hook's stdin/stdout, not the spool,
-logs or hub. Antigravity's user-chosen `accountName` is sent to the hub in check-ins
-and snapshots and can enter the spool, just as with native collection. Its identity
-uses the trimmed, lowercased name; case-only changes do not create another account.
-A hook's pooled accounts never become evidence of a native client's current login.
+Omitted resources keep the existing native semantics. Explicit missing ends their
+availability without inventing zero. Timestamps, nested fields and limits are
+validated before normalization.
 
-## Trust and failure boundaries
+## Observers
 
-Opting in executes **your code with your user's permissions**. This is not a sandbox,
-a signed-plugin system or a way to run untrusted scripts. Protect the executable,
-script, interpreter and their parent directories from other writers. Prefer an isolated
-interpreter mode, keep credentials out of arguments and choose absolute script paths.
-A time/output cap protects Quotum, not the rest of your machine from a malicious hook.
-The inherited non-Quotum environment may contain your own secrets; your script controls
-its own credential access and network use. Quotum never opens provider credential
-files, refreshes tokens, calls provider endpoints or makes model requests. Your hook
-must also avoid model requests. Secret storage and provider access belong to your
-script, outside Quotum's product and contract.
+An observer receives one normalized event per account, after local admission,
+independently of hub delivery. Its account reference contains the supplier pseudonym
+or an Antigravity name, never the raw supplier identity:
 
-In the background, accounts retain independent hub duty, commands, epochs, freshness,
-failure backoff and offline fallback through the existing scheduler and paired sink.
-Discovery does not create a hub subscription; only ordinary check-ins and accepted
-measurements do. Provider-only discovery failures remain private device diagnostics.
-No hub, database or ingest-protocol change is required.
+```json
+{"version":1,"event":"on_collected","provider":"codex","account":{"account":"0123456789abcdef01234567"},"attemptId":"12345678-1234-4234-8234-123456789abc","completedAt":"2026-10-26T12:00:01Z","measurement":{"observedAt":"2026-10-26T12:00:00Z","plan":"pro","windows":[{"id":"session","kind":"session","minutes":300,"usedPercent":12.5}]}}
+```
 
-[Русская версия](hook-collectors.ru.md)
+`measurement` contains normalized resources and their timestamps. A native success
+without a known identity uses `account: null`; a previous identity is never inferred.
+Known unnamed Antigravity uses `account: {"accountName":null}` instead.
+
+A failed attempt uses `event: "on_collection_failed"` and, instead of `measurement`,
+`error: {"code":"timeout","stage":"measure"}`. A discovery failure produces one
+provider-level event with `account: null` and `stage: "discover"`. It does not fail
+every retained account. Partial-resource observations produce one success event.
+`no_new_data` and cancellation produce no observer events.
+
+One worker handles a FIFO queue of 32 events without blocking the coordinator. Each
+observer gets one attempt, a 10-second deadline, 256 KiB stdin and 16 KiB stdout;
+stdout and stderr are discarded. Overflow or process errors produce fixed local
+codes, not measurement failures, and never invoke another observer. There is no
+persistent observer outbox, retry or replay. Normal one-shot exit gives the entire
+queue a shared 10-second grace period. Explicit stop cancels it immediately.
+
+A collector connected to a hub requires that hub to advertise `accountRosters: 1`
+and `collectionCompletions: 1` in its normal check-in reply. Missing support is an
+explicit upgrade error, not an offline or native fallback mode.

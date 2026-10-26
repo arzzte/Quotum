@@ -53,7 +53,7 @@ export type SessionDevice = {id:string;name:string;disconnected:boolean;enabled:
 /** Settings, admission and funding use the same connected or retained device inventory. */
 const sessionDeviceWhere='(d.revoked_at IS NULL OR EXISTS(SELECT 1 FROM agent_sessions s JOIN agent_work w ON w.session_id=s.id WHERE s.device_id=d.id))';
 
-export type DeviceFailure = {device: string; provider: Provider; error: string; detail: string | null; at: number};
+export type DeviceFailure = {accountKey?: string; device: string; provider: Provider; error: string; detail: string | null; at: number};
 
 /** A reset for everyone as a community tracker reported it. */
 export type Announcement = {at: number; url: string; text: string};
@@ -424,6 +424,8 @@ export class Store {
       if(providerOf(this.state(source).provider)?.measuredBy==='hub')continue;
       this.release(source,userId);
     }
+    // Preserve revoked associations until they have identified every orphan holding.
+    this.db.prepare('DELETE FROM device_sources WHERE device_id IN (SELECT id FROM devices WHERE user_id=? AND revoked_at IS NOT NULL)').run(userId);
   }
 
   // ---------- sharing ----------
@@ -645,9 +647,12 @@ export class Store {
 
   /** Remembers which source a device last delivered for a provider; its failures for the provider are over. */
   seenDevice(device: string, provider: Provider, source: string, at: number) {
-    const changed = this.deviceSource(device, provider) !== source;
-    this.db.prepare('INSERT INTO device_sources (device_id,provider,source_id,seen_at) VALUES (?,?,?,?) ON CONFLICT(device_id,provider) DO UPDATE SET source_id=excluded.source_id,seen_at=excluded.seen_at').run(device, provider, source, at);
-    this.db.prepare('DELETE FROM device_failures WHERE device_id = ? AND provider = ?').run(device, provider);
+    const key=this.account(source)!;
+    if(!this.rosterAllows(device,provider,key))return;
+    const changed = !this.db.prepare('SELECT 1 FROM device_sources WHERE device_id=? AND provider=? AND source_id=?').get(device,provider,source);
+    if(this.accountRoster(device,provider)===null)this.db.prepare('DELETE FROM device_sources WHERE device_id=? AND provider=? AND source_id<>?').run(device,provider,source);
+    this.db.prepare('INSERT INTO device_sources (device_id,provider,source_id,seen_at) VALUES (?,?,?,?) ON CONFLICT(device_id,provider,source_id) DO UPDATE SET seen_at=excluded.seen_at').run(device, provider, source, at);
+    this.db.prepare("DELETE FROM device_failures WHERE device_id=? AND provider=? AND account_key IN ('',?)").run(device, provider, key);
     if (changed) {
       const owner = this.db.prepare('SELECT user_id FROM devices WHERE id=?').get(device) as {user_id: string} | undefined;
       if (owner) tell(this.observer, o => o.touchUser(owner.user_id));
@@ -655,10 +660,26 @@ export class Store {
   }
 
   deviceSource(device: string, provider: Provider): string | null {
-    const row = this.db.prepare('SELECT source_id FROM device_sources WHERE device_id = ? AND provider = ?').get(device, provider) as
+    const row = this.db.prepare('SELECT source_id FROM device_sources WHERE device_id = ? AND provider = ? ORDER BY seen_at DESC,source_id LIMIT 1').get(device, provider) as
       | {source_id: string}
       | undefined;
     return row?.source_id ?? null;
+  }
+
+  accountRoster(device:string,provider:Provider):Set<string>|null {
+    const row=this.db.prepare('SELECT accounts FROM device_account_rosters WHERE device_id=? AND provider=?').get(device,provider) as {accounts:string}|undefined;
+    return row?new Set(JSON.parse(row.accounts) as string[]):null;
+  }
+
+  rosterAllows(device:string,provider:Provider,key:string):boolean {
+    const roster=this.accountRoster(device,provider);return roster===null||roster.has(key);
+  }
+
+  replaceAccountRoster(device:string,provider:Provider,accounts:Set<string>,now:number) {
+    this.db.prepare('INSERT INTO device_account_rosters VALUES (?,?,?,?) ON CONFLICT(device_id,provider) DO UPDATE SET accounts=excluded.accounts,updated_at=excluded.updated_at').run(device,provider,JSON.stringify([...accounts].sort()),now);
+    for(const row of this.db.prepare('SELECT ds.source_id,s.account FROM device_sources ds JOIN sources s ON s.id=ds.source_id WHERE ds.device_id=? AND ds.provider=?').all(device,provider) as {source_id:string;account:string}[]) {
+      if(!accounts.has(row.account))this.db.prepare('DELETE FROM device_sources WHERE device_id=? AND provider=? AND source_id=?').run(device,provider,row.source_id);
+    }
   }
 
   /** Which sources each device of a person delivers to. */
@@ -670,15 +691,15 @@ export class Store {
   }
 
   /** The last failure a device reported for a provider, kept until it delivers for it again. */
-  deviceFailed(device: string, provider: Provider, error: string, detail: string | null, at: number) {
-    this.db.prepare('INSERT OR REPLACE INTO device_failures VALUES (?, ?, ?, ?, ?)').run(device, provider, error, detail, at);
+  deviceFailed(device: string, provider: Provider, error: string, detail: string | null, at: number, accountKey = '') {
+    this.db.prepare('INSERT INTO device_failures VALUES (?,?,?,?,?,?) ON CONFLICT(device_id,provider,account_key) DO UPDATE SET error=excluded.error,detail=excluded.detail,at=excluded.at WHERE excluded.at>device_failures.at').run(device, provider, accountKey, error, detail, at);
   }
 
   deviceFailures(userId: string): DeviceFailure[] {
     const rows = this.db
       .prepare('SELECT f.* FROM device_failures f JOIN devices d ON d.id = f.device_id WHERE d.user_id = ?')
-      .all(userId) as {device_id: string; provider: Provider; error: string; detail: string | null; at: number}[];
-    return rows.map(r => ({device: r.device_id, provider: r.provider, error: r.error, detail: r.detail, at: r.at}));
+      .all(userId) as {device_id: string; provider: Provider; account_key:string; error: string; detail: string | null; at: number}[];
+    return rows.map(r => ({device: r.device_id, provider: r.provider, ...(r.account_key?{accountKey:r.account_key}:{}), error: r.error, detail: r.detail, at: r.at}));
   }
 
   /** The board's known work thresholds, independent of the tiles read. */

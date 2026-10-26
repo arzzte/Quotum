@@ -107,6 +107,12 @@ export class Duty {
     }
   }
 
+  /** Completing a command without evidence removes execution protection, never renews it. */
+  finishWithoutData(subscription:string,device:string,at:number) {
+    const holder=this.holders.get(subscription);
+    if(holder?.device===device&&answers(holder,at))this.holders.set(subscription,{...holder,askedAt:null,answering:true,scheduledUntil:null});
+  }
+
   /** A measurement arrived: its sender holds duty until the measurement goes stale. */
   delivered(subscription: string, device: string, observedAt: number, staleAfterMs: number, now: number, acknowledge = true) {
     const holder = this.holders.get(subscription);

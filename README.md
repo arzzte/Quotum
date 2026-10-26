@@ -678,9 +678,9 @@ account = "work"        # tells two Antigravity subscriptions apart (agy doesn't
 ```
 
 To replace a native measurement collector with your own local executable, including
-several accounts on one device, configure `[providers.claude.hook]` with an absolute
+several accounts on one device, configure `[providers.claude.hooks.collect]` with an absolute
 `path` and an `args` array. This is opt-in execution of trusted user code, not a sandbox.
-The [hook contract](docs/hook-collectors.md) keeps pseudonyms, per-account scheduling
+Independent `hooks.on_collected` and `hooks.on_collection_failed` commands can also observe native or custom outcomes. The [hook contract](docs/hook-collectors.md) keeps pseudonyms, per-account scheduling
 and delivery on the existing `quotum connect` connection inside Quotum.
 
 The environment variables `QUOTUM_HUB_URL`, `QUOTUM_HUB_TOKEN`,

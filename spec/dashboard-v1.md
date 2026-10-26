@@ -2331,3 +2331,7 @@ for values and sorting; a new source-work interval invalidates only work-derived
 accounting. Financial indexes, drawing evidence and subscriptions remain reusable
 when their native facts have not changed. The ordinary GET history route also accepts
 `work=1` with the same source permissions and history bounds.
+
+A refresh request may finish with `status: "no_new_data"`: collection completed without a new observation. `finishedAt` is the completion admission time. Existing resource values and freshness are unchanged; the ordinary refresh state/event and 60-second terminal retention apply.
+
+The owner-private `/api/devices` response may contain several `sources` for one device/provider. A failure optionally carries `accountKey` for its verified account; an absent key denotes a genuinely unknown provider-level failure. A successful observation clears its own account failure without removing sibling failures. These references are not added to shared board projections.

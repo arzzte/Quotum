@@ -63,19 +63,20 @@ directly. These are the client interfaces used by the agent:
 | Codex | `codex app-server`, JSON-RPC `account/rateLimits/read` (the protocol of the IDE extensions) | Plan, per-model limits, free resets, purchased credits, account id. |
 | Antigravity | `agy -p /usage --output-format json` (agy 1.1.11+) | The agent sends agy's log to its own file; otherwise agy writes a new log file on every run. |
 
-A provider may instead use an explicitly configured [local hook](hook-collectors.md).
-It replaces only that provider's measurements. The agent executes a trusted user command,
-not a built-in provider API client; credential handling stays in the user's script.
-A versioned stdin/stdout contract separates local identity discovery from measurement
-of the accounts selected by the hub. Raw Claude and Codex supplier identities are hashed
-by the existing model and never enter delivery or logs. Antigravity's user-chosen
-`accountName` is sent in check-ins and snapshots and can enter the spool, as with native
-collection. Each discovered account reuses `Schedule`, duty, launch-scoped attempt
-evidence and the paired sink; the complete roster is checked in
-together so a partial due set cannot look like a changed native login. Hooks run
-sequentially in the same runner loop, with the native process runner's environment,
-stop and cleanup, a 60-second deadline and a 256 KiB output cap. Pooled identities
-never replace a native client's login evidence in activity reports.
+A provider may instead use an explicitly configured [local collector](hook-collectors.md).
+A strict versioned stdin/stdout exchange discovers its full account roster and measures
+only the due accounts. Native and custom collection share one coordinator and dynamic
+account schedule. One active collection worker leaves policy contact and activity
+delivery responsive. Membership, current candidate evidence and due accounts are
+separate: an individual observation cannot withdraw another roster member or restore a
+withdrawn account. No-data completion answers its exact command without refreshing any
+resource. The hub handles the same snapshots, failures and generic account/completion
+contract regardless of how the device obtained them.
+
+Independent local success/failure observers receive normalized account outcomes on a
+bounded volatile worker queue. They cannot affect collection or delivery, retry events,
+or receive hub credentials and raw supplier identities. Policy, target incarnation and
+runner cancellation guard both collection results and observer launches.
 
 What follows for the native collectors:
 
